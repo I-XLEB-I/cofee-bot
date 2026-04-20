@@ -1,0 +1,18 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+credentials.json
+
+# OS / editor
+.DS_Store
+*.swp
+
+# Backups
+*.save
+*.save.*
+bot.py.save*
