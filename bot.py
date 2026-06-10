@@ -4729,10 +4729,10 @@ def build_repair_card_markup(repair_id, data):
         ],
         [
             InlineKeyboardButton("📎 Документы", callback_data=f"repair_docs_{repair_id}"),
-            InlineKeyboardButton("✅ Вернули на точку", callback_data=f"repair_return_{repair_id}", style="primary"),
+            InlineKeyboardButton("✅ Вернули на точку", callback_data=f"repair_return_{repair_id}"),
         ],
         [
-            InlineKeyboardButton("🗑 Удалить ремонт", callback_data=f"repair_delete_{repair_id}", style="danger"),
+            InlineKeyboardButton("🗑 Удалить ремонт", callback_data=f"repair_delete_{repair_id}"),
         ],
     ]
     machine = data.get("machine")
@@ -4899,7 +4899,7 @@ def build_repair_plan_date_markup():
 def build_repair_delete_confirm_markup(repair_id):
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"repair_delete_confirm_{repair_id}", style="danger")],
+            [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"repair_delete_confirm_{repair_id}")],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"repair_delete_cancel_{repair_id}")],
         ]
     )
@@ -7158,7 +7158,7 @@ async def show_travel_edit_card(query, context, row_num, notice=None):
         [
             [InlineKeyboardButton("💰 Изменить сумму", callback_data=f"tr_edit_amount:{row_num}")],
             [InlineKeyboardButton("📅 Изменить дату", callback_data=f"tr_edit_date_prompt:{row_num}")],
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tr_edit_delete:{row_num}", style="danger")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tr_edit_delete:{row_num}")],
             [InlineKeyboardButton("⬅️ К записям", callback_data="tr_edit_back_entries")],
         ]
     )
@@ -7209,8 +7209,8 @@ async def show_fix_action_menu(query, context):
     points_text = ", ".join(points)
     kb = [
         [InlineKeyboardButton("✏️ Изменить запись", callback_data="fix_action_edit")],
-        [InlineKeyboardButton("🗑 Удалить одну запись", callback_data="fix_action_delete_one", style="danger")],
-        [InlineKeyboardButton(f"🗑 Удалить все записи за день ({len(entries)})", callback_data="fix_action_delete_day", style="danger")],
+        [InlineKeyboardButton("🗑 Удалить одну запись", callback_data="fix_action_delete_one")],
+        [InlineKeyboardButton(f"🗑 Удалить все записи за день ({len(entries)})", callback_data="fix_action_delete_day")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_date")],
     ]
     await show_text_screen(
@@ -7369,7 +7369,7 @@ async def show_fix_entry_salary_menu(query, context, notice=None):
         InlineKeyboardButton("↺ Как в записи", callback_data="fix_entry_salary_reset"),
         InlineKeyboardButton("🚫 Не считать", callback_data="fix_entry_salary_clear"),
     ])
-    kb.append([InlineKeyboardButton("✅ Сохранить", callback_data="fix_entry_salary_save", style="primary")])
+    kb.append([InlineKeyboardButton("✅ Сохранить", callback_data="fix_entry_salary_save")])
     kb.append([
         InlineKeyboardButton("⬅️ Назад", callback_data="back_fix_entry_actions"),
         InlineKeyboardButton("🏠 В меню", callback_data="back_main"),
@@ -7386,7 +7386,7 @@ async def show_fix_entry_action_menu(query, context, notice=None):
     kb = [
         [InlineKeyboardButton("✏️ Изменить запись", callback_data="fix_entry_edit")],
         [InlineKeyboardButton("💸 Кому в ЗП", callback_data="fix_entry_salary")],
-        [InlineKeyboardButton("🗑 Удалить запись", callback_data="fix_entry_delete", style="danger")],
+        [InlineKeyboardButton("🗑 Удалить запись", callback_data="fix_entry_delete")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_entry")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -7398,7 +7398,7 @@ async def show_delete_confirm_menu(query, context):
     entry = context.user_data.get("delete", {}).get("entry")
     text = "🗑 Удалить эту запись?\n\n" + build_service_entry_text(entry)
     kb = [
-        [InlineKeyboardButton("🗑 Удалить", callback_data="del_confirm_yes", style="danger")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data="del_confirm_yes")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_entry")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -7420,7 +7420,7 @@ async def show_delete_day_confirm_menu(query, context):
         "Это удалит все записи обслуживания и фото за эту дату."
     )
     kb = [
-        [InlineKeyboardButton("🗑 Удалить всё за день", callback_data="del_day_confirm_yes", style="danger")],
+        [InlineKeyboardButton("🗑 Удалить всё за день", callback_data="del_day_confirm_yes")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_fix_actions")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -7998,7 +7998,7 @@ def build_service_duplicate_review_text(review, mode="overview"):
 def build_service_duplicate_review_overview_markup(review_id, has_candidates):
     keyboard = []
     if has_candidates:
-        keyboard.append([InlineKeyboardButton("🗑 Удалить все кандидаты", callback_data=f"svcdup:confirm_all:{review_id}", style="danger")])
+        keyboard.append([InlineKeyboardButton("🗑 Удалить все кандидаты", callback_data=f"svcdup:confirm_all:{review_id}")])
         keyboard.append([InlineKeyboardButton("🎯 Выбрать строки", callback_data=f"svcdup:select:{review_id}")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"svcdup:cancel:{review_id}")])
     return InlineKeyboardMarkup(keyboard)
@@ -8033,7 +8033,7 @@ def build_service_duplicate_selection_markup(review):
         keyboard.append(actions)
 
     if selected_rows:
-        keyboard.append([InlineKeyboardButton("🗑 Удалить выбранное", callback_data=f"svcdup:confirm_selected:{review_id}", style="danger")])
+        keyboard.append([InlineKeyboardButton("🗑 Удалить выбранное", callback_data=f"svcdup:confirm_selected:{review_id}")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"svcdup:back:{review_id}")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"svcdup:cancel:{review_id}")])
     return InlineKeyboardMarkup(keyboard)
@@ -8312,7 +8312,7 @@ def build_revision_confirm_text(revision):
 
 async def show_revision_menu(query, context):
     keyboard = [
-        [InlineKeyboardButton("📝 Заполнить ревизию", callback_data="rev_fill", style="primary")],
+        [InlineKeyboardButton("📝 Заполнить ревизию", callback_data="rev_fill")],
         [InlineKeyboardButton("📋 Посмотреть ревизию", callback_data="rev_view")],
         [InlineKeyboardButton("📥 Импорт из текста", callback_data="rev_import")],
         [InlineKeyboardButton("🛒 Закупка и остатки", callback_data="rev_procurement")],
@@ -8441,7 +8441,7 @@ async def show_revision_edit_action_menu(query, context):
     if revision.get("group_report_undo_log_row"):
         keyboard.append([InlineKeyboardButton("↩️ Отменить это пополнение", callback_data="rev_edit_undo_group_import")])
     keyboard.extend([
-        [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_edit_delete", style="danger")],
+        [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_edit_delete")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_location")],
     ])
     text = "✏️ Что сделать с ревизией?\n\n" + build_revision_record_text(record)
@@ -8682,7 +8682,7 @@ async def revision_item_text_input_handler(update: Update, context):
 
 async def show_revision_confirm(query, context):
     keyboard = [
-        [InlineKeyboardButton("✅ Сохранить", callback_data="rev_confirm_save", style="primary")],
+        [InlineKeyboardButton("✅ Сохранить", callback_data="rev_confirm_save")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_confirm")],
         [InlineKeyboardButton("❌ Отмена", callback_data="rev_confirm_cancel")],
     ]
@@ -8698,7 +8698,7 @@ async def show_revision_confirm(query, context):
 async def show_revision_confirm_message(message, context):
     revision = get_revision_context(context)
     keyboard = [
-        [InlineKeyboardButton("✅ Сохранить", callback_data="rev_confirm_save", style="primary")],
+        [InlineKeyboardButton("✅ Сохранить", callback_data="rev_confirm_save")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_confirm")],
         [InlineKeyboardButton("❌ Отмена", callback_data="rev_confirm_cancel")],
     ]
@@ -8727,7 +8727,7 @@ async def show_revision_delete_confirm_menu(query, context):
     revision = get_revision_context(context)
     record = revision["existing_record"]
     keyboard = [
-        [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_delete_yes", style="danger")],
+        [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_delete_yes")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_edit_action")],
     ]
     text = "🗑 Удалить ревизию?\n\n" + build_revision_record_text(record)
@@ -9387,7 +9387,7 @@ async def start(update: Update, context):
         return await deny_private_access(update)
     context.user_data.clear()
     keyboard = [
-        [InlineKeyboardButton("👀 К обслуживанию сегодня", callback_data="service_today", style="success")],
+        [InlineKeyboardButton("👀 К обслуживанию сегодня", callback_data="service_today")],
         [InlineKeyboardButton("🔧 Обслуживание", callback_data="service")],
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
@@ -11628,7 +11628,7 @@ async def repair_expense_paid_handler(update: Update, context):
 
 async def show_service_section_menu(query, context):
     keyboard = [
-        [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start", style="primary")],
+        [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start")],
         [InlineKeyboardButton("🛠 Ремонт", callback_data="repair")],
         [InlineKeyboardButton("📋 Информация по точкам", callback_data="info")],
         [InlineKeyboardButton("⚠️ Проблемные точки", callback_data="service_problem_points")],
@@ -11767,7 +11767,7 @@ async def show_salary_task_confirm_screen(query, context, notice=None):
         text = f"{notice}\n\n{text}"
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✅ Сохранить", callback_data="salary_task_save", style="primary")],
+            [InlineKeyboardButton("✅ Сохранить", callback_data="salary_task_save")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back_salary_task_amount")],
             [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
         ]
@@ -11813,7 +11813,7 @@ def get_payout_screen_access(query, settlement):
 def build_payout_delete_markup(confirm_callback, back_screen):
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✅ Да, удалить", callback_data=confirm_callback, style="danger")],
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=confirm_callback)],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"payout_screen:{back_screen}")],
         ]
     )
@@ -13981,7 +13981,7 @@ async def service_today_notice(update: Update, context):
             callback_data="service_today_repair",
         )])
     kb.extend([
-        [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start", style="primary")],
+        [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_service_menu")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ])
@@ -14441,8 +14441,8 @@ async def delete_date_custom_handler(update: Update, context):
     points = order_points({entry.get("Точка", "") for entry in entries if entry.get("Точка")})
     kb = [
         [InlineKeyboardButton("✏️ Изменить запись", callback_data="fix_action_edit")],
-        [InlineKeyboardButton("🗑 Удалить одну запись", callback_data="fix_action_delete_one", style="danger")],
-        [InlineKeyboardButton(f"🗑 Удалить все записи за день ({len(entries)})", callback_data="fix_action_delete_day", style="danger")],
+        [InlineKeyboardButton("🗑 Удалить одну запись", callback_data="fix_action_delete_one")],
+        [InlineKeyboardButton(f"🗑 Удалить все записи за день ({len(entries)})", callback_data="fix_action_delete_day")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_date")],
     ]
     await update.message.reply_text(
@@ -16923,7 +16923,7 @@ async def travel_history_period_handler(update: Update, context):
                 ),
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"tr_edit_delete_yes:{row_num}", style="danger")],
+                        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"tr_edit_delete_yes:{row_num}")],
                         [InlineKeyboardButton("⬅️ Назад", callback_data=f"tr_edit_entry:{row_num}")],
                     ]
                 ),
