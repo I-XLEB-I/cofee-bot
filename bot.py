@@ -9387,7 +9387,7 @@ async def start(update: Update, context):
         return await deny_private_access(update)
     context.user_data.clear()
     keyboard = [
-        [InlineKeyboardButton("👀 К обслуживанию сегодня", callback_data="service_today", style="primary")],
+        [InlineKeyboardButton("👀 К обслуживанию сегодня", callback_data="service_today", style="success")],
         [InlineKeyboardButton("🔧 Обслуживание", callback_data="service")],
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
