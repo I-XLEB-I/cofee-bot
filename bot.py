@@ -20,7 +20,8 @@ from telegram import (
     ReplyKeyboardRemove,
     Update,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -108,7 +109,7 @@ PAYOUT_SHEET = "Выплаты"
 PAYOUT_STATUS_PENDING = "ожидает"
 PAYOUT_STATUS_PAID = "переведено"
 POINTS = ["Беломорский", "Гагарина", "Гиппо", "Южный", "Сити", "Макси", "Бел2"]
-REVISION_LOCATIONS = POINTS + ["Дома"]
+REVISION_LOCATIONS = POINTS + ["Дома", "Гараж"]
 POINT_SHORT_LABELS = {
     "Беломорский": "Беломор",
 }
@@ -606,11 +607,7 @@ def get_sheet():
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
-    credentials_json = os.getenv("CREDENTIALS_JSON", "").strip()
-    if credentials_json:
-        creds = Credentials.from_service_account_info(json.loads(credentials_json), scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     client = gspread.authorize(creds)
     book = client.open_by_key(SPREADSHEET_ID)
     _BOOK_CACHE["book"] = book
@@ -1129,6 +1126,22 @@ def ensure_repair_worksheets():
 def get_all_repair_centers():
     ensure_repair_worksheets()
     return get_records(REPAIR_SHEET_CENTERS, REPAIR_CENTER_HEADERS)
+
+
+def add_repair_center_row(entry):
+    ensure_repair_worksheets()
+    sheet = get_or_create_worksheet(REPAIR_SHEET_CENTERS, REPAIR_CENTER_HEADERS)
+    return append_row_and_get_index(sheet, [
+        entry.get("id", ""),
+        entry.get("Название", ""),
+        entry.get("Город", ""),
+        entry.get("Контактное лицо", ""),
+        entry.get("Телефон", ""),
+        entry.get("Email", ""),
+        entry.get("Адрес", ""),
+        entry.get("Специализация", ""),
+        entry.get("Заметки", ""),
+    ])
 
 
 def get_all_repair_machines():
@@ -2311,6 +2324,7 @@ def build_revision_restock_saved_markup(save_result):
 def save_group_report_entry(draft):
     payload = build_group_report_payload(draft)
     service_row = add_service_row(payload)
+    auto_close_repair_for_point(draft.get("point"))
     photo_rows = []
     for file_id in draft.get("photo_ids", []):
         photo_rows.append(add_photo_row(draft["date"], draft["point"], draft["who"], file_id))
@@ -2818,6 +2832,9 @@ REVISION_LOCATION_ALIASES = {
     "дома": "Дома",
     "дом": "Дома",
     "склад": "Дома",
+    "гараж": "Гараж",
+    "гар": "Гараж",
+    "garage": "Гараж",
 }
 
 
@@ -4297,6 +4314,53 @@ def update_repair_status_value(repair_id, new_status):
     return repair
 
 
+def auto_close_repair_for_point(point_name):
+    # A service report for the point means the machine is operating again,
+    # so any active repair ticket should be closed (Установлен) and the
+    # machine flipped back to Работает. Wrapped in try/except so a Sheets
+    # hiccup never blocks the original service report save.
+    try:
+        normalized = str(point_name or "").strip()
+        if not normalized:
+            return None
+        machines = get_all_repair_machines_with_rows()
+        target = next(
+            (m for m in machines
+             if str(m.get("Точка", "")).strip() == normalized
+             and str(m.get("Статус", "")).strip() == REPAIR_MACHINE_REPAIR),
+            None,
+        )
+        if not target:
+            return None
+
+        machine_id = str(target.get("id", "")).strip()
+        repairs = get_all_repairs_with_rows()
+        active = [
+            r for r in repairs
+            if str(r.get("Аппарат ID", "")).strip() == machine_id
+            and is_repair_active_status(r.get("Статус", ""))
+        ]
+
+        closed_ids = []
+        if active:
+            for repair in active:
+                repair_id = str(repair.get("id", "")).strip()
+                update_repair_status_value(repair_id, REPAIR_STATUS_INSTALLED)
+                closed_ids.append(repair_id)
+        else:
+            target["Статус"] = REPAIR_MACHINE_WORKING
+            update_repair_machine_row(target["__row"], target)
+
+        logger.info(
+            "auto-closed repair on service report: point=%s machine_id=%s closed_repairs=%s",
+            normalized, machine_id, closed_ids,
+        )
+        return {"machine_id": machine_id, "closed_repairs": closed_ids}
+    except Exception:
+        logger.exception("auto_close_repair_for_point failed: point=%s", point_name)
+        return None
+
+
 def update_repair_service_value(repair_id, service_value):
     repairs = get_all_repairs_with_rows()
     repair = find_repair_record(repairs, repair_id)
@@ -4579,7 +4643,26 @@ def build_machine_history_text(machine, history_data):
             ]
         )
     )
+    lines.extend(["", "👇 Нажми на ремонт, чтобы открыть карточку и отредактировать."])
     return "\n".join(lines)
+
+
+def build_machine_history_markup(history_data, back_callback):
+    keyboard = []
+    for item in history_data.get("history", []):
+        repair = item["repair"]
+        rid = str(repair.get("id", "")).strip()
+        if not rid:
+            continue
+        broken_dt = parse_date(repair.get("Дата поломки", ""))
+        period_text = f"{broken_dt.month:02d}.{broken_dt.year}" if broken_dt else "—"
+        reason = str(repair.get("Причина", "") or "—").strip()
+        if len(reason) > 30:
+            reason = reason[:29] + "…"
+        label = f"{rid} · {period_text} · {reason}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"repair_open_{rid}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])
+    return InlineKeyboardMarkup(keyboard)
 
 
 def build_repair_centers_text(centers):
@@ -4646,10 +4729,10 @@ def build_repair_card_markup(repair_id, data):
         ],
         [
             InlineKeyboardButton("📎 Документы", callback_data=f"repair_docs_{repair_id}"),
-            InlineKeyboardButton("✅ Вернули на точку", callback_data=f"repair_return_{repair_id}"),
+            InlineKeyboardButton("✅ Вернули на точку", callback_data=f"repair_return_{repair_id}", style="primary"),
         ],
         [
-            InlineKeyboardButton("🗑 Удалить ремонт", callback_data=f"repair_delete_{repair_id}"),
+            InlineKeyboardButton("🗑 Удалить ремонт", callback_data=f"repair_delete_{repair_id}", style="danger"),
         ],
     ]
     machine = data.get("machine")
@@ -4813,19 +4896,10 @@ def build_repair_plan_date_markup():
     )
 
 
-def build_repair_confirm_markup():
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Создать", callback_data="repair_create_confirm"), InlineKeyboardButton("✏️ Изменить", callback_data="repair_create_edit")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="back_repair_menu")],
-        ]
-    )
-
-
 def build_repair_delete_confirm_markup(repair_id):
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"repair_delete_confirm_{repair_id}")],
+            [InlineKeyboardButton("🗑 Да, удалить", callback_data=f"repair_delete_confirm_{repair_id}", style="danger")],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"repair_delete_cancel_{repair_id}")],
         ]
     )
@@ -5012,7 +5086,128 @@ def build_revision_summary_text(period, records):
     lines.append("")
     lines.append("<b>🏠 Дома</b>")
     lines.append(build_preformatted_block(build_total_rows("home_value")))
+    lines.append("")
+    lines.append("<b>🚗 Гараж</b>")
+    lines.append(build_preformatted_block(build_total_rows("garage_value")))
 
+    return "\n".join(lines)
+
+
+EXCEL_EXPORT_ROW_MAP = [
+    ("Кофе", "Кофе"),
+    ("Молоко", "Молоко"),
+    ("Шоколад", "Шоколад"),
+    ("Мока", "Мока"),
+    ("Сахар", "Сахар"),
+    ("Сироп", "Сиропы"),
+    ("Стаканы", "Стаканы"),
+    ("КрышкиЧ", "Крышки чёрн"),
+    ("КрышкиБ", "Крышки бел"),
+    ("Палочки", "Палочки"),
+    ("Трубочки", "Трубочки"),
+    ("Капхолдеры", "Манжеты"),
+]
+
+EXCEL_EXPORT_COL_MAP = [
+    ("Сити", ["Сити"]),
+    ("Белом", ["Беломорский"]),
+    ("Бел 2", ["Бел2"]),
+    ("Южн", ["Южный"]),
+    ("Гагарина", ["Гагарина"]),
+    ("Макси", ["Макси"]),
+    ("Гиппо", ["Гиппо"]),
+    ("Дома", ["Дома", "Гараж"]),
+]
+
+
+def build_revision_excel_export_text(period, records):
+    period_records = [r for r in records if r.get("Период") == period]
+    by_location = {r.get("Локация", ""): r for r in period_records}
+
+    # matrix[row][col] = string value (or "" for empty)
+    matrix = []
+    has_any_data = False
+    for _, bot_item in EXCEL_EXPORT_ROW_MAP:
+        row = []
+        for _, bot_locations in EXCEL_EXPORT_COL_MAP:
+            if not bot_item:
+                row.append("")
+                continue
+            total = 0.0
+            has_value = False
+            for loc in bot_locations:
+                rec = by_location.get(loc)
+                if not rec:
+                    continue
+                v = parse_numeric_value(rec.get(bot_item, ""))
+                if v is None:
+                    continue
+                total += v
+                has_value = True
+            if has_value:
+                has_any_data = True
+                row.append(format_number(total))
+            else:
+                row.append("")
+        matrix.append(row)
+
+    lines = [
+        f"<b>📤 Экспорт для Excel — {escape_html(format_period_label(period))}</b>",
+        "",
+        "Telegram не сохраняет табы при копировании, поэтому каждый столбец отдельно.",
+        "Для каждого столбца: скопируй блок и вставь в Excel в первую ячейку «Кофе» соответствующей колонки.",
+        "",
+        "Порядок строк (одинаковый для всех 8 блоков):",
+        "Кофе · Молоко · Шоколад · Мока · Сахар · Сироп · Стаканы · КрышкиЧ · КрышкиБ · Палочки · Трубочки · Капхолдеры",
+        "",
+    ]
+    if not has_any_data:
+        lines.append("⚪ За этот месяц нет ни одной заполненной ревизии — все столбцы будут пустыми.")
+        lines.append("")
+
+    for col_idx, (col_name, _) in enumerate(EXCEL_EXPORT_COL_MAP):
+        col_values = [matrix[row_idx][col_idx] for row_idx in range(len(matrix))]
+        block = "\n".join(col_values)
+        lines.append(f"📍 <b>{escape_html(col_name)}</b>")
+        lines.append("<pre>" + escape_html(block) + "</pre>")
+    return "\n".join(lines)
+
+
+def build_revision_all_points_detailed_text(period, records):
+    period_records = [record for record in records if record.get("Период") == period]
+    stock_totals = build_revision_stock_totals(period_records)
+    by_location = stock_totals["by_location"]
+    lines = [f"<b>📍 Ревизия по всем точкам — {escape_html(format_period_label(period))}</b>", ""]
+
+    sections = [
+        ("📍 " + p, p) for p in POINTS
+    ] + [("🏠 Дома", "Дома"), ("🚗 Гараж", "Гараж")]
+
+    any_filled = False
+    for title, location in sections:
+        record = by_location.get(location)
+        if not record:
+            lines.append(f"<b>{title}</b>")
+            lines.append("⚪ нет данных")
+            lines.append("")
+            continue
+        any_filled = True
+        rows = []
+        for item_name in REVISION_ITEMS:
+            value = parse_numeric_value(record.get(item_name, ""))
+            rows.append((
+                item_name,
+                "—" if value is None else format_number(value),
+                "" if value is None else get_procurement_unit_short(get_revision_unit(item_name)),
+            ))
+        lines.append(f"<b>{title}</b>")
+        lines.append(build_preformatted_block(rows))
+        lines.append("")
+
+    if not any_filled:
+        lines.append("⚪ За этот месяц нет ни одной заполненной ревизии.")
+    while lines and lines[-1] == "":
+        lines.pop()
     return "\n".join(lines)
 
 
@@ -5073,6 +5268,7 @@ def classify_threshold_level(value, critical_value, warning_value):
 def build_revision_stock_totals(period_records):
     by_location = {record.get("Локация", ""): record for record in period_records}
     home_record = by_location.get("Дома")
+    garage_record = by_location.get("Гараж")
     items = {}
 
     for item_name in REVISION_ITEMS:
@@ -5089,25 +5285,32 @@ def build_revision_stock_totals(period_records):
             has_point_data = True
 
         home_value = parse_numeric_value(home_record.get(item_name, "")) if home_record else None
+        garage_value = parse_numeric_value(garage_record.get(item_name, "")) if garage_record else None
         total_value = None
-        if has_point_data or home_value is not None:
-            total_value = point_total + (home_value or 0)
+        if has_point_data or home_value is not None or garage_value is not None:
+            total_value = point_total + (home_value or 0) + (garage_value or 0)
 
         items[item_name] = {
             "point_values": point_values,
             "point_total": point_total if has_point_data else None,
             "home_value": home_value,
+            "garage_value": garage_value,
             "total_value": total_value,
         }
 
     home_has_data = bool(
         home_record and any(item_data["home_value"] is not None for item_data in items.values())
     )
+    garage_has_data = bool(
+        garage_record and any(item_data["garage_value"] is not None for item_data in items.values())
+    )
 
     return {
         "by_location": by_location,
         "home_record": home_record,
+        "garage_record": garage_record,
         "home_has_data": home_has_data,
+        "garage_has_data": garage_has_data,
         "items": items,
     }
 
@@ -6246,6 +6449,15 @@ def remember_cleanup_message(context, message):
     tracked.append(message.message_id)
 
 
+# Process-local Task registries: must NOT live in application.bot_data, because
+# PicklePersistence deep-copies bot_data and asyncio.Task objects are unpicklable.
+# Past incident: every periodic persistence dump crashed the bot with
+# TypeError: cannot pickle '_asyncio.Task' object → systemd restart → pending
+# cleanup tasks died before firing → "saved" notifications never auto-deleted.
+_SINGLE_CLEANUP_TASKS = {}
+_CARD_CLEANUP_TASKS = {}
+
+
 async def delete_messages_by_ids(bot, chat_id, message_ids):
     deleted = 0
     for message_id in message_ids:
@@ -6262,18 +6474,22 @@ async def delete_messages_by_ids(bot, chat_id, message_ids):
 
 def schedule_single_message_cleanup(application, chat_id, message_id, delay_seconds):
     if delay_seconds <= 0 or not message_id:
+        logger.info("cleanup skipped: delay=%s message_id=%s", delay_seconds, message_id)
         return
 
-    cleanup_tasks = application.bot_data.setdefault("_single_cleanup_tasks", {})
+    cleanup_tasks = _SINGLE_CLEANUP_TASKS
     task_key = f"{chat_id}:{message_id}"
     previous_task = cleanup_tasks.get(task_key)
     if previous_task and not previous_task.done():
         previous_task.cancel()
 
     async def _cleanup():
+        logger.info("cleanup awake-wait: chat=%s msg=%s delay=%s", chat_id, message_id, delay_seconds)
         try:
             await asyncio.sleep(delay_seconds)
-            await delete_messages_by_ids(application.bot, chat_id, [message_id])
+            logger.info("cleanup deleting: chat=%s msg=%s", chat_id, message_id)
+            deleted = await delete_messages_by_ids(application.bot, chat_id, [message_id])
+            logger.info("cleanup deleted: chat=%s msg=%s deleted=%s", chat_id, message_id, deleted)
         except Exception:
             logger.exception("Failed to auto-clean single message %s in chat %s", message_id, chat_id)
         finally:
@@ -6282,6 +6498,7 @@ def schedule_single_message_cleanup(application, chat_id, message_id, delay_seco
                 cleanup_tasks.pop(task_key, None)
 
     cleanup_tasks[task_key] = asyncio.create_task(_cleanup())
+    logger.info("cleanup scheduled: chat=%s msg=%s delay=%s", chat_id, message_id, delay_seconds)
 
 
 def schedule_card_messages_cleanup(context, chat_id, user_id):
@@ -6293,7 +6510,7 @@ def schedule_card_messages_cleanup(context, chat_id, user_id):
         return
 
     task_key = f"{chat_id}:{user_id}"
-    cleanup_tasks = context.application.bot_data.setdefault("_cleanup_tasks", {})
+    cleanup_tasks = _CARD_CLEANUP_TASKS
     previous_task = cleanup_tasks.get(task_key)
     if previous_task and not previous_task.done():
         previous_task.cancel()
@@ -6941,7 +7158,7 @@ async def show_travel_edit_card(query, context, row_num, notice=None):
         [
             [InlineKeyboardButton("💰 Изменить сумму", callback_data=f"tr_edit_amount:{row_num}")],
             [InlineKeyboardButton("📅 Изменить дату", callback_data=f"tr_edit_date_prompt:{row_num}")],
-            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tr_edit_delete:{row_num}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tr_edit_delete:{row_num}", style="danger")],
             [InlineKeyboardButton("⬅️ К записям", callback_data="tr_edit_back_entries")],
         ]
     )
@@ -6992,8 +7209,8 @@ async def show_fix_action_menu(query, context):
     points_text = ", ".join(points)
     kb = [
         [InlineKeyboardButton("✏️ Изменить запись", callback_data="fix_action_edit")],
-        [InlineKeyboardButton("🗑 Удалить одну запись", callback_data="fix_action_delete_one")],
-        [InlineKeyboardButton(f"🗑 Удалить все записи за день ({len(entries)})", callback_data="fix_action_delete_day")],
+        [InlineKeyboardButton("🗑 Удалить одну запись", callback_data="fix_action_delete_one", style="danger")],
+        [InlineKeyboardButton(f"🗑 Удалить все записи за день ({len(entries)})", callback_data="fix_action_delete_day", style="danger")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_date")],
     ]
     await show_text_screen(
@@ -7152,7 +7369,7 @@ async def show_fix_entry_salary_menu(query, context, notice=None):
         InlineKeyboardButton("↺ Как в записи", callback_data="fix_entry_salary_reset"),
         InlineKeyboardButton("🚫 Не считать", callback_data="fix_entry_salary_clear"),
     ])
-    kb.append([InlineKeyboardButton("✅ Сохранить", callback_data="fix_entry_salary_save")])
+    kb.append([InlineKeyboardButton("✅ Сохранить", callback_data="fix_entry_salary_save", style="primary")])
     kb.append([
         InlineKeyboardButton("⬅️ Назад", callback_data="back_fix_entry_actions"),
         InlineKeyboardButton("🏠 В меню", callback_data="back_main"),
@@ -7169,7 +7386,7 @@ async def show_fix_entry_action_menu(query, context, notice=None):
     kb = [
         [InlineKeyboardButton("✏️ Изменить запись", callback_data="fix_entry_edit")],
         [InlineKeyboardButton("💸 Кому в ЗП", callback_data="fix_entry_salary")],
-        [InlineKeyboardButton("🗑 Удалить запись", callback_data="fix_entry_delete")],
+        [InlineKeyboardButton("🗑 Удалить запись", callback_data="fix_entry_delete", style="danger")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_entry")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -7181,7 +7398,7 @@ async def show_delete_confirm_menu(query, context):
     entry = context.user_data.get("delete", {}).get("entry")
     text = "🗑 Удалить эту запись?\n\n" + build_service_entry_text(entry)
     kb = [
-        [InlineKeyboardButton("🗑 Удалить", callback_data="del_confirm_yes")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data="del_confirm_yes", style="danger")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_entry")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -7203,7 +7420,7 @@ async def show_delete_day_confirm_menu(query, context):
         "Это удалит все записи обслуживания и фото за эту дату."
     )
     kb = [
-        [InlineKeyboardButton("🗑 Удалить всё за день", callback_data="del_day_confirm_yes")],
+        [InlineKeyboardButton("🗑 Удалить всё за день", callback_data="del_day_confirm_yes", style="danger")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_fix_actions")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -7781,7 +7998,7 @@ def build_service_duplicate_review_text(review, mode="overview"):
 def build_service_duplicate_review_overview_markup(review_id, has_candidates):
     keyboard = []
     if has_candidates:
-        keyboard.append([InlineKeyboardButton("🗑 Удалить все кандидаты", callback_data=f"svcdup:confirm_all:{review_id}")])
+        keyboard.append([InlineKeyboardButton("🗑 Удалить все кандидаты", callback_data=f"svcdup:confirm_all:{review_id}", style="danger")])
         keyboard.append([InlineKeyboardButton("🎯 Выбрать строки", callback_data=f"svcdup:select:{review_id}")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"svcdup:cancel:{review_id}")])
     return InlineKeyboardMarkup(keyboard)
@@ -7816,7 +8033,7 @@ def build_service_duplicate_selection_markup(review):
         keyboard.append(actions)
 
     if selected_rows:
-        keyboard.append([InlineKeyboardButton("🗑 Удалить выбранное", callback_data=f"svcdup:confirm_selected:{review_id}")])
+        keyboard.append([InlineKeyboardButton("🗑 Удалить выбранное", callback_data=f"svcdup:confirm_selected:{review_id}", style="danger")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"svcdup:back:{review_id}")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"svcdup:cancel:{review_id}")])
     return InlineKeyboardMarkup(keyboard)
@@ -8007,10 +8224,6 @@ def get_revision_context(context):
 def build_revision_period_markup(show_all=False, action=None):
     periods = recent_completed_period_keys(8 if show_all else 2)
     keyboard = []
-    if action == "fill":
-        keyboard.append([InlineKeyboardButton("🏠 Заполнить промежуточную ревизию", callback_data="rev_home_check")])
-    elif action == "view":
-        keyboard.append([InlineKeyboardButton("🏠 Промежуточная ревизия запасов", callback_data="rev_home_view")])
     row = []
     for i, period in enumerate(periods):
         row.append(
@@ -8030,7 +8243,7 @@ def build_revision_period_markup(show_all=False, action=None):
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_revision_location_markup(back_callback):
+def build_revision_location_markup(back_callback, action=None):
     keyboard = []
     row = []
     for i, location in enumerate(REVISION_LOCATIONS):
@@ -8038,6 +8251,10 @@ def build_revision_location_markup(back_callback):
         if len(row) == 2 or i == len(REVISION_LOCATIONS) - 1:
             keyboard.append(row)
             row = []
+    if action == "fill":
+        keyboard.append([InlineKeyboardButton("🏠 Промежуточная ревизия (текущий месяц)", callback_data="rev_home_check")])
+    elif action == "view":
+        keyboard.append([InlineKeyboardButton("🏠 Промежуточная ревизия (текущий месяц)", callback_data="rev_home_view")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])
     return InlineKeyboardMarkup(keyboard)
 
@@ -8051,7 +8268,6 @@ def build_revision_item_markup(item_name):
         if len(row) == 3 or i == len(options) - 1:
             keyboard.append(row)
             row = []
-    keyboard.append([InlineKeyboardButton("Другое", callback_data="revi_custom")])
     keyboard.append([InlineKeyboardButton("Пропустить", callback_data="revi_skip")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_item")])
     return InlineKeyboardMarkup(keyboard)
@@ -8070,7 +8286,8 @@ def build_revision_item_prompt_text(revision):
     return (
         f"📍 Шаг {current_step}/{total_steps}\n"
         f"{bar}\n"
-        f"📦 {item_name} — сколько осталось ({unit})?"
+        f"📦 {item_name} — сколько осталось ({unit})?\n"
+        f"💡 Нажми кнопку или просто напиши число в чат"
         f"{current_line}"
     )
 
@@ -8095,12 +8312,10 @@ def build_revision_confirm_text(revision):
 
 async def show_revision_menu(query, context):
     keyboard = [
-        [InlineKeyboardButton("📝 Заполнить ревизию", callback_data="rev_fill")],
-        [InlineKeyboardButton("📥 Импорт из текста", callback_data="rev_import")],
-        [InlineKeyboardButton("✏️ Изменить ревизию", callback_data="rev_edit")],
+        [InlineKeyboardButton("📝 Заполнить ревизию", callback_data="rev_fill", style="primary")],
         [InlineKeyboardButton("📋 Посмотреть ревизию", callback_data="rev_view")],
+        [InlineKeyboardButton("📥 Импорт из текста", callback_data="rev_import")],
         [InlineKeyboardButton("🛒 Закупка и остатки", callback_data="rev_procurement")],
-        [InlineKeyboardButton("📊 Сравнить с прошлым месяцем", callback_data="rev_compare")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
     await show_text_screen(query, context, "📦 Ревизия\n\nВыберите действие:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -8195,7 +8410,7 @@ async def show_revision_location_menu(query, context):
         query,
         context,
         titles.get(action, "📦 Выберите точку:"),
-        reply_markup=build_revision_location_markup("back_revision_period"),
+        reply_markup=build_revision_location_markup("back_revision_period", action=action),
     )
     return REVISION_LOCATION
 
@@ -8226,7 +8441,7 @@ async def show_revision_edit_action_menu(query, context):
     if revision.get("group_report_undo_log_row"):
         keyboard.append([InlineKeyboardButton("↩️ Отменить это пополнение", callback_data="rev_edit_undo_group_import")])
     keyboard.extend([
-        [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_edit_delete")],
+        [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_edit_delete", style="danger")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_location")],
     ])
     text = "✏️ Что сделать с ревизией?\n\n" + build_revision_record_text(record)
@@ -8251,17 +8466,20 @@ async def show_revision_view_mode_menu(query, context):
     revision = get_revision_context(context)
     keyboard = [
         [InlineKeyboardButton("📋 Общая по месяцу", callback_data="rev_view_summary")],
+        [InlineKeyboardButton("📍 По всем точкам подробно", callback_data="rev_view_all_points")],
         [InlineKeyboardButton("📍 По точке", callback_data="rev_view_location")],
         [InlineKeyboardButton("🧾 По товару", callback_data="rev_view_item")],
+        [InlineKeyboardButton("📊 Сравнить с прошлым месяцем", callback_data="rev_view_compare")],
         [InlineKeyboardButton("🛒 Что нужно закупить", callback_data="rev_view_to_procurement")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_period")],
+        [InlineKeyboardButton("📤 Экспорт для Excel", callback_data="rev_view_excel_export")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_root")],
     ]
-    await show_text_screen(
-        query,
-        context,
-        f"📋 {format_period_label(revision['period'])}\n\nЧто показать?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    period = revision.get("period")
+    if period:
+        title = f"📋 {format_period_label(period)}\n\nЧто показать?"
+    else:
+        title = "📋 Посмотреть ревизию\n\nЧто показать?"
+    await show_text_screen(query, context, title, reply_markup=InlineKeyboardMarkup(keyboard))
     return REVISION_VIEW_MODE
 
 
@@ -8270,7 +8488,7 @@ async def show_revision_view_location_menu(query, context):
         query,
         context,
         "📍 Выберите точку:",
-        reply_markup=build_revision_location_markup("back_revision_view_mode"),
+        reply_markup=build_revision_location_markup("back_revision_period"),
     )
     return REVISION_VIEW_LOCATION
 
@@ -8283,7 +8501,7 @@ async def show_revision_view_item_menu(query, context):
         if len(row) == 2 or i == len(REVISION_ITEMS) - 1:
             keyboard.append(row)
             row = []
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_view_mode")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_period")])
     await show_text_screen(query, context, "🧾 Выберите товар:", reply_markup=InlineKeyboardMarkup(keyboard))
     return REVISION_VIEW_ITEM
 
@@ -8391,6 +8609,8 @@ async def ask_revision_item(query, context):
         build_revision_item_prompt_text(revision),
         reply_markup=build_revision_item_markup(item_name),
     )
+    if query.message:
+        revision["bot_msg"] = {"chat_id": query.message.chat_id, "message_id": query.message.message_id}
     return REVISION_ITEM
 
 
@@ -8399,16 +8619,70 @@ async def ask_revision_item_message(message, context):
     if revision["idx"] >= len(revision["order"]):
         return await show_revision_confirm_message(message, context)
     item_name = revision["order"][revision["idx"]]
-    await message.reply_text(
-        build_revision_item_prompt_text(revision),
-        reply_markup=build_revision_item_markup(item_name),
-    )
+    text = build_revision_item_prompt_text(revision)
+    markup = build_revision_item_markup(item_name)
+
+    bot_msg = revision.get("bot_msg")
+    if bot_msg:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=bot_msg["chat_id"],
+                message_id=bot_msg["message_id"],
+                text=text,
+                reply_markup=markup,
+            )
+            return REVISION_ITEM
+        except Exception:
+            logger.info("revision edit failed, falling back to reply: %s", bot_msg)
+
+    sent = await message.reply_text(text, reply_markup=markup)
+    revision["bot_msg"] = {"chat_id": sent.chat_id, "message_id": sent.message_id}
     return REVISION_ITEM
+
+
+async def revision_item_text_input_handler(update: Update, context):
+    # Direct numeric input from REVISION_ITEM state (no need to press "Другое" first).
+    # Also implements message clean-up: delete user's text, edit the bot's existing
+    # message instead of replying with a fresh one (no more "polotno of messages").
+    revision = get_revision_context(context)
+    if revision["idx"] >= len(revision["order"]):
+        return REVISION_ITEM
+    item_name = revision["order"][revision["idx"]]
+    raw = (update.message.text or "").strip()
+    try:
+        value = normalize_number_text(raw)
+    except ValueError:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        bot_msg = revision.get("bot_msg")
+        if bot_msg:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=bot_msg["chat_id"],
+                    message_id=bot_msg["message_id"],
+                    text=build_revision_item_prompt_text(revision) + f"\n\n❌ «{raw}» — не число, попробуй ещё раз.",
+                    reply_markup=build_revision_item_markup(item_name),
+                )
+                return REVISION_ITEM
+            except Exception:
+                pass
+        await update.message.reply_text(f"❌ Введите число для «{item_name}»:")
+        return REVISION_ITEM
+
+    revision["values"][item_name] = value
+    revision["idx"] += 1
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    return await ask_revision_item_message(update.message, context)
 
 
 async def show_revision_confirm(query, context):
     keyboard = [
-        [InlineKeyboardButton("✅ Сохранить", callback_data="rev_confirm_save")],
+        [InlineKeyboardButton("✅ Сохранить", callback_data="rev_confirm_save", style="primary")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_confirm")],
         [InlineKeyboardButton("❌ Отмена", callback_data="rev_confirm_cancel")],
     ]
@@ -8422,15 +8696,30 @@ async def show_revision_confirm(query, context):
 
 
 async def show_revision_confirm_message(message, context):
+    revision = get_revision_context(context)
     keyboard = [
-        [InlineKeyboardButton("✅ Сохранить", callback_data="rev_confirm_save")],
+        [InlineKeyboardButton("✅ Сохранить", callback_data="rev_confirm_save", style="primary")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_confirm")],
         [InlineKeyboardButton("❌ Отмена", callback_data="rev_confirm_cancel")],
     ]
-    await message.reply_text(
-        build_revision_confirm_text(get_revision_context(context)),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    text = build_revision_confirm_text(revision)
+    markup = InlineKeyboardMarkup(keyboard)
+
+    bot_msg = revision.get("bot_msg")
+    if bot_msg:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=bot_msg["chat_id"],
+                message_id=bot_msg["message_id"],
+                text=text,
+                reply_markup=markup,
+            )
+            return REVISION_CONFIRM
+        except Exception:
+            logger.info("revision confirm edit failed, falling back: %s", bot_msg)
+
+    sent = await message.reply_text(text, reply_markup=markup)
+    revision["bot_msg"] = {"chat_id": sent.chat_id, "message_id": sent.message_id}
     return REVISION_CONFIRM
 
 
@@ -8438,7 +8727,7 @@ async def show_revision_delete_confirm_menu(query, context):
     revision = get_revision_context(context)
     record = revision["existing_record"]
     keyboard = [
-        [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_delete_yes")],
+        [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_delete_yes", style="danger")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_edit_action")],
     ]
     text = "🗑 Удалить ревизию?\n\n" + build_revision_record_text(record)
@@ -8469,6 +8758,9 @@ async def revision_menu_handler(update: Update, context):
     if data == "rev_home_check":
         return await start_current_home_revision_check(update, context)
     revision["action"] = action_map[data]
+    if data == "rev_view":
+        revision["view_mode"] = None
+        return await show_revision_view_mode_menu(query, context)
     return await show_revision_period_menu(query, context)
 
 
@@ -8496,6 +8788,9 @@ async def revision_period_handler(update: Update, context):
     revision["show_all_periods"] = False
 
     if revision.get("action") == "view":
+        view_mode = revision.get("view_mode")
+        if view_mode:
+            return await _render_revision_view(query, context, view_mode)
         return await show_revision_view_mode_menu(query, context)
     if revision.get("action") == "procurement":
         return await show_revision_procurement_screen(query, context, view="summary")
@@ -8513,6 +8808,11 @@ async def revision_location_handler(update: Update, context):
 
     if query.data == "back_revision_period":
         return await show_revision_period_menu(query, context)
+
+    if query.data == "rev_home_check":
+        return await start_current_home_revision_check(update, context)
+    if query.data == "rev_home_view":
+        return await show_current_home_revision_view(query, context)
 
     location = query.data.replace("revloc_", "")
     revision["location"] = location
@@ -8548,6 +8848,10 @@ async def revision_existing_handler(update: Update, context):
         return await show_revision_location_menu(query, context)
     if query.data == "rev_existing_edit":
         return await show_revision_edit_action_menu(query, context)
+
+    if query.data != "rev_existing_overwrite":
+        logger.warning("revision_existing_handler got unexpected callback %r — ignoring", query.data)
+        return REVISION_EXISTING
 
     start_revision_wizard(context, update, existing_record=revision["existing_record"], mode="edit_all")
     return await ask_revision_item(query, context)
@@ -8702,6 +9006,10 @@ async def revision_item_custom_handler(update: Update, context):
         return REVISION_ITEM_CUSTOM
 
     revision["idx"] += 1
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     return await ask_revision_item_message(update.message, context)
 
 
@@ -8767,6 +9075,50 @@ async def revision_confirm_handler(update: Update, context):
     return REVISION_MENU
 
 
+REV_VIEW_KEY_MAP = {
+    "rev_view_summary": "summary",
+    "rev_view_all_points": "all_points",
+    "rev_view_location": "location",
+    "rev_view_item": "item",
+    "rev_view_compare": "compare",
+    "rev_view_to_procurement": "to_procurement",
+    "rev_view_excel_export": "excel_export",
+}
+
+
+async def _render_revision_view(query, context, view_mode):
+    revision = get_revision_context(context)
+    if view_mode == "summary":
+        await show_loading_state(query, context, "Загружаю сводную ревизию...")
+        records = await run_blocking(get_all_revisions)
+        text = build_revision_summary_text(revision["period"], records)
+        await show_text_screen(query, context, text, reply_markup=back_markup("back_revision_period", "⬅️ Назад"), parse_mode="HTML")
+        return REVISION_VIEW_MODE
+    if view_mode == "all_points":
+        await show_loading_state(query, context, "Собираю ревизии по всем точкам...")
+        records = await run_blocking(get_all_revisions)
+        text = build_revision_all_points_detailed_text(revision["period"], records)
+        await show_text_screen(query, context, text, reply_markup=back_markup("back_revision_period", "⬅️ Назад"), parse_mode="HTML")
+        return REVISION_VIEW_MODE
+    if view_mode == "excel_export":
+        await show_loading_state(query, context, "Готовлю экспорт для Excel...")
+        records = await run_blocking(get_all_revisions)
+        text = build_revision_excel_export_text(revision["period"], records)
+        await show_text_screen(query, context, text, reply_markup=back_markup("back_revision_period", "⬅️ Назад"), parse_mode="HTML")
+        return REVISION_VIEW_MODE
+    if view_mode == "compare":
+        revision["action"] = "compare"
+        return await show_revision_compare_location_menu(query, context)
+    if view_mode == "to_procurement":
+        revision["action"] = "procurement"
+        return await show_revision_procurement_screen(query, context, view="summary")
+    if view_mode == "location":
+        return await show_revision_view_location_menu(query, context)
+    if view_mode == "item":
+        return await show_revision_view_item_menu(query, context)
+    return REVISION_VIEW_MODE
+
+
 async def revision_view_mode_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -8776,25 +9128,16 @@ async def revision_view_mode_handler(update: Update, context):
         return await show_revision_period_menu(query, context)
     if query.data == "back_revision_view_mode":
         return await show_revision_view_mode_menu(query, context)
-    if query.data == "rev_view_summary":
-        await show_loading_state(query, context, "Загружаю сводную ревизию...")
-        records = await run_blocking(get_all_revisions)
-        text = build_revision_summary_text(revision["period"], records)
-        await show_text_screen(
-            query,
-            context,
-            text,
-            reply_markup=back_markup("back_revision_view_mode", "⬅️ Назад"),
-            parse_mode="HTML",
-        )
-        return REVISION_VIEW_MODE
-    if query.data == "rev_view_to_procurement":
-        revision["action"] = "procurement"
-        return await show_revision_procurement_screen(query, context, view="summary")
-    if query.data == "rev_view_location":
-        return await show_revision_view_location_menu(query, context)
-    if query.data == "rev_view_item":
-        return await show_revision_view_item_menu(query, context)
+    if query.data == "back_revision_root":
+        return await show_revision_menu(query, context)
+
+    view_mode = REV_VIEW_KEY_MAP.get(query.data)
+    if view_mode:
+        revision["view_mode"] = view_mode
+        # If no period chosen yet, ask for period; otherwise render now.
+        if not revision.get("period"):
+            return await show_revision_period_menu(query, context)
+        return await _render_revision_view(query, context, view_mode)
     return REVISION_VIEW_MODE
 
 
@@ -8896,6 +9239,10 @@ async def revision_delete_confirm_handler(update: Update, context):
 
     if query.data == "back_revision_edit_action":
         return await show_revision_edit_action_menu(query, context)
+
+    if query.data != "rev_delete_yes":
+        logger.warning("revision_delete_confirm_handler got unexpected callback %r — ignoring", query.data)
+        return REVISION_DELETE_CONFIRM
 
     try:
         await run_blocking(delete_revision_row, revision["existing_record"]["__row"])
@@ -9040,7 +9387,7 @@ async def start(update: Update, context):
         return await deny_private_access(update)
     context.user_data.clear()
     keyboard = [
-        [InlineKeyboardButton("👀 К обслуживанию сегодня", callback_data="service_today")],
+        [InlineKeyboardButton("👀 К обслуживанию сегодня", callback_data="service_today", style="primary")],
         [InlineKeyboardButton("🔧 Обслуживание", callback_data="service")],
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
@@ -9784,11 +10131,13 @@ async def show_repair_history_screen(query, context, machine_id):
 
     repair_ctx = get_repair_context(context)
     repair_ctx["history_machine_id"] = machine_id
+    point = repair_ctx.get("history_point", "")
+    back_cb = f"repair_hist_point_{point}" if point else "repair_history"
     await show_text_screen(
         query,
         context,
         build_machine_history_text(data["machine"], data),
-        reply_markup=build_repair_history_back_markup(repair_ctx.get("history_point", "")),
+        reply_markup=build_machine_history_markup(data, back_cb),
         parse_mode="HTML",
     )
     return REPAIR_HISTORY_MACHINE
@@ -9813,11 +10162,15 @@ async def show_repair_centers_screen(query, context):
             await show_sheets_busy_notice(query)
             return REPAIR_MENU_SECTION
         raise
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить сервисный центр", callback_data="repair_refs_centers_add")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="repair_refs")],
+    ]
     await show_text_screen(
         query,
         context,
         build_repair_centers_text(centers),
-        reply_markup=back_markup("repair_refs"),
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
     )
     return REPAIR_MENU_SECTION
@@ -9832,11 +10185,15 @@ async def show_repair_machines_screen(query, context):
             await show_sheets_busy_notice(query)
             return REPAIR_MENU_SECTION
         raise
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить аппарат", callback_data="repair_refs_machines_add")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="repair_refs")],
+    ]
     await show_text_screen(
         query,
         context,
         build_repair_machines_text(machines),
-        reply_markup=back_markup("repair_refs"),
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="HTML",
     )
     return REPAIR_MENU_SECTION
@@ -10264,6 +10621,30 @@ async def repair_menu_handler(update: Update, context):
         return await show_repair_centers_screen(query, context)
     if data == "repair_refs_machines":
         return await show_repair_machines_screen(query, context)
+    if data == "repair_refs_centers_add":
+        await show_text_screen(
+            query, context,
+            "➕ <b>Добавить сервисный центр</b>\n\n"
+            "Отправь команду в личке боту:\n"
+            "<code>/add_center Название;Город;Контакт;Телефон;Email;Адрес;Специализация;Заметки</code>\n\n"
+            "Обязательно только название. Остальные поля можно оставить пустыми (но разделители <code>;</code> сохраняй).\n\n"
+            "Пример: <code>/add_center Кофесервис;Москва;Иван;+79991234567</code>",
+            reply_markup=back_markup("repair_refs_centers"),
+            parse_mode="HTML",
+        )
+        return REPAIR_MENU_SECTION
+    if data == "repair_refs_machines_add":
+        await show_text_screen(
+            query, context,
+            "➕ <b>Добавить аппарат</b>\n\n"
+            "Отправь команду в личке боту:\n"
+            "<code>/add_machine Точка;Бренд;Модель;Серийный;ДатаПокупки;Гарантия;Заметки</code>\n\n"
+            "Обязательны: Точка и Бренд. Точки: " + ", ".join(POINTS) + "\n\n"
+            "Пример: <code>/add_machine Сити;Saeco;Aulika EVO;SN-12345</code>",
+            reply_markup=back_markup("repair_refs_machines"),
+            parse_mode="HTML",
+        )
+        return REPAIR_MENU_SECTION
     if data.startswith("repair_open_"):
         return await show_repair_card_screen(query, context, data.replace("repair_open_", "", 1))
     if data.startswith("repair_status_"):
@@ -11247,7 +11628,7 @@ async def repair_expense_paid_handler(update: Update, context):
 
 async def show_service_section_menu(query, context):
     keyboard = [
-        [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start")],
+        [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start", style="primary")],
         [InlineKeyboardButton("🛠 Ремонт", callback_data="repair")],
         [InlineKeyboardButton("📋 Информация по точкам", callback_data="info")],
         [InlineKeyboardButton("⚠️ Проблемные точки", callback_data="service_problem_points")],
@@ -11386,7 +11767,7 @@ async def show_salary_task_confirm_screen(query, context, notice=None):
         text = f"{notice}\n\n{text}"
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✅ Сохранить", callback_data="salary_task_save")],
+            [InlineKeyboardButton("✅ Сохранить", callback_data="salary_task_save", style="primary")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back_salary_task_amount")],
             [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
         ]
@@ -11432,7 +11813,7 @@ def get_payout_screen_access(query, settlement):
 def build_payout_delete_markup(confirm_callback, back_screen):
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✅ Да, удалить", callback_data=confirm_callback)],
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=confirm_callback, style="danger")],
             [InlineKeyboardButton("⬅️ Назад", callback_data=f"payout_screen:{back_screen}")],
         ]
     )
@@ -12820,6 +13201,76 @@ async def cancel(update: Update, context):
     await update.message.reply_text("❌ Действие отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
+async def cmd_add_center(update: Update, context):
+    if not is_allowed_user(update):
+        return await deny_private_access(update)
+    raw = " ".join(context.args).strip() if context.args else ""
+    if not raw:
+        await update.effective_message.reply_text(
+            "Использование:\n"
+            "<code>/add_center Название;Город;Контакт;Телефон;Email;Адрес;Специализация;Заметки</code>\n\n"
+            "Обязательно только название. Остальные поля можно оставить пустыми, разделители оставь:\n"
+            "<code>/add_center Кофесервис;Москва;;+7...</code>",
+            parse_mode="HTML",
+        )
+        return
+    parts = [p.strip() for p in raw.split(";")]
+    headers_fields = ["Название", "Город", "Контактное лицо", "Телефон", "Email", "Адрес", "Специализация", "Заметки"]
+    entry = {field: (parts[i] if i < len(parts) else "") for i, field in enumerate(headers_fields)}
+    if not entry["Название"]:
+        await update.effective_message.reply_text("❌ Название не может быть пустым.")
+        return
+    try:
+        centers = await run_blocking(get_all_repair_centers)
+        entry["id"] = next_prefixed_id(centers, "SC")
+        await run_blocking(add_repair_center_row, entry)
+    except Exception:
+        logger.exception("cmd_add_center failed: raw=%s", raw)
+        await update.effective_message.reply_text("❌ Не удалось добавить сервисный центр.")
+        return
+    await update.effective_message.reply_text(
+        f"✅ Сервисный центр добавлен: {entry['id']} · {entry['Название']}"
+    )
+
+
+async def cmd_add_machine(update: Update, context):
+    if not is_allowed_user(update):
+        return await deny_private_access(update)
+    raw = " ".join(context.args).strip() if context.args else ""
+    if not raw:
+        await update.effective_message.reply_text(
+            "Использование:\n"
+            "<code>/add_machine Точка;Бренд;Модель;Серийный;ДатаПокупки;Гарантия;Заметки</code>\n\n"
+            "Обязательны: Точка и Бренд. Точки: " + ", ".join(POINTS) + "\n"
+            "Пример: <code>/add_machine Сити;Saeco;Aulika EVO;SN-12345</code>",
+            parse_mode="HTML",
+        )
+        return
+    parts = [p.strip() for p in raw.split(";")]
+    headers_fields = ["Точка", "Бренд", "Модель", "Серийный номер", "Дата покупки", "Гарантия до", "Заметки"]
+    entry = {field: (parts[i] if i < len(parts) else "") for i, field in enumerate(headers_fields)}
+    if not entry["Точка"] or not entry["Бренд"]:
+        await update.effective_message.reply_text("❌ Точка и Бренд обязательны.")
+        return
+    if entry["Точка"] not in POINTS:
+        await update.effective_message.reply_text(
+            f"❌ Точка «{entry['Точка']}» не из списка. Допустимые: {', '.join(POINTS)}"
+        )
+        return
+    entry["Статус"] = REPAIR_MACHINE_WORKING
+    try:
+        machines = await run_blocking(get_all_repair_machines)
+        entry["id"] = next_prefixed_id(machines, "M")
+        await run_blocking(add_repair_machine_row, entry)
+    except Exception:
+        logger.exception("cmd_add_machine failed: raw=%s", raw)
+        await update.effective_message.reply_text("❌ Не удалось добавить аппарат.")
+        return
+    await update.effective_message.reply_text(
+        f"✅ Аппарат добавлен: {entry['id']} · {entry['Точка']} · {entry['Бренд']} {entry['Модель']}".rstrip()
+    )
+
+
 async def cmd_ids(update: Update, context):
     if not is_allowed_user(update):
         return await deny_private_access(update)
@@ -13530,7 +13981,7 @@ async def service_today_notice(update: Update, context):
             callback_data="service_today_repair",
         )])
     kb.extend([
-        [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start")],
+        [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start", style="primary")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_service_menu")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ])
@@ -13990,8 +14441,8 @@ async def delete_date_custom_handler(update: Update, context):
     points = order_points({entry.get("Точка", "") for entry in entries if entry.get("Точка")})
     kb = [
         [InlineKeyboardButton("✏️ Изменить запись", callback_data="fix_action_edit")],
-        [InlineKeyboardButton("🗑 Удалить одну запись", callback_data="fix_action_delete_one")],
-        [InlineKeyboardButton(f"🗑 Удалить все записи за день ({len(entries)})", callback_data="fix_action_delete_day")],
+        [InlineKeyboardButton("🗑 Удалить одну запись", callback_data="fix_action_delete_one", style="danger")],
+        [InlineKeyboardButton(f"🗑 Удалить все записи за день ({len(entries)})", callback_data="fix_action_delete_day", style="danger")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_date")],
     ]
     await update.message.reply_text(
@@ -14176,6 +14627,10 @@ async def delete_confirm_handler(update: Update, context):
             [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
         ]
         await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(kb))
+        return DELETE_CONFIRM
+
+    if query.data != "del_confirm_yes":
+        logger.warning("delete_confirm_handler got unexpected callback %r — ignoring", query.data)
         return DELETE_CONFIRM
 
     entry = delete_data.get("entry")
@@ -15912,13 +16367,30 @@ async def process_group_report_message(message, application, photo_ids=None):
     except Exception:
         logger.exception("Failed to refresh group service-today post after group report save")
 
-    try:
-        await send_group_report_saved_message(application, draft, save_result)
-    except Exception:
+    last_error = None
+    for attempt in range(4):
+        try:
+            await send_group_report_saved_message(application, draft, save_result)
+            last_error = None
+            break
+        except (NetworkError, TimedOut) as e:
+            last_error = e
+            delay = 2 ** attempt  # 1, 2, 4, 8
+            logger.warning(
+                "send_group_report_saved_message network retry %d/4 in %ds: %s",
+                attempt + 1, delay, type(e).__name__,
+            )
+            await asyncio.sleep(delay)
+        except Exception as e:
+            last_error = e
+            break
+
+    if last_error is not None:
         logger.exception(
             "Failed to send saved group report confirmation chat=%s source=%s",
             draft["chat_id"],
             draft["source_key"],
+            exc_info=last_error,
         )
         fallback_result = dict(save_result or {})
         fallback_warnings = list(fallback_result.get("warnings", []))
@@ -16451,7 +16923,7 @@ async def travel_history_period_handler(update: Update, context):
                 ),
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"tr_edit_delete_yes:{row_num}")],
+                        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"tr_edit_delete_yes:{row_num}", style="danger")],
                         [InlineKeyboardButton("⬅️ Назад", callback_data=f"tr_edit_entry:{row_num}")],
                     ]
                 ),
@@ -18259,10 +18731,16 @@ def main():
     if PHOTO_CHAT_ID is None:
         raise RuntimeError("PHOTO_CHAT_ID is not set")
     persistence = PicklePersistence(filepath=resolve_runtime_path(PERSISTENCE_FILE))
+    # TimeWeb's IPv4 route to Telegram's 149.154.166.0/24 flaps; default 5s
+    # connect timeout in httpx isn't enough when both IPv4 and IPv6 moment
+    # simultaneously. Larger timeouts + longer pool absorb short outages.
+    request_kwargs = dict(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .persistence(persistence)
+        .request(HTTPXRequest(**request_kwargs))
+        .get_updates_request(HTTPXRequest(**request_kwargs))
         .post_init(on_app_startup)
         .post_shutdown(on_app_shutdown)
         .build()
@@ -18466,7 +18944,10 @@ def main():
             REVISION_PERIOD: [CallbackQueryHandler(revision_period_handler)],
             REVISION_LOCATION: [CallbackQueryHandler(revision_location_handler)],
             REVISION_EXISTING: [CallbackQueryHandler(revision_existing_handler)],
-            REVISION_ITEM: [CallbackQueryHandler(revision_item_handler)],
+            REVISION_ITEM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, revision_item_text_input_handler),
+                CallbackQueryHandler(revision_item_handler),
+            ],
             REVISION_ITEM_CUSTOM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, revision_item_custom_handler),
                 CallbackQueryHandler(revision_item_custom_back_handler),
@@ -18493,6 +18974,8 @@ def main():
             CommandHandler("dupes", cmd_service_duplicates),
             CommandHandler("delete_service_rows", cmd_delete_service_rows),
             CommandHandler("delrows", cmd_delete_service_rows),
+            CommandHandler("add_center", cmd_add_center),
+            CommandHandler("add_machine", cmd_add_machine),
         ],
     )
 
