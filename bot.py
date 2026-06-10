@@ -5,26 +5,33 @@ import json
 import logging
 import os
 import re
+from datetime import date, datetime, timedelta
+from functools import lru_cache
 from html import escape as escape_html
-import gspread
-from gspread.exceptions import APIError, WorksheetNotFound
-from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError, WorksheetNotFound
 from telegram import (
-    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
     ReplyKeyboardRemove,
+    Update,
 )
 from telegram.error import BadRequest
-from telegram.helpers import escape_markdown
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ConversationHandler, filters
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    PicklePersistence,
+    filters,
 )
+from telegram.helpers import escape_markdown
+
 
 # ============ НАСТРОЙКИ ============
 def parse_env_id_set(name, default_values=None):
@@ -46,32 +53,60 @@ def parse_env_id_set(name, default_values=None):
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
-PHOTO_CHAT_ID = int(os.getenv("PHOTO_CHAT_ID", "-5289856494"))
+PHOTO_CHAT_ID_RAW = os.getenv("PHOTO_CHAT_ID", "").strip()
 CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json").strip()
+USERS_JSON = os.getenv("USERS_JSON", "").strip()
 GROUP_REPORT_DRAFT_TTL_SECONDS = int(os.getenv("GROUP_REPORT_DRAFT_TTL_SECONDS", "86400"))
-GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS = int(os.getenv("GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS", "300"))
+GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS = int(
+    os.getenv("GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS", "300")
+)
+GROUP_REPORT_ACTION_WINDOW_SECONDS = int(os.getenv("GROUP_REPORT_ACTION_WINDOW_SECONDS", "60"))
+SERVICE_DUPLICATE_REVIEW_TTL_SECONDS = int(os.getenv("SERVICE_DUPLICATE_REVIEW_TTL_SECONDS", "3600"))
 CARD_MESSAGES_AUTO_CLEANUP_SECONDS = int(os.getenv("CARD_MESSAGES_AUTO_CLEANUP_SECONDS", "600"))
 SHEETS_BOOK_CACHE_TTL_SECONDS = int(os.getenv("SHEETS_BOOK_CACHE_TTL_SECONDS", "60"))
+PAYOUT_SCREEN_LOAD_TIMEOUT_SECONDS = int(os.getenv("PAYOUT_SCREEN_LOAD_TIMEOUT_SECONDS", "25"))
 BOT_TIMEZONE = ZoneInfo("Europe/Moscow")
 REMINDER_STATE_FILE = os.getenv("REMINDER_STATE_FILE", "reminder_state.json").strip()
+PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_state.pickle").strip()
 SERVICE_TODAY_GROUP_POST_HOUR = int(os.getenv("SERVICE_TODAY_GROUP_POST_HOUR", "9"))
 SERVICE_TODAY_GROUP_DELETE_HOUR = int(os.getenv("SERVICE_TODAY_GROUP_DELETE_HOUR", "2"))
 HOME_REVISION_REMINDER_HOUR = int(os.getenv("HOME_REVISION_REMINDER_HOUR", "12"))
 MONTH_CLOSE_REVISION_REMINDER_HOUR = int(os.getenv("MONTH_CLOSE_REVISION_REMINDER_HOUR", "12"))
 
-USERS = {
+if PHOTO_CHAT_ID_RAW:
+    try:
+        PHOTO_CHAT_ID = int(PHOTO_CHAT_ID_RAW)
+    except ValueError as exc:
+        raise RuntimeError("PHOTO_CHAT_ID must be an integer") from exc
+else:
+    PHOTO_CHAT_ID = None
+
+USER_DIRECTORY_SHEET = "Пользователи"
+USER_DIRECTORY_HEADERS = ["telegram_id", "имя", "роль"]
+
+DEPRECATED_USERS = {
+    # DEPRECATED: перенести в Sheets.
     1395822345: "Матвей",
     611556433: "Владислав",
     5075547917: "Начальник",
     874403512: "Кирилл",
 }
-ALLOWED_USER_IDS = parse_env_id_set("ALLOWED_USER_IDS", USERS.keys())
+ALLOWED_USER_IDS = parse_env_id_set("ALLOWED_USER_IDS")
 ALLOWED_GROUP_CHAT_IDS = parse_env_id_set("ALLOWED_GROUP_CHAT_IDS")
 
 PAID_WORKERS = ["Кирилл"]
 SERVICE_PRICE = 250
 DEFAULT_FARE = 48
 WORKERS = ["Кирилл", "Матвей", "Владислав", "Начальник"]
+OWNER_ID = 5075547917
+MATVEY_ID = 1395822345
+KIRILL_ID = 874403512
+PAYOUT_WORKER = "Кирилл"
+PAYOUT_VIEWERS = {MATVEY_ID, KIRILL_ID}
+PAYOUT_EDITORS = {MATVEY_ID}
+PAYOUT_SHEET = "Выплаты"
+PAYOUT_STATUS_PENDING = "ожидает"
+PAYOUT_STATUS_PAID = "переведено"
 POINTS = ["Беломорский", "Гагарина", "Гиппо", "Южный", "Сити", "Макси", "Бел2"]
 REVISION_LOCATIONS = POINTS + ["Дома"]
 POINT_SHORT_LABELS = {
@@ -321,7 +356,14 @@ REPAIR_STATUS_ICONS = {
  REVISION_VIEW_MODE, REVISION_VIEW_LOCATION, REVISION_VIEW_ITEM,
  REVISION_COMPARE_LOCATION, REVISION_DELETE_CONFIRM,
  REVISION_IMPORT_TEXT, REVISION_IMPORT_CONFIRM,
- REVISION_PROCUREMENT_REPORT) = range(84)
+ REVISION_PROCUREMENT_REPORT,
+ TRAVEL_MENU, TRAVEL_HISTORY_PERIOD,
+ SALARY_TASK_WORKER, SALARY_TASK_DATE, SALARY_TASK_DATE_CUSTOM,
+ SALARY_TASK_DESCRIPTION, SALARY_TASK_AMOUNT, SALARY_TASK_CONFIRM,
+ PAYOUT_SCREEN, PAYOUT_CORRECTION_AMOUNT, PAYOUT_CORRECTION_NOTE,
+ PAYOUT_TRAVEL_EDIT_AMOUNT, PAYOUT_TRAVEL_EDIT_DATE,
+ PAYOUT_TASK_EDIT_DESCRIPTION, PAYOUT_TASK_EDIT_AMOUNT,
+ PAYOUT_TASK_EDIT_DATE) = range(100)
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -336,9 +378,98 @@ async def global_error_handler(update: object, context):
     logger.exception("Unhandled exception while processing update", exc_info=context.error)
 
 
+def parse_users_json(raw_value):
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("USERS_JSON must be valid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("USERS_JSON must be a JSON object mapping Telegram IDs to names")
+
+    users = {}
+    for raw_id, raw_name in payload.items():
+        try:
+            telegram_id = int(str(raw_id).strip())
+        except ValueError as exc:
+            raise RuntimeError("USERS_JSON keys must be Telegram integer IDs") from exc
+
+        name = str(raw_name).strip()
+        if not name:
+            raise RuntimeError("USERS_JSON values must be non-empty names")
+        users[telegram_id] = name
+    return users
+
+
+def build_users_from_records(records):
+    users = {}
+    for record in records:
+        raw_id = str(record.get("telegram_id", "")).strip()
+        name = str(record.get("имя", "")).strip()
+        if not raw_id and not name:
+            continue
+        if not raw_id or not name:
+            logger.warning(
+                "Skipping incomplete user directory row: telegram_id=%r name=%r",
+                raw_id,
+                name,
+            )
+            continue
+        try:
+            telegram_id = int(raw_id)
+        except ValueError:
+            logger.warning("Skipping invalid telegram_id in %s: %r", USER_DIRECTORY_SHEET, raw_id)
+            continue
+        users[telegram_id] = name
+    return users
+
+
+@lru_cache(maxsize=1)
+def get_user_directory():
+    if USERS_JSON:
+        return parse_users_json(USERS_JSON)
+
+    try:
+        get_or_create_worksheet(USER_DIRECTORY_SHEET, USER_DIRECTORY_HEADERS)
+        users = build_users_from_records(get_records(USER_DIRECTORY_SHEET, USER_DIRECTORY_HEADERS))
+        if users:
+            return users
+        logger.warning(
+            "%s is empty, using deprecated user directory fallback",
+            USER_DIRECTORY_SHEET,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to load users from %s, using deprecated fallback",
+            USER_DIRECTORY_SHEET,
+        )
+
+    return dict(DEPRECATED_USERS)
+
+
+def get_allowed_user_ids():
+    return ALLOWED_USER_IDS or set(get_user_directory().keys())
+
+
+def get_configured_user_name(user_id):
+    if user_id is None:
+        return None
+    return get_user_directory().get(user_id)
+
+
 def is_allowed_user(update):
     user = update.effective_user
-    return bool(user and user.id in ALLOWED_USER_IDS)
+    return bool(user and user.id in get_allowed_user_ids())
+
+
+def is_payout_viewer(update):
+    user = getattr(update, "effective_user", None)
+    return bool(user and user.id in PAYOUT_VIEWERS)
+
+
+def is_payout_editor(update):
+    user = getattr(update, "effective_user", None)
+    return bool(user and user.id in PAYOUT_EDITORS)
 
 
 def is_allowed_group_chat(update):
@@ -349,6 +480,15 @@ def is_allowed_group_chat(update):
         and ALLOWED_GROUP_CHAT_IDS
         and chat.id in ALLOWED_GROUP_CHAT_IDS
     )
+
+
+def is_private_chat(update):
+    chat = update.effective_chat
+    return bool(chat and chat.type == "private")
+
+
+def is_allowed_group_report_chat(update):
+    return is_private_chat(update) or is_allowed_group_chat(update)
 
 
 async def deny_private_access(update):
@@ -362,14 +502,31 @@ async def deny_callback_access(query):
     await query.answer("⛔ Нет доступа.", show_alert=True)
 
 # ============ GOOGLE SHEETS ============
-SERVICE_HEADERS = ["Дата", "Кто", "Точка", "Вода(бут)", "Нехватка", "Остатки", "Закупки", "Сумма закупок", "Сумма обслуж"]
+SERVICE_HEADERS = [
+    "Дата", "Кто", "Точка", "Вода(бут)", "Нехватка",
+    "Остатки", "Закупки", "Сумма закупок", "Сумма обслуж", "В ЗП",
+]
 TRAVEL_HEADERS = ["Дата", "Кто", "Сумма"]
 PHOTO_HEADERS = ["Дата", "Точка", "Кто", "File_ID"]
+SALARY_TASK_HEADERS = ["Дата", "Кто", "Описание", "Сумма", "Кто добавил"]
+PAYOUT_HEADERS = [
+    "Период", "Кому",
+    "Сумма обсл", "Кол-во обсл",
+    "Сумма закупок",
+    "Сумма проезда", "Кол-во записей проезда",
+    "Сумма доплат", "Кол-во доплат",
+    "Корректировка", "Комм. корректировки",
+    "Итого",
+    "Статус",
+    "Дата перевода",
+    "Кто отметил",
+]
 REVISION_HEADERS = ["Период", "Локация", "Кто", "Дата заполнения"] + REVISION_ITEMS
 GROUP_REPORT_LOG_HEADERS = [
     "Chat_ID", "Source_Key", "Source_Message_ID", "Media_Group_ID",
     "Кто", "Точка", "Дата", "Fingerprint", "Service_Row", "Photo_Rows",
-    "Статус", "Создано",
+    "Revision_Row", "Revision_Period", "Revision_Location", "Revision_Mode",
+    "Revision_Backup", "Статус", "Создано",
 ]
 RENT_LANDLORD_HEADERS = [
     "id", "Имя / Название", "Телефон", "Email", "ИНН",
@@ -435,6 +592,7 @@ REPAIR_SHEET_REPAIRS = "Ремонты"
 REPAIR_SHEET_EXPENSES = "Расходы на ремонт"
 REPAIR_SHEET_DOCUMENTS = "Документы ремонта"
 REPAIR_SHEET_SERVICE = "Ремонт_служебное"
+SALARY_TASK_SHEET = "ЗП задачи"
 
 
 def get_sheet():
@@ -514,48 +672,124 @@ def append_row_and_get_index(sheet, values):
     return len(sheet.get_all_values())
 
 
-def add_service_row(data):
-    sheet = get_sheet().worksheet("Обслуживание")
-    return append_row_and_get_index(sheet, [
+def default_service_salary_workers(who):
+    worker = str(who or "").strip()
+    if worker in PAID_WORKERS:
+        return [worker]
+    return []
+
+
+def normalize_salary_workers(value):
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        parts = [str(part).strip() for part in value]
+    elif value in (None, ""):
+        parts = []
+    else:
+        parts = [str(value).strip()]
+
+    workers = []
+    seen = set()
+    for part in parts:
+        if not part:
+            continue
+        if part in seen:
+            continue
+        seen.add(part)
+        workers.append(part)
+    return order_workers(workers)
+
+
+def serialize_salary_workers(value):
+    return ", ".join(normalize_salary_workers(value))
+
+
+def get_service_salary_workers(entry):
+    raw_value = str(entry.get("В ЗП", "")).strip().lower()
+    if raw_value in {"нет", "-", "—", "none"}:
+        return []
+    workers = normalize_salary_workers(entry.get("В ЗП", ""))
+    if workers:
+        return workers
+    return default_service_salary_workers(entry.get("Кто", ""))
+
+
+def get_service_salary_workers_from_context(svc):
+    if "salary_workers" in svc:
+        return normalize_salary_workers(svc.get("salary_workers"))
+    return default_service_salary_workers(svc.get("who", ""))
+
+
+def calculate_service_sum_for_workers(workers):
+    paid_count = sum(1 for worker in normalize_salary_workers(workers) if worker in PAID_WORKERS)
+    return SERVICE_PRICE * paid_count
+
+
+def build_service_row_values(data):
+    salary_workers = normalize_salary_workers(data.get("salary_workers"))
+    salary_workers_raw = serialize_salary_workers(salary_workers)
+    if not salary_workers_raw and "salary_workers" in data and str(data.get("who", "")).strip() in PAID_WORKERS:
+        salary_workers_raw = "нет"
+    return [
         data["date"], data["who"], data["point"], data["water"],
         data.get("shortage", ""), data.get("shortage_qty", ""),
         data.get("purchases", ""), data.get("purchase_sum", 0),
-        data.get("service_sum", 0)
-    ])
+        data.get("service_sum", 0), salary_workers_raw,
+    ]
+
+
+def add_service_row(data):
+    sheet = get_or_create_worksheet("Обслуживание", SERVICE_HEADERS)
+    return append_row_and_get_index(sheet, build_service_row_values(data))
 
 
 def update_service_row(row_num, data):
-    sheet = get_sheet().worksheet("Обслуживание")
-    sheet.update(
-        f"A{row_num}:I{row_num}",
-        [[
-            data["date"], data["who"], data["point"], data["water"],
-            data.get("shortage", ""), data.get("shortage_qty", ""),
-            data.get("purchases", ""), data.get("purchase_sum", 0),
-            data.get("service_sum", 0)
-        ]],
-    )
+    sheet = get_or_create_worksheet("Обслуживание", SERVICE_HEADERS)
+    sheet.update(f"A{row_num}:J{row_num}", [build_service_row_values(data)])
+
 
 def add_travel_row(date, who, amount):
-    return append_row_and_get_index(get_sheet().worksheet("Проезд"), [date, who, amount])
+    return append_row_and_get_index(get_or_create_worksheet("Проезд", TRAVEL_HEADERS), [date, who, amount])
+
+
+def update_travel_row(row_num, date, who, amount):
+    get_or_create_worksheet("Проезд", TRAVEL_HEADERS).update(
+        f"A{row_num}:C{row_num}",
+        [[date, who, amount]],
+    )
+
+
+def delete_travel_row(row_num):
+    get_or_create_worksheet("Проезд", TRAVEL_HEADERS).delete_rows(row_num)
+
 
 def add_photo_row(date, point, who, file_id):
-    return append_row_and_get_index(get_sheet().worksheet("Фото"), [date, point, who, file_id])
+    return append_row_and_get_index(get_or_create_worksheet("Фото", PHOTO_HEADERS), [date, point, who, file_id])
 
 
 def update_photo_row(row_num, date, point, who, file_id):
-    get_sheet().worksheet("Фото").update(
+    get_or_create_worksheet("Фото", PHOTO_HEADERS).update(
         f"A{row_num}:D{row_num}",
         [[date, point, who, file_id]],
     )
 
 def get_all_services():
+    get_or_create_worksheet("Обслуживание", SERVICE_HEADERS)
     return get_records("Обслуживание", SERVICE_HEADERS)
 
 def get_all_travels():
+    get_or_create_worksheet("Проезд", TRAVEL_HEADERS)
     return get_records("Проезд", TRAVEL_HEADERS)
 
+
+def get_all_travels_with_rows():
+    get_or_create_worksheet("Проезд", TRAVEL_HEADERS)
+    return get_records_with_rows("Проезд", TRAVEL_HEADERS)
+
+
 def get_all_photos():
+    get_or_create_worksheet("Фото", PHOTO_HEADERS)
     return get_records("Фото", PHOTO_HEADERS)
 
 
@@ -579,11 +813,211 @@ def get_records_with_rows(worksheet_name, headers):
 
 
 def get_all_services_with_rows():
+    get_or_create_worksheet("Обслуживание", SERVICE_HEADERS)
     return get_records_with_rows("Обслуживание", SERVICE_HEADERS)
 
 
 def get_all_photos_with_rows():
+    get_or_create_worksheet("Фото", PHOTO_HEADERS)
     return get_records_with_rows("Фото", PHOTO_HEADERS)
+
+
+def get_all_salary_tasks():
+    get_or_create_worksheet(SALARY_TASK_SHEET, SALARY_TASK_HEADERS)
+    return get_records(SALARY_TASK_SHEET, SALARY_TASK_HEADERS)
+
+
+def get_all_salary_tasks_with_rows():
+    get_or_create_worksheet(SALARY_TASK_SHEET, SALARY_TASK_HEADERS)
+    return get_records_with_rows(SALARY_TASK_SHEET, SALARY_TASK_HEADERS)
+
+
+def add_salary_task_row(entry):
+    sheet = get_or_create_worksheet(SALARY_TASK_SHEET, SALARY_TASK_HEADERS)
+    return append_row_and_get_index(
+        sheet,
+        [
+            entry.get("date", ""),
+            entry.get("who", ""),
+            entry.get("description", ""),
+            entry.get("amount", ""),
+            entry.get("added_by", ""),
+        ],
+    )
+
+
+def update_salary_task_row(row_num, entry):
+    get_or_create_worksheet(SALARY_TASK_SHEET, SALARY_TASK_HEADERS).update(
+        f"A{row_num}:E{row_num}",
+        [[
+            entry.get("date", ""),
+            entry.get("who", ""),
+            entry.get("description", ""),
+            entry.get("amount", ""),
+            entry.get("added_by", ""),
+        ]],
+    )
+
+
+def delete_salary_task_row(row_num):
+    get_or_create_worksheet(SALARY_TASK_SHEET, SALARY_TASK_HEADERS).delete_rows(row_num)
+
+
+def ensure_payouts_worksheet():
+    ensure_worksheet_group("payouts", [(PAYOUT_SHEET, PAYOUT_HEADERS)])
+
+
+def build_payout_row_values(entry):
+    return [
+        entry.get("period", ""),
+        entry.get("who", ""),
+        entry.get("service_sum", 0),
+        entry.get("service_count", 0),
+        entry.get("purchase_sum", 0),
+        entry.get("travel_sum", 0),
+        entry.get("travel_count", 0),
+        entry.get("salary_task_sum", 0),
+        entry.get("salary_task_count", 0),
+        entry.get("correction", 0),
+        entry.get("correction_note", ""),
+        entry.get("total", 0),
+        entry.get("status", PAYOUT_STATUS_PENDING),
+        entry.get("paid_date", ""),
+        entry.get("paid_by", ""),
+    ]
+
+
+def get_all_payouts():
+    ensure_payouts_worksheet()
+    return get_records(PAYOUT_SHEET, PAYOUT_HEADERS)
+
+
+def get_all_payouts_with_rows():
+    ensure_payouts_worksheet()
+    return get_records_with_rows(PAYOUT_SHEET, PAYOUT_HEADERS)
+
+
+def find_payout_record(records, period_key, who):
+    period_key = str(period_key).strip()
+    who = str(who).strip()
+    return next(
+        (
+            record
+            for record in records
+            if str(record.get("Период", "")).strip() == period_key
+            and str(record.get("Кому", "")).strip() == who
+        ),
+        None,
+    )
+
+
+def get_payout(period_key, who):
+    return find_payout_record(get_all_payouts_with_rows(), period_key, who)
+
+
+def add_payout_row(entry):
+    sheet = get_or_create_worksheet(PAYOUT_SHEET, PAYOUT_HEADERS)
+    return append_row_and_get_index(sheet, build_payout_row_values(entry))
+
+
+def update_payout_row(row_num, entry):
+    sheet = get_or_create_worksheet(PAYOUT_SHEET, PAYOUT_HEADERS)
+    sheet.update(
+        f"A{row_num}:O{row_num}",
+        [build_payout_row_values(entry)],
+    )
+
+
+def build_payout_entry_from_record(record):
+    if not record:
+        return {
+            "period": "",
+            "who": "",
+            "service_sum": 0,
+            "service_count": 0,
+            "purchase_sum": 0,
+            "travel_sum": 0,
+            "travel_count": 0,
+            "salary_task_sum": 0,
+            "salary_task_count": 0,
+            "correction": 0,
+            "correction_note": "",
+            "total": 0,
+            "status": PAYOUT_STATUS_PENDING,
+            "paid_date": "",
+            "paid_by": "",
+        }
+
+    return {
+        "period": str(record.get("Период", "")).strip(),
+        "who": str(record.get("Кому", "")).strip(),
+        "service_sum": parse_numeric_value(record.get("Сумма обсл", "")) or 0,
+        "service_count": int(parse_numeric_value(record.get("Кол-во обсл", "")) or 0),
+        "purchase_sum": parse_numeric_value(record.get("Сумма закупок", "")) or 0,
+        "travel_sum": parse_numeric_value(record.get("Сумма проезда", "")) or 0,
+        "travel_count": int(parse_numeric_value(record.get("Кол-во записей проезда", "")) or 0),
+        "salary_task_sum": parse_numeric_value(record.get("Сумма доплат", "")) or 0,
+        "salary_task_count": int(parse_numeric_value(record.get("Кол-во доплат", "")) or 0),
+        "correction": parse_numeric_value(record.get("Корректировка", "")) or 0,
+        "correction_note": str(record.get("Комм. корректировки", "")).strip(),
+        "total": parse_numeric_value(record.get("Итого", "")) or 0,
+        "status": str(record.get("Статус", "")).strip() or PAYOUT_STATUS_PENDING,
+        "paid_date": str(record.get("Дата перевода", "")).strip(),
+        "paid_by": str(record.get("Кто отметил", "")).strip(),
+    }
+
+
+def upsert_payout(period_key, who, payload):
+    period_key = str(period_key).strip()
+    who = str(who).strip()
+    payouts = get_all_payouts_with_rows()
+    existing = find_payout_record(payouts, period_key, who)
+    entry = build_payout_entry_from_record(existing)
+    entry.update(payload)
+    entry["period"] = period_key
+    entry["who"] = who
+    if existing and existing.get("__row"):
+        update_payout_row(existing["__row"], entry)
+        entry["__row"] = existing["__row"]
+        return entry
+
+    row_num = add_payout_row(entry)
+    entry["__row"] = row_num
+    return entry
+
+
+def mark_payout_paid(period_key, who, paid_by, snapshot):
+    return upsert_payout(
+        period_key,
+        who,
+        {
+            "service_sum": snapshot.get("service_sum", 0),
+            "service_count": snapshot.get("service_count", 0),
+            "purchase_sum": snapshot.get("purchase_sum", 0),
+            "travel_sum": snapshot.get("travel_sum", 0),
+            "travel_count": snapshot.get("travel_count", 0),
+            "salary_task_sum": snapshot.get("salary_task_sum", 0),
+            "salary_task_count": snapshot.get("salary_task_count", 0),
+            "correction": snapshot.get("correction", 0),
+            "correction_note": snapshot.get("correction_note", ""),
+            "total": snapshot.get("total", 0),
+            "status": PAYOUT_STATUS_PAID,
+            "paid_date": today(),
+            "paid_by": paid_by,
+        },
+    )
+
+
+def unmark_payout_paid(period_key, who):
+    return upsert_payout(
+        period_key,
+        who,
+        {
+            "status": PAYOUT_STATUS_PENDING,
+            "paid_date": "",
+            "paid_by": "",
+        },
+    )
 
 
 def get_all_revisions():
@@ -836,6 +1270,11 @@ def append_group_report_log(entry):
         entry.get("fingerprint", ""),
         entry.get("service_row", ""),
         entry.get("photo_rows", ""),
+        entry.get("revision_row", ""),
+        entry.get("revision_period", ""),
+        entry.get("revision_location", ""),
+        entry.get("revision_mode", ""),
+        entry.get("revision_backup", ""),
         entry.get("status", ""),
         entry.get("created_at", ""),
     ]
@@ -845,7 +1284,7 @@ def append_group_report_log(entry):
 def update_group_report_log(row_num, entry):
     sheet = get_or_create_worksheet("Импорт группы", GROUP_REPORT_LOG_HEADERS)
     sheet.update(
-        f"A{row_num}:L{row_num}",
+        f"A{row_num}:Q{row_num}",
         [[
             entry.get("chat_id", ""),
             entry.get("source_key", ""),
@@ -857,6 +1296,11 @@ def update_group_report_log(row_num, entry):
             entry.get("fingerprint", ""),
             entry.get("service_row", ""),
             entry.get("photo_rows", ""),
+            entry.get("revision_row", ""),
+            entry.get("revision_period", ""),
+            entry.get("revision_location", ""),
+            entry.get("revision_mode", ""),
+            entry.get("revision_backup", ""),
             entry.get("status", ""),
             entry.get("created_at", ""),
         ]],
@@ -888,7 +1332,8 @@ def build_revision_row_values(data):
 
 
 def add_revision_row(data):
-    get_or_create_worksheet("Ревизия", REVISION_HEADERS).append_row(build_revision_row_values(data))
+    sheet = get_or_create_worksheet("Ревизия", REVISION_HEADERS)
+    return append_row_and_get_index(sheet, build_revision_row_values(data))
 
 
 def update_revision_row(row_num, data):
@@ -944,6 +1389,10 @@ def yesterday():
     return format_date(now_local() - timedelta(days=1))
 
 
+def day_before_yesterday():
+    return format_date(now_local() - timedelta(days=2))
+
+
 def now_local():
     return datetime.now(BOT_TIMEZONE)
 
@@ -953,6 +1402,48 @@ def parse_date(date_str):
         return datetime.strptime(str(date_str).strip(), "%d.%m.%Y")
     except (TypeError, ValueError):
         return None
+
+
+def format_group_report_created_at(dt=None):
+    return (dt or now_local()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_group_report_created_at(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            return parsed.replace(tzinfo=BOT_TIMEZONE)
+        except ValueError:
+            continue
+    return None
+
+
+def is_group_report_action_window_open(record):
+    created_at = parse_group_report_created_at(record.get("Создано", ""))
+    if not created_at:
+        return False
+    return now_local() - created_at <= timedelta(seconds=max(GROUP_REPORT_ACTION_WINDOW_SECONDS, 1))
+
+
+def get_period_key_for_date(date_str):
+    parsed = parse_date(date_str)
+    if not parsed:
+        return None
+    return build_period_key(parsed.year, parsed.month)
+
+
+def is_date_in_period_key(date_str, period_key):
+    return get_period_key_for_date(date_str) == str(period_key).strip()
+
+
+def get_period_restriction_error(date_str, period_key):
+    if period_key and not is_date_in_period_key(date_str, period_key):
+        return f"❌ Нужна дата внутри {format_period_label(period_key)}."
+    return None
 
 
 def validate_manual_date_input(date_str, allow_future=False, max_future_days=365):
@@ -1174,10 +1665,30 @@ def extract_service_report_shortage_items(text):
 
 
 def get_service_report_author(message):
+    forward_origin = getattr(message, "forward_origin", None)
+    if forward_origin:
+        sender_user = getattr(forward_origin, "sender_user", None)
+        if sender_user:
+            return (
+                get_configured_user_name(getattr(sender_user, "id", None))
+                or resolve_worker_name(getattr(sender_user, "first_name", ""))
+                or resolve_worker_name(getattr(sender_user, "username", ""))
+                or getattr(sender_user, "first_name", None)
+                or getattr(sender_user, "username", None)
+                or str(getattr(sender_user, "id", "Неизвестно"))
+            )
+
+        sender_user_name = getattr(forward_origin, "sender_user_name", None)
+        matched_name = resolve_worker_name(sender_user_name)
+        if matched_name:
+            return matched_name
+        if sender_user_name:
+            return str(sender_user_name).strip()
+
     tg_user = getattr(message, "from_user", None)
     if not tg_user:
         return "Неизвестно"
-    return USERS.get(tg_user.id) or tg_user.first_name or tg_user.username or str(tg_user.id)
+    return get_configured_user_name(tg_user.id) or tg_user.first_name or tg_user.username or str(tg_user.id)
 
 
 def get_message_local_date(message):
@@ -1230,9 +1741,6 @@ def parse_group_travel_message_text(text):
 def parse_service_report_message_text(text, has_photo=False):
     raw_text = str(text or "").strip()
     if not raw_text:
-        return None
-
-    if is_revision_like_service_report(raw_text):
         return None
 
     point = extract_service_report_point(raw_text)
@@ -1292,6 +1800,44 @@ def build_group_report_preview_text(draft):
     return "\n".join(lines)
 
 
+def build_group_report_duplicate_warning_text(draft, duplicates):
+    lines = [
+        "⚠️ Похоже, такое обслуживание уже есть.",
+        "",
+        build_group_report_preview_text(draft),
+        "",
+        "Совпадения в базе:",
+    ]
+
+    for entry in duplicates[:3]:
+        parts = [
+            f"• #{entry.get('__row', '?')}",
+            f"  📍 {entry.get('Точка', '?')}",
+            f"  📅 {entry.get('Дата', '?')}",
+            f"  👤 {entry.get('Кто', '?')}",
+            f"  💧 Вода: {format_number(entry.get('Вода(бут)', '?')) or 'не указана'}",
+        ]
+        purchase_sum = parse_numeric_value(entry.get("Сумма закупок", ""))
+        if purchase_sum:
+            parts.append(f"  🛒 Закупки: {format_money(purchase_sum)}")
+        lines.extend(parts)
+        lines.append("")
+
+    if len(duplicates) > 3:
+        lines.append(f"… и ещё {len(duplicates) - 3} совпад.")
+        lines.append("")
+
+    lines.append("Если это отдельный повторный выезд, сохрани его отдельной записью.")
+    return "\n".join(lines)
+
+
+def build_group_report_duplicate_draft_markup(draft_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Сохранить как отдельное", callback_data=f"grp_report_save_{draft_id}")],
+        [InlineKeyboardButton("❌ Не учитывать", callback_data=f"grp_report_ignore_{draft_id}")],
+    ])
+
+
 def get_group_report_drafts(bot_data):
     return bot_data.setdefault("group_report_drafts", {})
 
@@ -1319,7 +1865,8 @@ def next_group_report_draft_id(bot_data):
 
 def build_group_report_payload(draft):
     shortage_items = draft.get("shortage_items", [])
-    service_sum = SERVICE_PRICE if draft.get("who") in PAID_WORKERS else 0
+    salary_workers = default_service_salary_workers(draft.get("who"))
+    service_sum = calculate_service_sum_for_workers(salary_workers)
     return {
         "date": draft["date"],
         "who": draft["who"],
@@ -1330,7 +1877,43 @@ def build_group_report_payload(draft):
         "purchases": "",
         "purchase_sum": 0,
         "service_sum": service_sum,
+        "salary_workers": salary_workers,
     }
+
+
+def build_group_report_revision_data(draft):
+    raw_text = str(draft.get("source_text", "")).strip()
+    if not raw_text or not is_revision_like_service_report(raw_text):
+        return None, []
+
+    parsed, warnings = parse_revision_import_text(raw_text)
+    warnings = list(warnings)
+    if not parsed:
+        return None, warnings or ["не удалось распознать ревизию в сообщении"]
+
+    location = draft.get("point", "")
+    if location not in parsed:
+        if len(parsed) == 1:
+            location = next(iter(parsed))
+            warnings.append(f"ревизию зачёл по локации «{location}»")
+        else:
+            warnings.append("нашёл несколько локаций, ревизию не сохранил автоматически")
+            return None, warnings
+
+    values = parsed.get(location, {})
+    if not values:
+        return None, warnings or ["не нашёл значений ревизии для точки"]
+
+    period = get_period_key_for_date(draft.get("date", ""))
+    if not period:
+        warnings.append("не удалось определить месяц ревизии")
+        return None, warnings
+
+    return {
+        "period": period,
+        "location": location,
+        "values": values,
+    }, warnings
 
 
 def build_group_report_source_key(message):
@@ -1344,15 +1927,26 @@ def build_group_report_fingerprint(draft):
     shortage_items = sorted(normalize_text_key(item) for item in draft.get("shortage_items", []))
     normalized_source = re.sub(r"\s+", " ", normalize_text_key(draft.get("source_text", ""))).strip()
     raw = "||".join([
-        str(draft.get("chat_id", "")),
         normalize_text_key(draft.get("point", "")),
         normalize_text_key(draft.get("date", "")),
         normalize_text_key(draft.get("water", "")),
+        normalize_text_key(draft.get("who", "")),
         "|".join(shortage_items),
         normalized_source,
         str(len(draft.get("photo_ids", []))),
     ])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def build_group_report_revision_backup(record):
+    if not record:
+        return ""
+    payload = {
+        "who": record.get("Кто", ""),
+        "filled_at": record.get("Дата заполнения", ""),
+        "values": build_revision_values_from_record(record),
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def find_group_report_log_entry(chat_id, source_key):
@@ -1362,13 +1956,16 @@ def find_group_report_log_entry(chat_id, source_key):
     return None
 
 
+def get_group_report_log_entry_by_row(row_num):
+    return next((entry for entry in get_group_report_logs_with_rows() if entry.get("__row") == row_num), None)
+
+
 def find_group_report_duplicate(chat_id, source_key, fingerprint):
     matched_source = None
     matched_fingerprint = None
     for record in reversed(get_group_report_logs_with_rows()):
-        if str(record.get("Chat_ID", "")) != str(chat_id):
-            continue
-        if not matched_source and str(record.get("Source_Key", "")) == str(source_key):
+        same_chat = str(record.get("Chat_ID", "")) == str(chat_id)
+        if same_chat and not matched_source and str(record.get("Source_Key", "")) == str(source_key):
             matched_source = record
         if (
             not matched_fingerprint
@@ -1399,7 +1996,129 @@ def parse_logged_row_numbers(raw_value):
     return values
 
 
-def build_group_report_saved_text(draft):
+def save_group_report_revision(draft):
+    revision = draft.get("revision")
+    if not revision:
+        return None
+
+    existing = find_revision_record(revision["period"], revision["location"], True)
+    values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
+    for item_name, value in revision["values"].items():
+        values[item_name] = value
+
+    payload = {
+        "period": revision["period"],
+        "location": revision["location"],
+        "who": draft.get("who", ""),
+        "filled_at": today(),
+        "values": values,
+    }
+    if existing:
+        update_revision_row(existing["__row"], payload)
+        return {
+            "row": existing["__row"],
+            "period": revision["period"],
+            "location": revision["location"],
+            "mode": "updated",
+            "backup": build_group_report_revision_backup(existing),
+        }
+
+    row_num = add_revision_row(payload)
+    return {
+        "row": row_num,
+        "period": revision["period"],
+        "location": revision["location"],
+        "mode": "created",
+        "backup": "",
+    }
+
+
+def find_group_report_service_entry(record):
+    service_row_raw = str(record.get("Service_Row", "")).strip()
+    entries = get_all_services_with_rows()
+
+    try:
+        service_row = int(service_row_raw)
+    except ValueError:
+        service_row = None
+
+    if service_row is not None:
+        match = next((entry for entry in entries if entry.get("__row") == service_row), None)
+        if match:
+            return match
+
+    point = str(record.get("Точка", "")).strip()
+    date_value = str(record.get("Дата", "")).strip()
+    who = str(record.get("Кто", "")).strip()
+    matches = [
+        entry for entry in entries
+        if str(entry.get("Точка", "")).strip() == point
+        and str(entry.get("Дата", "")).strip() == date_value
+        and str(entry.get("Кто", "")).strip() == who
+    ]
+    return max(matches, key=lambda entry: entry.get("__row", 0)) if matches else None
+
+
+def find_group_report_revision_entry(record):
+    period = str(record.get("Revision_Period", "")).strip()
+    location = str(record.get("Revision_Location", "")).strip()
+    row_raw = str(record.get("Revision_Row", "")).strip()
+
+    if period and location:
+        try:
+            row_num = int(row_raw)
+        except ValueError:
+            row_num = None
+
+        matches = [
+            entry for entry in get_all_revisions_with_rows()
+            if str(entry.get("Период", "")).strip() == period
+            and str(entry.get("Локация", "")).strip() == location
+        ]
+        if row_num is not None:
+            exact = next((entry for entry in matches if entry.get("__row") == row_num), None)
+            if exact:
+                return exact
+        if matches:
+            return max(matches, key=lambda entry: entry.get("__row", 0))
+    return None
+
+
+def restore_group_report_revision(record):
+    revision_mode = str(record.get("Revision_Mode", "")).strip() or "created"
+    period = str(record.get("Revision_Period", "")).strip()
+    location = str(record.get("Revision_Location", "")).strip()
+    if not period or not location:
+        return "missing"
+
+    current = find_group_report_revision_entry(record)
+    if revision_mode == "updated":
+        backup_raw = str(record.get("Revision_Backup", "")).strip()
+        if not backup_raw:
+            return "missing"
+        snapshot = json.loads(backup_raw)
+        payload = {
+            "period": period,
+            "location": location,
+            "who": snapshot.get("who", ""),
+            "filled_at": snapshot.get("filled_at", ""),
+            "values": snapshot.get("values", {}),
+        }
+        if current:
+            update_revision_row(current["__row"], payload)
+        else:
+            add_revision_row(payload)
+        return "restored"
+
+    if not current:
+        return "missing"
+
+    delete_revision_row(current["__row"])
+    return "deleted"
+
+
+def build_group_report_saved_text(draft, save_result=None):
+    save_result = save_result or {}
     lines = [
         "✅ Отчёт сохранён",
         "",
@@ -1420,14 +2139,68 @@ def build_group_report_saved_text(draft):
     if photo_count:
         lines.append(f"📸 Фото: {photo_count}")
 
-    warnings = draft.get("warnings", [])
+    revision_meta = save_result.get("revision") or {}
+    revision_period = revision_meta.get("period", "")
+    revision_location = revision_meta.get("location", "")
+    if revision_period and revision_location:
+        lines.append(
+            f"📦 Ревизия: {format_period_label(revision_period)} · {revision_location}"
+        )
+
+    warnings = []
+    for warning in list(draft.get("warnings", [])) + list(save_result.get("warnings", [])):
+        warning = str(warning or "").strip()
+        if warning and warning not in warnings:
+            warnings.append(warning)
     if warnings:
         lines.append("")
         lines.append("⚠️ Что стоит проверить позже:")
         lines.extend(f"• {warning}" for warning in warnings)
 
     lines.append("")
-    lines.append("✏️ Если что-то не так, запись можно поправить через «Исправить записи».")
+    lines.append(f"⚡ Быстрые действия доступны {GROUP_REPORT_ACTION_WINDOW_SECONDS} сек.")
+    lines.append("👤 Сотрудника можно быстро поменять кнопкой ниже.")
+    lines.append("✏️ Потом запись можно поправить через обычные разделы «Исправить записи» и «Ревизия».")
+    return "\n".join(lines)
+
+
+def build_revision_message_saved_text(draft, save_result=None):
+    save_result = save_result or {}
+    values = draft.get("values", {})
+    lines = [
+        "✅ Ревизия сохранена",
+        "",
+        f"📍 {draft['point']}",
+        f"📅 {format_period_label(draft['period'])}",
+        f"👤 {draft['who']}",
+        f"📦 Позиций: {len(values)}",
+    ]
+
+    item_lines = []
+    for item_name in REVISION_ITEMS:
+        value = values.get(item_name, "")
+        if value in ("", None):
+            continue
+        item_lines.append(f"• {item_name} — {format_number(value)} {get_revision_unit(item_name)}")
+    if item_lines:
+        lines.append("")
+        lines.append("Что записано:")
+        lines.extend(item_lines[:12])
+
+    warnings = []
+    for warning in list(draft.get("warnings", [])) + list(save_result.get("warnings", [])):
+        warning = str(warning or "").strip()
+        if warning and warning not in warnings:
+            warnings.append(warning)
+    if warnings:
+        lines.append("")
+        lines.append("⚠️ Что стоит проверить:")
+        lines.extend(f"• {warning}" for warning in warnings[:8])
+
+    lines.append("")
+    lines.append(f"⚡ Быстрые действия доступны {GROUP_REPORT_ACTION_WINDOW_SECONDS} сек.")
+    lines.append("👤 Сотрудника можно быстро поменять кнопкой ниже.")
+    lines.append("✏️ Потом ревизию можно поправить через раздел «Ревизия».")
     return "\n".join(lines)
 
 
@@ -1435,13 +2208,31 @@ def build_group_travel_fingerprint(draft):
     amounts = [normalize_text_key(item) for item in draft.get("travel_amounts", [])]
     normalized_source = re.sub(r"\s+", " ", normalize_text_key(draft.get("source_text", ""))).strip()
     raw = "||".join([
-        str(draft.get("chat_id", "")),
         normalize_text_key(draft.get("who", "")),
         normalize_text_key(draft.get("date", "")),
         "|".join(amounts),
         normalized_source,
     ])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def build_revision_restock_fingerprint(draft):
+    normalized_source = re.sub(r"\s+", " ", normalize_text_key(draft.get("source_text", ""))).strip()
+    item_pairs = []
+    for item_name, value in sorted((draft.get("values") or {}).items()):
+        item_pairs.append(f"{normalize_text_key(item_name)}={normalize_text_key(value)}")
+    raw = "||".join([
+        normalize_text_key(draft.get("point", "")),
+        normalize_text_key(draft.get("period", "")),
+        normalize_text_key(draft.get("date", "")),
+        "|".join(item_pairs),
+        normalized_source,
+    ])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def build_revision_message_fingerprint(draft):
+    return build_revision_restock_fingerprint(draft)
 
 
 def build_group_travel_saved_text(draft):
@@ -1471,12 +2262,72 @@ def build_group_travel_saved_text(draft):
     return "\n".join(lines)
 
 
+def build_revision_restock_saved_text(draft, save_result=None):
+    save_result = save_result or {}
+    lines = [
+        "✅ Пополнение добавлено в ревизию",
+        "",
+        f"📍 {draft['point']}",
+        f"📅 {format_period_label(draft['period'])}",
+        f"👤 {draft['who']}",
+    ]
+
+    item_lines = []
+    for item_name, value in sorted((draft.get("values") or {}).items()):
+        unit = get_revision_unit(item_name)
+        item_lines.append(f"• {item_name} +{format_number(value)} {unit}")
+    if item_lines:
+        lines.append("")
+        lines.append("📦 Добавлено:")
+        lines.extend(item_lines[:12])
+
+    warnings = []
+    for warning in list(draft.get("warnings", [])) + list(save_result.get("warnings", [])):
+        warning = str(warning or "").strip()
+        if warning and warning not in warnings:
+            warnings.append(warning)
+    if warnings:
+        lines.append("")
+        lines.append("⚠️ Что стоит проверить:")
+        lines.extend(f"• {warning}" for warning in warnings[:8])
+
+    lines.append("")
+    lines.append(f"⚡ Быстрые действия доступны {GROUP_REPORT_ACTION_WINDOW_SECONDS} сек.")
+    return "\n".join(lines)
+
+
+def build_revision_restock_saved_markup(save_result):
+    log_row = save_result.get("log_row")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Редактировать ревизию", callback_data=f"grp_report_edit_revision_{log_row}")],
+        [InlineKeyboardButton("🗑 Отменить", callback_data=f"grp_report_delete_{log_row}")],
+    ])
+
+
 def save_group_report_entry(draft):
     payload = build_group_report_payload(draft)
     service_row = add_service_row(payload)
     photo_rows = []
     for file_id in draft.get("photo_ids", []):
         photo_rows.append(add_photo_row(draft["date"], draft["point"], draft["who"], file_id))
+    revision_meta = None
+    save_warnings = []
+    try:
+        revision_meta = save_group_report_revision(draft)
+    except Exception:
+        logger.exception(
+            "Failed to auto-save revision from group message: point=%s date=%s who=%s",
+            draft.get("point", ""),
+            draft.get("date", ""),
+            draft.get("who", ""),
+        )
+        save_warnings.append("ревизию не удалось сохранить автоматически, обслуживание сохранено")
+    logger.info(
+        "service saved: user_id=%s point=%s date=%s source=group",
+        draft.get("user_id"),
+        draft["point"],
+        draft["date"],
+    )
 
     log_row = append_group_report_log(
         {
@@ -1490,11 +2341,151 @@ def save_group_report_entry(draft):
             "fingerprint": draft.get("fingerprint", ""),
             "service_row": service_row,
             "photo_rows": serialize_row_numbers(photo_rows),
+            "revision_row": (revision_meta or {}).get("row", ""),
+            "revision_period": (revision_meta or {}).get("period", ""),
+            "revision_location": (revision_meta or {}).get("location", ""),
+            "revision_mode": (revision_meta or {}).get("mode", ""),
+            "revision_backup": (revision_meta or {}).get("backup", ""),
             "status": "saved",
-            "created_at": now_local().strftime("%d.%m.%Y %H:%M"),
+            "created_at": format_group_report_created_at(),
         }
     )
-    return log_row
+    return {
+        "log_row": log_row,
+        "service_row": service_row,
+        "photo_rows": photo_rows,
+        "who": draft.get("who", ""),
+        "revision": revision_meta,
+        "warnings": save_warnings,
+    }
+
+
+def save_revision_restock_entry(draft):
+    existing = find_revision_record(draft["period"], draft["point"], True)
+    values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
+
+    for item_name, delta in draft.get("values", {}).items():
+        current_value = parse_numeric_value(values.get(item_name, "")) or 0
+        delta_value = parse_numeric_value(delta) or 0
+        values[item_name] = format_number(current_value + delta_value)
+
+    payload = {
+        "period": draft["period"],
+        "location": draft["point"],
+        "who": draft.get("who", ""),
+        "filled_at": today(),
+        "values": values,
+    }
+    if existing:
+        update_revision_row(existing["__row"], payload)
+        revision_meta = {
+            "row": existing["__row"],
+            "period": draft["period"],
+            "location": draft["point"],
+            "mode": "updated",
+            "backup": build_group_report_revision_backup(existing),
+        }
+    else:
+        row_num = add_revision_row(payload)
+        revision_meta = {
+            "row": row_num,
+            "period": draft["period"],
+            "location": draft["point"],
+            "mode": "created",
+            "backup": "",
+        }
+
+    log_row = append_group_report_log(
+        {
+            "chat_id": draft["chat_id"],
+            "source_key": draft["source_key"],
+            "source_message_id": draft["source_message_id"],
+            "media_group_id": draft.get("media_group_id", ""),
+            "who": draft.get("who", ""),
+            "point": draft["point"],
+            "date": draft["date"],
+            "fingerprint": draft.get("fingerprint", ""),
+            "service_row": "",
+            "photo_rows": "",
+            "revision_row": revision_meta.get("row", ""),
+            "revision_period": revision_meta.get("period", ""),
+            "revision_location": revision_meta.get("location", ""),
+            "revision_mode": revision_meta.get("mode", ""),
+            "revision_backup": revision_meta.get("backup", ""),
+            "status": "saved",
+            "created_at": format_group_report_created_at(),
+        }
+    )
+    return {
+        "log_row": log_row,
+        "service_row": "",
+        "who": draft.get("who", ""),
+        "revision": revision_meta,
+        "warnings": [],
+    }
+
+
+def save_revision_message_entry(draft):
+    existing = find_revision_record(draft["period"], draft["point"], True)
+    values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
+
+    for item_name, value in draft.get("values", {}).items():
+        values[item_name] = value
+
+    payload = {
+        "period": draft["period"],
+        "location": draft["point"],
+        "who": draft.get("who", ""),
+        "filled_at": today(),
+        "values": values,
+    }
+    if existing:
+        update_revision_row(existing["__row"], payload)
+        revision_meta = {
+            "row": existing["__row"],
+            "period": draft["period"],
+            "location": draft["point"],
+            "mode": "updated",
+            "backup": build_group_report_revision_backup(existing),
+        }
+    else:
+        row_num = add_revision_row(payload)
+        revision_meta = {
+            "row": row_num,
+            "period": draft["period"],
+            "location": draft["point"],
+            "mode": "created",
+            "backup": "",
+        }
+
+    log_row = append_group_report_log(
+        {
+            "chat_id": draft["chat_id"],
+            "source_key": draft["source_key"],
+            "source_message_id": draft["source_message_id"],
+            "media_group_id": draft.get("media_group_id", ""),
+            "who": draft.get("who", ""),
+            "point": draft["point"],
+            "date": draft["date"],
+            "fingerprint": draft.get("fingerprint", ""),
+            "service_row": "",
+            "photo_rows": "",
+            "revision_row": revision_meta.get("row", ""),
+            "revision_period": revision_meta.get("period", ""),
+            "revision_location": revision_meta.get("location", ""),
+            "revision_mode": revision_meta.get("mode", ""),
+            "revision_backup": revision_meta.get("backup", ""),
+            "status": "saved",
+            "created_at": format_group_report_created_at(),
+        }
+    )
+    return {
+        "log_row": log_row,
+        "service_row": "",
+        "who": draft.get("who", ""),
+        "revision": revision_meta,
+        "warnings": [],
+    }
 
 
 def save_group_travel_entry(draft):
@@ -1514,8 +2505,13 @@ def save_group_travel_entry(draft):
             "fingerprint": draft.get("fingerprint", ""),
             "service_row": serialize_row_numbers(row_numbers),
             "photo_rows": "",
+            "revision_row": "",
+            "revision_period": "",
+            "revision_location": "",
+            "revision_mode": "",
+            "revision_backup": "",
             "status": "saved",
-            "created_at": now_local().strftime("%d.%m.%Y %H:%M"),
+            "created_at": format_group_report_created_at(),
         }
     )
     return log_row
@@ -1541,6 +2537,8 @@ def delete_group_report_entry_by_log_row(log_row_num):
     if str(service_row).strip():
         book.worksheet("Обслуживание").delete_rows(int(service_row))
 
+    restore_group_report_revision(record)
+
     updated = {
         "chat_id": record.get("Chat_ID", ""),
         "source_key": record.get("Source_Key", ""),
@@ -1552,6 +2550,11 @@ def delete_group_report_entry_by_log_row(log_row_num):
         "fingerprint": record.get("Fingerprint", ""),
         "service_row": record.get("Service_Row", ""),
         "photo_rows": record.get("Photo_Rows", ""),
+        "revision_row": record.get("Revision_Row", ""),
+        "revision_period": record.get("Revision_Period", ""),
+        "revision_location": record.get("Revision_Location", ""),
+        "revision_mode": record.get("Revision_Mode", ""),
+        "revision_backup": record.get("Revision_Backup", ""),
         "status": "deleted",
         "created_at": record.get("Создано", ""),
     }
@@ -1725,6 +2728,22 @@ def normalize_text_key(value):
     return text.strip(" .")
 
 
+def resolve_worker_name(value):
+    normalized = normalize_text_key(value)
+    if not normalized:
+        return None
+
+    for worker in WORKERS:
+        if normalize_text_key(worker) == normalized:
+            return worker
+
+    for user_name in get_user_directory().values():
+        if normalize_text_key(user_name) == normalized:
+            return user_name
+
+    return None
+
+
 SERVICE_REPORT_SUPPLY_ALIASES = {
     "стакан": "Стаканы",
     "стаканы": "Стаканы",
@@ -1842,12 +2861,77 @@ REVISION_IMPORT_ITEM_SPECS = {
 }
 
 
+REVISION_RESTOCK_ITEM_ALIASES = {
+    "вода": "Вода",
+    "воды": "Вода",
+    "бут воды": "Вода",
+    "бутылки воды": "Вода",
+    "кофе": "Кофе",
+    "молоко": "Молоко",
+    "молока": "Молоко",
+    "мока": "Мока",
+    "шоколад": "Шоколад",
+    "шоколада": "Шоколад",
+    "сироп": "Сиропы",
+    "сиропы": "Сиропы",
+    "стакан": "Стаканы",
+    "стаканы": "Стаканы",
+    "стаканов": "Стаканы",
+    "сахар": "Сахар",
+    "сахара": "Сахар",
+    "крышка б": "Крышки бел",
+    "крышки бел": "Крышки бел",
+    "бел крыш": "Крышки бел",
+    "белые крышки": "Крышки бел",
+    "крышка ч": "Крышки чёрн",
+    "крышки черн": "Крышки чёрн",
+    "черн крыш": "Крышки чёрн",
+    "черные крышки": "Крышки чёрн",
+    "чёрные крышки": "Крышки чёрн",
+    "труб": "Трубочки",
+    "трубочки": "Трубочки",
+    "трубочек": "Трубочки",
+    "палоч": "Палочки",
+    "палочки": "Палочки",
+    "палочек": "Палочки",
+    "манжета": "Манжеты",
+    "манжеты": "Манжеты",
+    "манжет": "Манжеты",
+    "влажные салф": "Влажные салф",
+    "влажные салфетки": "Влажные салф",
+    "салфетки влажные": "Влажные салф",
+    "сухие салфетки": "Салфетки сухие",
+    "салфетки сухие": "Салфетки сухие",
+    "салф сух": "Салфетки сухие",
+    "мусорные пакеты": "Мус.пакеты",
+    "мус пакеты": "Мус.пакеты",
+    "мус.пакеты": "Мус.пакеты",
+}
+
+
 def normalize_revision_location_name(value):
     return REVISION_LOCATION_ALIASES.get(normalize_text_key(value))
 
 
 def get_revision_import_item_spec(value):
     return REVISION_IMPORT_ITEM_SPECS.get(normalize_text_key(value))
+
+
+def resolve_revision_restock_item_name(value):
+    item_spec = get_revision_import_item_spec(value)
+    if item_spec:
+        return item_spec[0]
+
+    normalized = normalize_text_key(value)
+    if not normalized:
+        return None
+
+    alias_items = sorted(REVISION_RESTOCK_ITEM_ALIASES.items(), key=lambda item: len(item[0]), reverse=True)
+    for alias, item_name in alias_items:
+        if contains_normalized_alias(normalized, alias):
+            return item_name
+
+    return None
 
 
 def parse_import_number(value):
@@ -1887,6 +2971,14 @@ def parse_revision_import_text(text):
     for raw_line in str(text).splitlines():
         line = raw_line.strip()
         if not line:
+            continue
+
+        slash_header_match = re.match(r"^/\s*(.+?)\s*$", line)
+        if slash_header_match:
+            current_block_location = normalize_revision_location_name(slash_header_match.group(1))
+            slash_locations = None
+            if not current_block_location:
+                warnings.append(f"Не понял точку в строке: {line}")
             continue
 
         block_match = re.match(r"^\d{1,2}\.\d{1,2}\s+(.+)$", line)
@@ -1937,6 +3029,101 @@ def parse_revision_import_text(text):
     return parsed, warnings
 
 
+def extract_revision_restock_location(text):
+    normalized = normalize_text_key(text)
+    alias_items = sorted(REVISION_LOCATION_ALIASES.items(), key=lambda item: len(item[0]), reverse=True)
+    for alias, location in alias_items:
+        if contains_normalized_alias(normalized, alias):
+            return location
+    return None
+
+
+def parse_revision_restock_message_text(text):
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return None
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+
+    header_normalized = normalize_text_key(lines[0])
+    if not any(trigger in header_normalized for trigger in ("довез", "довёз", "в ревизию", "добавить в ревизию")):
+        return None
+
+    location = extract_revision_restock_location(lines[0])
+    if not location:
+        return None
+
+    values = {}
+    warnings = []
+    for raw_line in lines[1:]:
+        normalized_line = normalize_text_key(raw_line)
+        if not normalized_line:
+            continue
+        if "добавить в ревизию" in normalized_line:
+            continue
+
+        match = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s+(.+?)\s*$", raw_line)
+        if not match:
+            warnings.append(f"Не понял строку: {raw_line}")
+            continue
+
+        try:
+            value = normalize_number_text(match.group(1))
+        except ValueError:
+            warnings.append(f"Не понял количество в строке: {raw_line}")
+            continue
+
+        item_name = resolve_revision_restock_item_name(match.group(2))
+        if not item_name:
+            warnings.append(f"Не понял товар: {match.group(2).strip()}")
+            continue
+
+        add_revision_import_value(values, location, item_name, value, warnings=warnings, accumulate=True)
+
+    location_values = values.get(location, {})
+    if not location_values:
+        return None
+
+    return {
+        "location": location,
+        "values": location_values,
+        "warnings": warnings,
+        "source_text": raw_text,
+    }
+
+
+def parse_revision_snapshot_message_text(text):
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return None
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+
+    header_match = re.match(r"^/\s*(.+?)\s*$", lines[0])
+    if not header_match:
+        return None
+
+    location = normalize_revision_location_name(header_match.group(1))
+    if not location:
+        return None
+
+    parsed, warnings = parse_revision_import_text(raw_text)
+    location_values = parsed.get(location, {})
+    if len(location_values) < 3:
+        return None
+
+    return {
+        "location": location,
+        "values": location_values,
+        "warnings": warnings,
+        "source_text": raw_text,
+    }
+
+
 def build_revision_import_preview(period, parsed, warnings):
     locations = order_revision_locations(parsed.keys())
     lines = [
@@ -1969,7 +3156,7 @@ def get_revision_author(update):
     tg_user = update.effective_user
     if not tg_user:
         return "Неизвестно"
-    return USERS.get(tg_user.id) or tg_user.first_name or tg_user.username or str(tg_user.id)
+    return get_configured_user_name(tg_user.id) or tg_user.first_name or tg_user.username or str(tg_user.id)
 
 
 def parse_numeric_value(value):
@@ -2033,13 +3220,29 @@ def get_rent_context(context):
     return context.user_data.setdefault("rent", {})
 
 
+def get_payout_context(context):
+    return context.user_data.setdefault("payout", {})
+
+
+def clear_payout_context(context):
+    context.user_data.pop("payout", None)
+
+
+def build_payout_return_context(period_key, screen="overview"):
+    return {
+        "return_mode": "payout",
+        "return_period": period_key,
+        "return_screen": screen,
+    }
+
+
 def get_actor_label(update):
     tg_user = update.effective_user
     if not tg_user:
         return "Неизвестно"
     if tg_user.username:
         return f"@{tg_user.username}"
-    return USERS.get(tg_user.id) or tg_user.first_name or str(tg_user.id)
+    return get_configured_user_name(tg_user.id) or tg_user.first_name or str(tg_user.id)
 
 
 def format_money_spaced(value):
@@ -3537,6 +4740,7 @@ def build_repair_broken_date_markup(last_service_date=""):
     keyboard = [
         [InlineKeyboardButton(f"Сегодня ({today()})", callback_data="repair_date_today")],
         [InlineKeyboardButton(f"Вчера ({yesterday()})", callback_data="repair_date_yesterday")],
+        [InlineKeyboardButton(f"Позавчера ({day_before_yesterday()})", callback_data="repair_date_daybefore")],
     ]
     if last_service_date:
         keyboard.append(
@@ -3564,6 +4768,7 @@ def build_repair_sent_date_markup():
         [
             [InlineKeyboardButton(f"Сегодня ({today()})", callback_data="repair_sent_today")],
             [InlineKeyboardButton(f"Вчера ({yesterday()})", callback_data="repair_sent_yesterday")],
+            [InlineKeyboardButton(f"Позавчера ({day_before_yesterday()})", callback_data="repair_sent_daybefore")],
             [InlineKeyboardButton("✏️ Ввести дату", callback_data="repair_sent_custom")],
             [InlineKeyboardButton("⏭ Пропустить", callback_data="repair_sent_skip")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="repair_sent_back_card")],
@@ -3575,6 +4780,7 @@ def build_repair_broken_edit_markup(last_service_date=""):
     keyboard = [
         [InlineKeyboardButton(f"Сегодня ({today()})", callback_data="repair_broken_today")],
         [InlineKeyboardButton(f"Вчера ({yesterday()})", callback_data="repair_broken_yesterday")],
+        [InlineKeyboardButton(f"Позавчера ({day_before_yesterday()})", callback_data="repair_broken_daybefore")],
     ]
     if last_service_date:
         keyboard.append(
@@ -3777,32 +4983,31 @@ def build_revision_summary_text(period, records):
         lines.append("⚪ Нет ревизии")
         lines.extend(f"• {escape_html(location)}" for location in missing_locations)
 
-    totals = {}
-    for item in REVISION_ITEMS:
-        total = 0.0
-        has_values = False
-        for record in period_records:
-            numeric = parse_numeric_value(record.get(item, ""))
-            if numeric is None:
-                continue
-            total += numeric
-            has_values = True
-        totals[item] = total if has_values else None
+    stock_totals = build_revision_stock_totals(period_records)
 
-    total_rows = []
-    for item in REVISION_ITEMS:
-        value = totals[item]
-        total_rows.append(
-            (
-                item,
-                "—" if value is None else format_number(value),
-                get_procurement_unit_short(get_revision_unit(item)),
+    def build_total_rows(value_key):
+        rows = []
+        for item_name in REVISION_ITEMS:
+            item_data = stock_totals["items"][item_name]
+            value = item_data.get(value_key)
+            rows.append(
+                (
+                    item_name,
+                    "—" if value is None else format_number(value),
+                    "" if value is None else get_procurement_unit_short(get_revision_unit(item_name)),
+                )
             )
-        )
+        return rows
 
     lines.append("")
-    lines.append("<b>📊 Итого по сети</b>")
-    lines.append(build_preformatted_block(total_rows))
+    lines.append("<b>📊 Всего</b>")
+    lines.append(build_preformatted_block(build_total_rows("total_value")))
+    lines.append("")
+    lines.append("<b>📍 На точках</b>")
+    lines.append(build_preformatted_block(build_total_rows("point_total")))
+    lines.append("")
+    lines.append("<b>🏠 Дома</b>")
+    lines.append(build_preformatted_block(build_total_rows("home_value")))
 
     return "\n".join(lines)
 
@@ -3814,31 +5019,14 @@ def build_revision_item_text(period, item_name, records):
         "",
     ]
 
+    stock_totals = build_revision_stock_totals(period_records)
+    item_totals = stock_totals["items"][item_name]
     values_by_location = {record.get("Локация", ""): record.get(item_name, "") for record in period_records}
-    point_total = 0.0
-    point_has_values = False
-    all_total = 0.0
-    all_has_values = False
-    home_value = values_by_location.get("Дома", "")
-    home_num = parse_numeric_value(home_value)
-
-    for location in POINTS:
-        numeric = parse_numeric_value(values_by_location.get(location, ""))
-        if numeric is None:
-            continue
-        point_total += numeric
-        point_has_values = True
-        all_total += numeric
-        all_has_values = True
-
-    if home_num is not None:
-        all_total += home_num
-        all_has_values = True
 
     summary_rows = [
-        ("Итого по точкам", "—" if not point_has_values else format_number(point_total), "" if not point_has_values else get_procurement_unit_short(get_revision_unit(item_name))),
-        ("Дома", "—" if home_num is None else format_number(home_num), "" if home_num is None else get_procurement_unit_short(get_revision_unit(item_name))),
-        ("Итого с домом", "—" if not all_has_values else format_number(all_total), "" if not all_has_values else get_procurement_unit_short(get_revision_unit(item_name))),
+        ("Всего", "—" if item_totals["total_value"] is None else format_number(item_totals["total_value"]), "" if item_totals["total_value"] is None else get_procurement_unit_short(get_revision_unit(item_name))),
+        ("На точках", "—" if item_totals["point_total"] is None else format_number(item_totals["point_total"]), "" if item_totals["point_total"] is None else get_procurement_unit_short(get_revision_unit(item_name))),
+        ("Дома", "—" if item_totals["home_value"] is None else format_number(item_totals["home_value"]), "" if item_totals["home_value"] is None else get_procurement_unit_short(get_revision_unit(item_name))),
     ]
     lines.append(build_preformatted_block(summary_rows))
     lines.append("")
@@ -3878,32 +5066,65 @@ def classify_threshold_level(value, critical_value, warning_value):
     return None
 
 
-def analyze_revision_thresholds(period, records):
-    period_records = [record for record in records if record.get("Период") == period]
+def build_revision_stock_totals(period_records):
     by_location = {record.get("Локация", ""): record for record in period_records}
     home_record = by_location.get("Дома")
-    home_has_data = bool(
-        home_record and any(parse_numeric_value(home_record.get(item_name, "")) is not None for item_name in REVISION_ITEMS)
-    )
+    items = {}
 
-    items = []
-    point_critical = []
-    point_warning = []
-
-    for item_name, thresholds in REVISION_STOCK_THRESHOLDS.items():
+    for item_name in REVISION_ITEMS:
         point_values = {}
-        network_total = 0.0
-        has_network_data = False
+        point_total = 0.0
+        has_point_data = False
         for location in POINTS:
             record = by_location.get(location)
             value = parse_numeric_value(record.get(item_name, "")) if record else None
             if value is None:
                 continue
             point_values[location] = value
-            network_total += value
-            has_network_data = True
+            point_total += value
+            has_point_data = True
 
         home_value = parse_numeric_value(home_record.get(item_name, "")) if home_record else None
+        total_value = None
+        if has_point_data or home_value is not None:
+            total_value = point_total + (home_value or 0)
+
+        items[item_name] = {
+            "point_values": point_values,
+            "point_total": point_total if has_point_data else None,
+            "home_value": home_value,
+            "total_value": total_value,
+        }
+
+    home_has_data = bool(
+        home_record and any(item_data["home_value"] is not None for item_data in items.values())
+    )
+
+    return {
+        "by_location": by_location,
+        "home_record": home_record,
+        "home_has_data": home_has_data,
+        "items": items,
+    }
+
+
+def analyze_revision_thresholds(period, records):
+    period_records = [record for record in records if record.get("Период") == period]
+    stock_totals = build_revision_stock_totals(period_records)
+    by_location = stock_totals["by_location"]
+    home_record = stock_totals["home_record"]
+    home_has_data = stock_totals["home_has_data"]
+
+    items = []
+    point_critical = []
+    point_warning = []
+
+    for item_name, thresholds in REVISION_STOCK_THRESHOLDS.items():
+        item_totals = stock_totals["items"][item_name]
+        point_values = item_totals["point_values"]
+        network_total = item_totals["total_value"]
+        has_network_data = network_total is not None
+        home_value = item_totals["home_value"]
         network_level = None
         if has_network_data:
             network_level = classify_threshold_level(
@@ -3921,6 +5142,7 @@ def analyze_revision_thresholds(period, records):
                 "has_network_data": has_network_data,
                 "network_level": network_level,
                 "home_value": home_value,
+                "point_total": item_totals["point_total"],
                 "point_values": point_values,
             }
         )
@@ -4014,7 +5236,7 @@ def build_revision_network_detail_text(period, records, level):
         return f"🛒 Что нужно закупить\n📅 {format_period_label(period)}\n\n❌ За этот месяц ревизии нет."
 
     items = analysis["network_critical"] if level == "critical" else analysis["network_warning"]
-    title = "🚨 Срочно по сети" if level == "critical" else "🟡 Скоро заказать"
+    title = "🚨 Срочно" if level == "critical" else "🟡 Скоро заказать"
     lines = [
         f"<b>{escape_html(title)}</b>",
         f"📅 {escape_html(format_period_label(period))}",
@@ -4026,23 +5248,24 @@ def build_revision_network_detail_text(period, records, level):
         return "\n".join(lines)
 
     for item_data in items:
-        rows = [(
-            item_data["item"],
-            format_number(round(item_data["network_total"], 2)),
-            get_procurement_unit_short(item_data["unit"]),
-        )]
-        point_rows = [
+        lines.append(f"<b>{escape_html(item_data['item'])}</b>")
+        rows = [
             (
-                point,
-                format_number(value),
-                get_procurement_unit_short(item_data["unit"]),
-            )
-            for point, value in sorted(item_data["point_values"].items(), key=lambda pair: pair[1])
+                "Всего",
+                "—" if item_data["network_total"] is None else format_number(round(item_data["network_total"], 2)),
+                "" if item_data["network_total"] is None else get_procurement_unit_short(item_data["unit"]),
+            ),
+            (
+                "На точках",
+                "—" if item_data["point_total"] is None else format_number(round(item_data["point_total"], 2)),
+                "" if item_data["point_total"] is None else get_procurement_unit_short(item_data["unit"]),
+            ),
+            (
+                "Дома",
+                "—" if item_data["home_value"] is None else format_number(item_data["home_value"]),
+                "" if item_data["home_value"] is None else get_procurement_unit_short(item_data["unit"]),
+            ),
         ]
-        rows.extend(point_rows)
-        home_value = "—" if item_data["home_value"] is None else format_number(item_data["home_value"])
-        home_unit = "" if item_data["home_value"] is None else get_procurement_unit_short(item_data["unit"])
-        rows.append(("Дома", home_value, home_unit))
         lines.append(build_preformatted_block(rows))
         lines.append("")
 
@@ -4107,40 +5330,27 @@ def build_revision_procurement_summary_text(period, records):
         parts.append("<b>🟡 Скоро заказать</b>")
         parts.append(build_preformatted_block(build_procurement_rows(analysis["network_warning"])))
 
-    if analysis["home_has_data"]:
-        focus_items = analysis["network_critical"] + analysis["network_warning"]
-        home_rows = []
+    focus_items = analysis["network_critical"] + analysis["network_warning"]
+    if focus_items:
+        unique_items = []
         seen = set()
         for item_data in focus_items:
             if item_data["item"] in seen:
                 continue
             seen.add(item_data["item"])
-            home_rows.append(
-                {
-                    "item": item_data["item"],
-                    "unit": item_data["unit"],
-                    "home_value": item_data["home_value"],
-                }
-            )
+            unique_items.append(item_data)
 
-        if home_rows:
-            parts.append("")
-            parts.append("<b>🏠 Дома</b>")
-            parts.append(
-                build_preformatted_block(
-                    [
-                        (
-                            item_data["item"],
-                            "—" if item_data["home_value"] is None else format_number(round(item_data["home_value"], 2)),
-                            "" if item_data["home_value"] is None else get_procurement_unit_short(item_data["unit"]),
-                        )
-                        for item_data in home_rows
-                    ]
-                )
-            )
-    else:
         parts.append("")
-        parts.append("⚪ Нет данных по складу «Дома»")
+        parts.append("<b>📍 На точках сейчас</b>")
+        parts.append(build_preformatted_block(build_procurement_rows(unique_items, value_key="point_total")))
+
+        if analysis["home_has_data"]:
+            parts.append("")
+            parts.append("<b>🏠 Дома в запасе</b>")
+            parts.append(build_preformatted_block(build_procurement_rows(unique_items, value_key="home_value")))
+        else:
+            parts.append("")
+            parts.append("⚪ Нет данных по складу «Дома»")
 
     if not analysis["network_critical"] and not analysis["network_warning"]:
         parts.append("")
@@ -4254,11 +5464,15 @@ def build_service_entry_label(entry):
     water = format_number(entry.get("Вода(бут)", "?"))
     shortage = entry.get("Нехватка", "")
     purchases = entry.get("Закупки", "")
+    salary_workers = get_service_salary_workers(entry)
+    default_workers = default_service_salary_workers(entry.get("Кто", ""))
     flags = []
     if purchases:
         flags.append("закупки")
     if shortage:
         flags.append("нехватка")
+    if salary_workers != default_workers:
+        flags.append("зп")
     suffix = f" • {', '.join(flags)}" if flags else ""
     return f"#{entry['__row']} {who} • {water} бут{suffix}"
 
@@ -4282,6 +5496,40 @@ def build_purchase_summary(items):
         for item in filled_items
     ]
     return ", ".join(parts), total
+
+
+def parse_purchase_summary(value):
+    text = str(value or "").strip()
+    if not text:
+        return []
+
+    parsed = []
+    for part in [chunk.strip() for chunk in text.split(", ") if chunk.strip()]:
+        match = re.match(r"^(?P<name>.+?)\((?P<qty>[^()]*)\)\s+(?P<amount>[0-9]+(?:[.,][0-9]+)?)₽$", part)
+        if not match:
+            return []
+
+        qty_raw = match.group("qty").strip()
+        try:
+            qty = normalize_number_text(qty_raw)
+        except ValueError:
+            return []
+
+        amount = parse_numeric_value(match.group("amount"))
+        if amount is None:
+            return []
+
+        name = match.group("name").strip()
+        parsed.append(
+            {
+                "name": name,
+                "qty": qty,
+                "sum": amount,
+                "is_custom": name not in PURCHASE_ITEMS,
+            }
+        )
+
+    return parsed
 
 
 def get_next_unfilled_purchase_index(items):
@@ -4318,6 +5566,63 @@ def build_shortage_summary_and_details(items):
     shortage = ", ".join(item["name"] for item in normalized)
     details = "\n".join(build_shortage_item_line(item) for item in normalized)
     return shortage, details
+
+
+def parse_shortage_state(shortage, shortage_details):
+    lines = build_shortage_display_lines(shortage, shortage_details)
+    if not lines:
+        return []
+
+    parsed = []
+    for line in lines:
+        raw_line = str(line or "").strip()
+        if not raw_line:
+            continue
+
+        name, separator, body = raw_line.partition(" — ")
+        name = name.strip()
+        body = body.strip()
+        if not name:
+            return []
+
+        item = {
+            "name": name,
+            "reserve_qty": None,
+            "no_reserve": False,
+            "next_visit_status": None,
+            "skipped": False,
+        }
+
+        if not separator:
+            parsed.append(item)
+            continue
+
+        if body == "запас: не указано":
+            item["skipped"] = True
+            parsed.append(item)
+            continue
+
+        if body.startswith("запас: "):
+            quantity_part = body.replace("запас: ", "", 1).rsplit(" ", 1)[0].strip()
+            try:
+                item["reserve_qty"] = normalize_number_text(quantity_part)
+            except ValueError:
+                return []
+            parsed.append(item)
+            continue
+
+        if body.startswith("запаса для пополнения нет"):
+            item["no_reserve"] = True
+            if "не хватит до следующего приезда" in body:
+                item["next_visit_status"] = "not_enough"
+            elif "хватит до следующего приезда" in body:
+                item["next_visit_status"] = "enough"
+            parsed.append(item)
+            continue
+
+        parsed.append(item)
+
+    return parsed
 
 
 def extract_shortage_detail_lines(value):
@@ -4374,6 +5679,10 @@ def build_service_entry_text(entry):
         f"👤 {entry.get('Кто', '?')}",
         f"💧 Вода: {format_number(entry.get('Вода(бут)', '?'))} бут",
     ]
+    salary_workers = get_service_salary_workers(entry)
+    default_workers = default_service_salary_workers(entry.get("Кто", ""))
+    if salary_workers != default_workers:
+        lines.append(f"💸 В ЗП: {', '.join(salary_workers) if salary_workers else 'не считать'}")
 
     purchases = entry.get("Закупки", "")
     shortage = entry.get("Нехватка", "")
@@ -4919,6 +6228,13 @@ async def show_text_screen(query, context, text, reply_markup=None, parse_mode=N
         raise
 
 
+async def render_text_screen(target, context, text, reply_markup=None, parse_mode=None):
+    if hasattr(target, "reply_text"):
+        await target.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+    await show_text_screen(target, context, text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+
 def remember_cleanup_message(context, message):
     if not message:
         return
@@ -5014,9 +6330,17 @@ SERVICE_FLOW_STEPS = (
 
 
 def build_service_progress_text(current_step_index):
-    total = len(SERVICE_FLOW_STEPS)
+    return build_progress_text(SERVICE_FLOW_STEPS, current_step_index)
+
+
+TRAVEL_FLOW_STEPS = ("Кто", "Дата", "Поездки")
+REPAIR_NEW_FLOW_STEPS = ("Точка", "Аппарат", "Причина", "Описание", "Фото", "Дата поломки")
+
+
+def build_progress_text(steps, current_step_index):
+    total = len(steps)
     index = max(1, min(current_step_index, total))
-    step_name = SERVICE_FLOW_STEPS[index - 1]
+    step_name = steps[index - 1]
     bar = "█" * index + "░" * (total - index)
     return f"📍 Шаг {index}/{total}: {step_name}\n{bar}"
 
@@ -5025,17 +6349,34 @@ async def show_loading_state(query, context, text):
     await show_text_screen(query, context, f"⏳ {text}")
 
 
-async def show_sheets_busy_notice(target):
+async def show_sheets_busy_notice(target, context=None, retry_callback=None, back_callback=None):
     text = "⏳ Google Sheets перегружен, попробуй через минуту."
+    if retry_callback is None:
+        try:
+            if hasattr(target, "answer"):
+                await target.answer(text, show_alert=True)
+                return
+            if hasattr(target, "reply_text"):
+                await target.reply_text(text)
+                return
+        except Exception:
+            logger.exception("Failed to show Google Sheets busy notice")
+        return
+
+    keyboard = [[InlineKeyboardButton("🔄 Повторить", callback_data=retry_callback)]]
+    if back_callback:
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])
     try:
         if hasattr(target, "answer"):
-            await target.answer(text, show_alert=True)
-            return
-        if hasattr(target, "reply_text"):
-            await target.reply_text(text)
-            return
+            await target.answer()
+        await show_text_screen(
+            target,
+            context,
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
     except Exception:
-        logger.exception("Failed to show Google Sheets busy notice")
+        logger.exception("Failed to show Google Sheets busy retry screen")
 
 
 def build_service_points_markup(repair_points=None):
@@ -5052,21 +6393,27 @@ def build_service_points_markup(repair_points=None):
     return InlineKeyboardMarkup(kb)
 
 
-async def show_service_date_menu(query, context):
+async def show_service_date_menu(query, context, notice=None):
     svc = context.user_data.get("svc", {})
     who = svc.get("who", "")
     selected_date = svc.get("date")
     date_line = f"📅 Выбрано: {selected_date}\n\n" if selected_date else ""
+    period_key = svc.get("allowed_period")
+    period_line = f"🗓 Месяц: {format_period_label(period_key)}\n\n" if period_key else ""
     kb = [
         [InlineKeyboardButton(f"Сегодня ({today()})", callback_data="svc_date_today")],
         [InlineKeyboardButton(f"Вчера ({yesterday()})", callback_data="svc_date_yesterday")],
+        [InlineKeyboardButton(f"Позавчера ({day_before_yesterday()})", callback_data="svc_date_daybefore")],
         [InlineKeyboardButton("✏️ Другая дата", callback_data="svc_date_custom")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_service_who")],
     ]
+    text = f"{build_service_progress_text(2)}\n\n🔧 {who}\n\n{date_line}{period_line}За какую дату внести обслуживание?"
+    if notice:
+        text = f"{notice}\n\n{text}"
     await show_text_screen(
         query,
         context,
-        f"{build_service_progress_text(2)}\n\n🔧 {who}\n\n{date_line}За какую дату внести обслуживание?",
+        text,
         reply_markup=InlineKeyboardMarkup(kb),
     )
     return SERVICE_DATE
@@ -5175,21 +6522,249 @@ def build_travel_day_summary(who, date_str, travels):
     )
 
 
-async def show_travel_date_menu(query, context):
+def get_travel_reference_date(context):
+    selected_date = get_travel_selected_date(context)
+    parsed = parse_date(selected_date)
+    return parsed or now_local()
+
+
+def filter_travels_by_month(travels, reference_date):
+    filtered = []
+    for travel in travels:
+        dt = parse_date(travel.get("Дата", ""))
+        if not dt:
+            continue
+        if dt.year == reference_date.year and dt.month == reference_date.month:
+            filtered.append((dt, travel))
+    return filtered
+
+
+def build_travel_edit_date_groups(who, travels, reference_date):
+    grouped = {}
+    for dt, travel in filter_travels_by_month(travels, reference_date):
+        if str(travel.get("Кто", "")).strip() != str(who).strip():
+            continue
+        amount = parse_numeric_value(travel.get("Сумма", ""))
+        if amount is None:
+            continue
+        date_key = format_date(dt)
+        bucket = grouped.setdefault(date_key, {"date": date_key, "count": 0, "amount": 0.0})
+        bucket["count"] += 1
+        bucket["amount"] += amount
+
+    return sorted(grouped.values(), key=lambda bucket: parse_date(bucket["date"]) or datetime.min, reverse=True)
+
+
+def build_travel_edit_entries(who, travels, date_str):
+    entries = [
+        travel for travel in travels
+        if str(travel.get("Кто", "")).strip() == str(who).strip()
+        and str(travel.get("Дата", "")).strip() == str(date_str).strip()
+    ]
+    entries.sort(key=lambda item: int(item.get("__row", 0)), reverse=True)
+    return entries
+
+
+def format_month_caption(reference_date):
+    return format_period_label(build_period_key(reference_date.year, reference_date.month))
+
+
+def build_travel_action_markup():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("1 поездка", callback_data="tr_count_1"),
+                InlineKeyboardButton("2 поездки", callback_data="tr_count_2"),
+            ],
+            [
+                InlineKeyboardButton("3 поездки", callback_data="tr_count_3"),
+                InlineKeyboardButton("4 поездки", callback_data="tr_count_4"),
+            ],
+            [InlineKeyboardButton("🔢 Другое количество", callback_data="tr_count_custom")],
+            [InlineKeyboardButton("💰 Другая сумма", callback_data="tr_custom")],
+            [InlineKeyboardButton("📋 За выбранную дату", callback_data="tr_summary")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_date")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+        ]
+    )
+
+
+def build_travel_month_person_text(who, travels, reference_date):
+    month_caption = format_month_caption(reference_date)
+    month_travels = [
+        (dt, travel)
+        for dt, travel in filter_travels_by_month(travels, reference_date)
+        if travel.get("Кто") == who
+    ]
+    if not month_travels:
+        return f"💰 Проезд — {who}\n\n📆 {month_caption}\n\n⚪ За этот месяц записей пока нет."
+
+    totals_by_day = {}
+    counts_by_day = {}
+    total_sum = 0.0
+    total_records = 0
+
+    for dt, travel in month_travels:
+        date_key = format_date(dt)
+        amount = parse_numeric_value(travel.get("Сумма", ""))
+        if amount is None:
+            continue
+        totals_by_day[date_key] = totals_by_day.get(date_key, 0.0) + amount
+        counts_by_day[date_key] = counts_by_day.get(date_key, 0) + 1
+        total_sum += amount
+        total_records += 1
+
+    if not totals_by_day:
+        return f"💰 Проезд — {who}\n\n📆 {month_caption}\n\n⚪ За этот месяц нет корректных сумм."
+
+    lines = [f"💰 Проезд — {who}", "", f"📆 {month_caption}", "", "📅 По дням"]
+    ordered_dates = sorted(totals_by_day.keys(), key=lambda value: parse_date(value) or now_local())
+    for date_key in ordered_dates:
+        lines.append(
+            f"• {date_key} — {format_money_spaced(totals_by_day[date_key])} · {counts_by_day[date_key]} зап."
+        )
+
+    lines.extend(
+        [
+            "",
+            f"Итого за месяц: {format_money_spaced(total_sum)}",
+            f"Записей: {total_records}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_travel_month_all_text(travels, reference_date):
+    month_caption = format_month_caption(reference_date)
+    month_travels = filter_travels_by_month(travels, reference_date)
+    if not month_travels:
+        return f"💰 Проезд — все сотрудники\n\n📆 {month_caption}\n\n⚪ За этот месяц записей пока нет."
+
+    totals_by_day = {}
+    totals_by_day_people = {}
+    totals_by_person = {}
+    counts_by_person = {}
+    total_sum = 0.0
+    total_records = 0
+
+    for dt, travel in month_travels:
+        who = str(travel.get("Кто", "")).strip() or "Не указано"
+        amount = parse_numeric_value(travel.get("Сумма", ""))
+        if amount is None:
+            continue
+        date_key = format_date(dt)
+        totals_by_day[date_key] = totals_by_day.get(date_key, 0.0) + amount
+        totals_by_person[who] = totals_by_person.get(who, 0.0) + amount
+        counts_by_person[who] = counts_by_person.get(who, 0) + 1
+        totals_by_day_people.setdefault(date_key, {})
+        totals_by_day_people[date_key][who] = totals_by_day_people[date_key].get(who, 0.0) + amount
+        total_sum += amount
+        total_records += 1
+
+    if not totals_by_day:
+        return f"💰 Проезд — все сотрудники\n\n📆 {month_caption}\n\n⚪ За этот месяц нет корректных сумм."
+
+    known_people = [name for name in WORKERS if name in totals_by_person]
+    other_people = sorted(name for name in totals_by_person if name not in WORKERS)
+    ordered_people = known_people + other_people
+
+    lines = ["💰 Проезд — все сотрудники", "", f"📆 {month_caption}", "", "📅 По дням"]
+    ordered_dates = sorted(totals_by_day.keys(), key=lambda value: parse_date(value) or now_local())
+    for date_key in ordered_dates:
+        person_parts = [
+            f"{name} {format_money_spaced(totals_by_day_people[date_key][name])}"
+            for name in ordered_people
+            if name in totals_by_day_people.get(date_key, {})
+        ]
+        line = f"• {date_key} — {format_money_spaced(totals_by_day[date_key])}"
+        if person_parts:
+            line += f" ({'; '.join(person_parts)})"
+        lines.append(line)
+
+    lines.extend(["", "👤 По людям"])
+    for name in ordered_people:
+        lines.append(
+            f"• {name} — {format_money_spaced(totals_by_person[name])} · {counts_by_person[name]} зап."
+        )
+
+    lines.extend(
+        [
+            "",
+            f"Итого за месяц: {format_money_spaced(total_sum)}",
+            f"Записей: {total_records}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def show_travel_menu(query, context):
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить проезд", callback_data="travel_add")],
+        [InlineKeyboardButton("📋 История по сотруднику", callback_data="travel_history_person")],
+        [InlineKeyboardButton("📊 Все за месяц", callback_data="travel_history_all")],
+    ]
+    if is_payout_editor_target(query):
+        keyboard.append([InlineKeyboardButton("✏️ Исправить проезд", callback_data="travel_edit")])
+    keyboard.extend([
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_service_menu")],
+        [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+    ])
+    await show_text_screen(
+        query,
+        context,
+        "💰 Проезд\n\nВыберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return TRAVEL_MENU
+
+
+async def show_travel_history_period_menu(query, context, mode):
+    context.user_data["travel_history_mode"] = mode
+    who = context.user_data.get("travel_who", "")
+    if mode == "person":
+        title = f"📋 История по сотруднику\n\n{who}\n\nКакой месяц показать?"
+        back_callback = "back_travel_who"
+    elif mode == "edit":
+        title = f"✏️ Исправить проезд\n\n{who}\n\nКакой месяц открыть?"
+        back_callback = "back_travel_who"
+    else:
+        title = "📊 Проезд — все сотрудники\n\nКакой месяц показать?"
+        back_callback = "back_travel_menu"
+
+    keyboard = [
+        [InlineKeyboardButton("📅 Текущий месяц", callback_data="tr_hist_current")],
+        [InlineKeyboardButton("🗓 Прошлый месяц", callback_data="tr_hist_prev")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
+        [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+    ]
+    await show_text_screen(query, context, title, reply_markup=InlineKeyboardMarkup(keyboard))
+    return TRAVEL_HISTORY_PERIOD
+
+
+async def show_travel_date_menu(query, context, notice=None):
     who = context.user_data.get("travel_who", "?")
     selected_date = context.user_data.get("travel_date")
     selected_line = f"📅 Выбрано: {selected_date}\n\n" if selected_date else ""
+    period_key = context.user_data.get("travel_allowed_period")
+    period_line = f"🗓 Месяц: {format_period_label(period_key)}\n\n" if period_key else ""
     keyboard = [
         [InlineKeyboardButton(f"Сегодня ({today()})", callback_data="tr_date_today")],
         [InlineKeyboardButton(f"Вчера ({yesterday()})", callback_data="tr_date_yesterday")],
+        [InlineKeyboardButton(f"Позавчера ({day_before_yesterday()})", callback_data="tr_date_daybefore")],
         [InlineKeyboardButton("✏️ Другая дата", callback_data="tr_date_custom")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_who")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
+    text = (
+        f"{build_progress_text(TRAVEL_FLOW_STEPS, 2)}\n\n"
+        f"💰 Проезд — {who}\n\n{selected_line}{period_line}За какую дату добавить поездки?"
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
     await show_text_screen(
         query,
         context,
-        f"💰 Проезд — {who}\n\n{selected_line}За какую дату добавить поездки?",
+        text,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return TRAVEL_DATE
@@ -5198,28 +6773,176 @@ async def show_travel_date_menu(query, context):
 async def show_travel_action_menu(query, context):
     who = context.user_data.get("travel_who", "?")
     selected_date = get_travel_selected_date(context)
-    kb = [
-        [
-            InlineKeyboardButton("1 поездка", callback_data="tr_count_1"),
-            InlineKeyboardButton("2 поездки", callback_data="tr_count_2"),
-        ],
-        [
-            InlineKeyboardButton("3 поездки", callback_data="tr_count_3"),
-            InlineKeyboardButton("4 поездки", callback_data="tr_count_4"),
-        ],
-        [InlineKeyboardButton("🔢 Другое количество", callback_data="tr_count_custom")],
-        [InlineKeyboardButton("💰 Другая сумма", callback_data="tr_custom")],
-        [InlineKeyboardButton("📋 Поездки за выбранную дату", callback_data="tr_summary")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_date")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
-    ]
     await show_text_screen(
         query,
         context,
-        f"💰 Проезд — {who}\n\n📅 {selected_date}\nВыберите действие:",
-        reply_markup=InlineKeyboardMarkup(kb),
+        f"{build_progress_text(TRAVEL_FLOW_STEPS, 3)}\n\n💰 Проезд — {who}\n\n📅 {selected_date}\n\n➕ Добавить поездки:",
+        reply_markup=build_travel_action_markup(),
     )
     return TRAVEL_ACTION
+
+
+async def show_travel_month_person_screen(query, context, back_callback="back_travel_action"):
+    who = context.user_data.get("travel_who", "?")
+    reference_date = get_travel_reference_date(context)
+
+    try:
+        travels = await run_blocking(get_all_travels)
+        text = build_travel_month_person_text(who, travels, reference_date)
+    except Exception:
+        logger.exception("Failed to build monthly travel summary for person")
+        text = f"💰 Проезд — {who}\n\n❌ Не удалось получить историю за месяц."
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
+            [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+        ]
+    )
+    await show_text_screen(query, context, text, reply_markup=keyboard)
+    return TRAVEL_ACTION if back_callback == "back_travel_action" else TRAVEL_HISTORY_PERIOD
+
+
+async def show_travel_month_all_screen(query, context, back_callback="back_travel_who"):
+    reference_date = get_travel_reference_date(context)
+
+    try:
+        travels = await run_blocking(get_all_travels)
+        text = build_travel_month_all_text(travels, reference_date)
+    except Exception:
+        logger.exception("Failed to build monthly travel summary for all workers")
+        text = "💰 Проезд — все сотрудники\n\n❌ Не удалось получить свод за месяц."
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
+            [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+        ]
+    )
+    await show_text_screen(query, context, text, reply_markup=keyboard)
+    if back_callback == "back_travel_action":
+        return TRAVEL_ACTION
+    if back_callback in {"back_travel_who", "back_travel_menu"}:
+        return TRAVEL_MENU
+    return TRAVEL_HISTORY_PERIOD
+
+
+async def get_travel_entry_by_row(row_num):
+    travels = await run_blocking(get_all_travels_with_rows)
+    return next((item for item in travels if int(item.get("__row", 0)) == int(row_num)), None)
+
+
+async def show_travel_edit_date_screen(query, context, back_callback="back_travel_history_period", notice=None):
+    who = context.user_data.get("travel_who", "?")
+    reference_date = get_travel_reference_date(context)
+
+    try:
+        travels = await run_blocking(get_all_travels_with_rows)
+        groups = build_travel_edit_date_groups(who, travels, reference_date)
+    except Exception:
+        logger.exception("Failed to build travel edit date groups")
+        groups = None
+
+    month_caption = format_month_caption(reference_date)
+    lines = [f"✏️ Проезд — {who}", "", f"📆 {month_caption}"]
+    if notice:
+        lines.extend(["", notice])
+    lines.append("")
+
+    keyboard = []
+    if not groups:
+        lines.append("⚪ За этот месяц записей для редактирования нет.")
+    else:
+        lines.append("Выберите дату:")
+        lines.append("")
+        for bucket in groups:
+            lines.append(
+                f"• {bucket['date']} — {format_money_spaced(bucket['amount'])} · {bucket['count']} зап."
+            )
+            keyboard.append(
+                [InlineKeyboardButton(
+                    f"{bucket['date']} · {format_money_spaced(bucket['amount'])} · {bucket['count']} зап.",
+                    callback_data=f"tr_edit_date:{bucket['date']}",
+                )]
+            )
+
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])
+    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
+    await show_text_screen(query, context, "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+    return TRAVEL_HISTORY_PERIOD
+
+
+async def render_travel_edit_entries_screen(target, context, notice=None):
+    who = context.user_data.get("travel_who", "?")
+    date_str = context.user_data.get("travel_date") or today()
+
+    try:
+        travels = await run_blocking(get_all_travels_with_rows)
+        entries = build_travel_edit_entries(who, travels, date_str)
+    except Exception:
+        logger.exception("Failed to build travel edit entries")
+        entries = None
+
+    lines = [f"✏️ Проезд — {who}", "", f"📅 {date_str}"]
+    if notice:
+        lines.extend(["", notice])
+    lines.append("")
+
+    keyboard = []
+    if not entries:
+        lines.append("⚪ За эту дату записей не найдено.")
+    else:
+        for index, entry in enumerate(entries, start=1):
+            lines.extend(
+                [
+                    f"{index}. #{entry['__row']}",
+                    f"💰 {format_money_spaced(entry.get('Сумма', 0))}",
+                ]
+            )
+            if index != len(entries):
+                lines.extend(["", "────────", ""])
+            keyboard.append(
+                [InlineKeyboardButton(
+                    f"✏️ #{entry['__row']} · {format_money_spaced(entry.get('Сумма', 0))}",
+                    callback_data=f"tr_edit_entry:{entry['__row']}",
+                )]
+            )
+
+    keyboard.append([InlineKeyboardButton("⬅️ К датам", callback_data="tr_edit_back_dates")])
+    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
+    await render_text_screen(target, context, "\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
+    return TRAVEL_HISTORY_PERIOD
+
+
+async def show_travel_edit_card(query, context, row_num, notice=None):
+    entry = await get_travel_entry_by_row(row_num)
+    who = context.user_data.get("travel_who", "?")
+    date_str = context.user_data.get("travel_date") or today()
+    if not entry or str(entry.get("Кто", "")).strip() != str(who).strip():
+        return await render_travel_edit_entries_screen(query, context, notice="❌ Запись проезда не найдена.")
+
+    text_lines = [f"<b>✏️ Проезд — {escape_html(who)}</b>"]
+    if notice:
+        text_lines.extend([escape_html(notice), ""])
+    text_lines.extend(
+        [
+            f"📅 {escape_html(entry.get('Дата', ''))}",
+            f"💰 {format_money_spaced(entry.get('Сумма', 0))}",
+            f"🧾 Строка: #{entry.get('__row', '?')}",
+            "",
+            "Что изменить?",
+        ]
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💰 Изменить сумму", callback_data=f"tr_edit_amount:{row_num}")],
+            [InlineKeyboardButton("📅 Изменить дату", callback_data=f"tr_edit_date_prompt:{row_num}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"tr_edit_delete:{row_num}")],
+            [InlineKeyboardButton("⬅️ К записям", callback_data="tr_edit_back_entries")],
+        ]
+    )
+    await show_text_screen(query, context, "\n".join(text_lines), reply_markup=keyboard, parse_mode="HTML")
+    return TRAVEL_HISTORY_PERIOD
 
 
 async def show_delete_date_menu(query, context):
@@ -5233,14 +6956,15 @@ async def show_delete_date_menu(query, context):
     kb.extend([
         [InlineKeyboardButton(f"Сегодня ({today()})", callback_data="del_date_today")],
         [InlineKeyboardButton(f"Вчера ({yesterday()})", callback_data="del_date_yesterday")],
+        [InlineKeyboardButton(f"Позавчера ({day_before_yesterday()})", callback_data="del_date_daybefore")],
         [InlineKeyboardButton("✏️ Другая дата", callback_data="del_date_custom")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_service_menu")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_service_fix")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ])
     await show_text_screen(
         query,
         context,
-        f"✏️ Исправление записей\n\n{selected_line}За какую дату открыть записи?",
+        f"✏️ Исправить запись\n\n{selected_line}За какую дату открыть записи?",
         reply_markup=InlineKeyboardMarkup(kb),
     )
     return DELETE_DATE
@@ -5255,7 +6979,7 @@ async def show_fix_action_menu(query, context):
         await show_text_screen(
             query,
             context,
-            f"✏️ Исправление записей\n\nЗа {selected_date} записей обслуживания нет.",
+            f"✏️ Исправить запись\n\nЗа {selected_date} записей обслуживания нет.",
             reply_markup=back_markup("back_delete_date"),
         )
         return DELETE_POINT
@@ -5271,7 +6995,7 @@ async def show_fix_action_menu(query, context):
     await show_text_screen(
         query,
         context,
-        f"✏️ Исправление записей\n\n📅 {selected_date}\n"
+        f"✏️ Исправить запись\n\n📅 {selected_date}\n"
         f"Записей: {len(entries)}\n"
         f"Точки: {points_text}",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -5291,7 +7015,7 @@ async def show_delete_point_menu(query, context):
         await show_text_screen(
             query,
             context,
-            f"✏️ Исправление записей\n\nЗа {selected_date} записей обслуживания нет.",
+            f"✏️ Исправить запись\n\nЗа {selected_date} записей обслуживания нет.",
             reply_markup=back_markup("back_delete_date"),
         )
         return DELETE_POINT
@@ -5301,7 +7025,7 @@ async def show_delete_point_menu(query, context):
     await show_text_screen(
         query,
         context,
-        f"✏️ Исправление записей\n\n📅 {selected_date}\nВыберите точку для {action_text}:",
+        f"✏️ Исправить запись\n\n📅 {selected_date}\nВыберите точку для {action_text}:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
     return DELETE_POINT
@@ -5324,7 +7048,7 @@ async def show_delete_entry_menu(query, context):
         await show_text_screen(
             query,
             context,
-            f"✏️ Исправление записей\n\n📅 {selected_date}\n📍 {point}\n\nЗаписей не найдено.",
+            f"✏️ Исправить запись\n\n📅 {selected_date}\n📍 {point}\n\nЗаписей не найдено.",
             reply_markup=back_markup("back_delete_point"),
         )
         return DELETE_ENTRY
@@ -5334,17 +7058,113 @@ async def show_delete_entry_menu(query, context):
     await show_text_screen(
         query,
         context,
-        f"✏️ Исправление записей\n\n📅 {selected_date}\n📍 {point}\nВыберите запись для {action_text}:",
+        f"✏️ Исправить запись\n\n📅 {selected_date}\n📍 {point}\nВыберите запись для {action_text}:",
         reply_markup=InlineKeyboardMarkup(kb),
     )
     return DELETE_ENTRY
 
 
-async def show_fix_entry_action_menu(query, context):
+def build_service_update_data_from_entry(entry, salary_workers=None):
+    selected_workers = (
+        normalize_salary_workers(salary_workers)
+        if salary_workers is not None
+        else get_service_salary_workers(entry)
+    )
+    return {
+        "date": entry.get("Дата", ""),
+        "who": entry.get("Кто", ""),
+        "point": entry.get("Точка", ""),
+        "water": entry.get("Вода(бут)", ""),
+        "shortage": entry.get("Нехватка", ""),
+        "shortage_qty": entry.get("Остатки", ""),
+        "purchases": entry.get("Закупки", ""),
+        "purchase_sum": entry.get("Сумма закупок", 0),
+        "service_sum": calculate_service_sum_for_workers(selected_workers),
+        "salary_workers": selected_workers,
+    }
+
+
+def build_service_edit_context(entry, photo_entry=None):
+    purchases = str(entry.get("Закупки", "")).strip()
+    shortage = str(entry.get("Нехватка", "")).strip()
+    shortage_qty = str(entry.get("Остатки", "")).strip()
+    parsed_purchase_sum = parse_numeric_value(entry.get("Сумма закупок", ""))
+    parsed_purchases = parse_purchase_summary(purchases) if purchases else []
+    parsed_shortage = parse_shortage_state(shortage, shortage_qty) if shortage or shortage_qty else []
+
+    return {
+        "edit_mode": True,
+        "service_row": entry["__row"],
+        "photo_row": photo_entry["__row"] if photo_entry else None,
+        "photo": photo_entry.get("File_ID") if photo_entry else None,
+        "who": entry.get("Кто", ""),
+        "date": entry.get("Дата", ""),
+        "point": entry.get("Точка", ""),
+        "water": entry.get("Вода(бут)", ""),
+        "purchases": purchases,
+        "purchase_sum": parsed_purchase_sum if parsed_purchase_sum is not None else 0,
+        "plist": parsed_purchases,
+        "purchase_parse_failed": bool(purchases) and not parsed_purchases,
+        "shortage": shortage,
+        "shortage_qty": shortage_qty,
+        "slist": parsed_shortage,
+        "shortage_parse_failed": bool(shortage or shortage_qty) and not parsed_shortage,
+        "salary_workers": get_service_salary_workers(entry),
+    }
+
+
+async def show_fix_entry_salary_menu(query, context, notice=None):
+    delete_data = context.user_data.setdefault("delete", {})
+    entry = delete_data.get("entry")
+    if not entry:
+        await show_text_screen(
+            query,
+            context,
+            "❌ Не удалось определить запись.",
+            reply_markup=back_markup("back_delete_entry"),
+        )
+        return DELETE_CONFIRM
+
+    selected_workers = normalize_salary_workers(
+        delete_data.get("salary_workers_draft", get_service_salary_workers(entry))
+    )
+    delete_data["salary_workers_draft"] = list(selected_workers)
+
+    current_label = ", ".join(selected_workers) if selected_workers else "не считать"
+    text = (
+        "💸 Кому зачесть обслуживание в ЗП?\n\n"
+        f"{build_service_entry_text(entry)}\n\n"
+        f"Сейчас в ЗП: {current_label}\n"
+        f"За каждого отмеченного сотрудника начисляется {format_money(SERVICE_PRICE)}."
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    kb = []
+    for idx, worker in enumerate(PAID_WORKERS):
+        prefix = "✅" if worker in selected_workers else "⚪"
+        kb.append([InlineKeyboardButton(f"{prefix} {worker}", callback_data=f"fix_entry_salary_toggle_{idx}")])
+    kb.append([
+        InlineKeyboardButton("↺ Как в записи", callback_data="fix_entry_salary_reset"),
+        InlineKeyboardButton("🚫 Не считать", callback_data="fix_entry_salary_clear"),
+    ])
+    kb.append([InlineKeyboardButton("✅ Сохранить", callback_data="fix_entry_salary_save")])
+    kb.append([
+        InlineKeyboardButton("⬅️ Назад", callback_data="back_fix_entry_actions"),
+        InlineKeyboardButton("🏠 В меню", callback_data="back_main"),
+    ])
+    await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(kb))
+    return DELETE_CONFIRM
+
+
+async def show_fix_entry_action_menu(query, context, notice=None):
     entry = context.user_data.get("delete", {}).get("entry")
     text = "✏️ Что сделать с записью?\n\n" + build_service_entry_text(entry)
+    if notice:
+        text = f"{notice}\n\n{text}"
     kb = [
         [InlineKeyboardButton("✏️ Изменить запись", callback_data="fix_entry_edit")],
+        [InlineKeyboardButton("💸 Кому в ЗП", callback_data="fix_entry_salary")],
         [InlineKeyboardButton("🗑 Удалить запись", callback_data="fix_entry_delete")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_entry")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
@@ -5398,11 +7218,731 @@ def build_service_update_data(svc, service_sum):
         "purchases": svc.get("purchases", ""),
         "purchase_sum": svc.get("purchase_sum", 0),
         "service_sum": service_sum,
+        "salary_workers": get_service_salary_workers_from_context(svc),
     }
 
 
+def normalize_service_duplicate_value(value):
+    numeric = parse_numeric_value(value)
+    if numeric is not None:
+        return format_number(numeric)
+    return normalize_text_key(value)
+
+
+def build_service_duplicate_signature(data):
+    return (
+        normalize_text_key(data.get("date", "")),
+        normalize_text_key(data.get("who", "")),
+        normalize_text_key(data.get("point", "")),
+        normalize_service_duplicate_value(data.get("water", "")),
+        normalize_text_key(data.get("shortage", "")),
+        normalize_text_key(data.get("shortage_qty", "")),
+        normalize_text_key(data.get("purchases", "")),
+        normalize_service_duplicate_value(data.get("purchase_sum", 0)),
+        tuple(normalize_salary_workers(data.get("salary_workers", []))),
+    )
+
+
+def build_service_duplicate_signature_from_entry(entry):
+    return build_service_duplicate_signature(
+        {
+            "date": entry.get("Дата", ""),
+            "who": entry.get("Кто", ""),
+            "point": entry.get("Точка", ""),
+            "water": entry.get("Вода(бут)", ""),
+            "shortage": entry.get("Нехватка", ""),
+            "shortage_qty": entry.get("Остатки", ""),
+            "purchases": entry.get("Закупки", ""),
+            "purchase_sum": entry.get("Сумма закупок", 0),
+            "salary_workers": get_service_salary_workers(entry),
+        }
+    )
+
+
+def find_service_semantic_duplicates(payload, exclude_row=None):
+    signature = build_service_duplicate_signature(payload)
+    matches = []
+    for entry in get_all_services_with_rows():
+        row_num = entry.get("__row")
+        if exclude_row and row_num == exclude_row:
+            continue
+        if build_service_duplicate_signature_from_entry(entry) == signature:
+            matches.append(entry)
+    matches.sort(key=lambda entry: int(entry.get("__row", 0)), reverse=True)
+    return matches
+
+
+def build_service_duplicate_warning_text(svc, duplicates):
+    lines = [
+        "⚠️ Похоже, такая запись уже есть.",
+        "",
+        build_confirm_text(svc),
+        "",
+        "Совпадения в базе:",
+    ]
+    for entry in duplicates[:3]:
+        lines.extend(
+            [
+                f"• #{entry.get('__row', '?')}",
+                f"  📍 {entry.get('Точка', '?')}",
+                f"  📅 {entry.get('Дата', '?')}",
+                f"  👤 {entry.get('Кто', '?')}",
+                f"  💧 Вода: {format_number(entry.get('Вода(бут)', '?'))} бут",
+            ]
+        )
+        purchase_sum = parse_numeric_value(entry.get("Сумма закупок", ""))
+        if purchase_sum:
+            lines.append(f"  🛒 Закупки: {format_money(purchase_sum)}")
+        lines.append("")
+    if len(duplicates) > 3:
+        lines.append(f"… и ещё {len(duplicates) - 3} совпад.")
+        lines.append("")
+    lines.append("Если это отдельный повторный выезд, сохрани запись как ещё одно обслуживание.")
+    return "\n".join(lines)
+
+
+def build_service_duplicate_photo_key(entry):
+    return (
+        str(entry.get("Дата", "")).strip(),
+        str(entry.get("Точка", "")).strip(),
+        str(entry.get("Кто", "")).strip(),
+    )
+
+
+def build_service_duplicate_photo_index(photos):
+    photo_index = {}
+    for photo in photos:
+        key = build_service_duplicate_photo_key(photo)
+        photo_index.setdefault(key, []).append(int(photo.get("__row", 0)))
+    for rows in photo_index.values():
+        rows.sort(reverse=True)
+    return photo_index
+
+
+def entry_matches_service_duplicate_filters(entry, filters=None):
+    filters = filters or {}
+    date_filter = str(filters.get("date", "")).strip()
+    period_filter = str(filters.get("period", "")).strip()
+    worker_filter = str(filters.get("worker", "")).strip()
+    point_filter = str(filters.get("point", "")).strip()
+
+    if date_filter and str(entry.get("Дата", "")).strip() != date_filter:
+        return False
+    if period_filter and get_period_key_for_date(entry.get("Дата", "")) != period_filter:
+        return False
+    if worker_filter and str(entry.get("Кто", "")).strip() != worker_filter:
+        return False
+    if point_filter and str(entry.get("Точка", "")).strip() != point_filter:
+        return False
+    return True
+
+
+def build_service_duplicate_group_summary(entries, photo_rows):
+    newest_first = sorted(entries, key=lambda item: int(item.get("__row", 0)), reverse=True)
+    sample = newest_first[0]
+    purchase_sum = parse_numeric_value(sample.get("Сумма закупок", "")) or 0
+
+    return {
+        "date": str(sample.get("Дата", "")).strip(),
+        "point": str(sample.get("Точка", "")).strip(),
+        "who": str(sample.get("Кто", "")).strip(),
+        "water": format_number(sample.get("Вода(бут)", "")) or "",
+        "shortage": str(sample.get("Нехватка", "")).strip(),
+        "shortage_qty": str(sample.get("Остатки", "")).strip(),
+        "purchases": str(sample.get("Закупки", "")).strip(),
+        "purchase_sum": purchase_sum,
+        "salary_workers": serialize_salary_workers(get_service_salary_workers(sample)),
+        "rows": [int(item.get("__row", 0)) for item in newest_first],
+        "keep_row": int(newest_first[0].get("__row", 0)),
+        "candidate_rows": [int(item.get("__row", 0)) for item in newest_first[1:]],
+        "matching_photo_rows": list(photo_rows),
+        "entries": [
+            {
+                "row": int(item.get("__row", 0)),
+                "date": str(item.get("Дата", "")).strip(),
+                "point": str(item.get("Точка", "")).strip(),
+                "who": str(item.get("Кто", "")).strip(),
+                "water": format_number(item.get("Вода(бут)", "")) or "",
+                "shortage": str(item.get("Нехватка", "")).strip(),
+                "shortage_qty": str(item.get("Остатки", "")).strip(),
+                "purchases": str(item.get("Закупки", "")).strip(),
+                "purchase_sum": parse_numeric_value(item.get("Сумма закупок", "")) or 0,
+                "service_sum": parse_numeric_value(item.get("Сумма обслуж", "")) or 0,
+                "salary_workers": serialize_salary_workers(get_service_salary_workers(item)),
+            }
+            for item in newest_first
+        ],
+    }
+
+
+def find_service_duplicate_groups(filters=None, limit=0):
+    filters = filters or {}
+    services = get_all_services_with_rows()
+    photos = get_all_photos_with_rows()
+    photo_index = build_service_duplicate_photo_index(photos)
+
+    grouped = {}
+    for entry in services:
+        if not entry_matches_service_duplicate_filters(entry, filters):
+            continue
+        signature = build_service_duplicate_signature_from_entry(entry)
+        grouped.setdefault(signature, []).append(entry)
+
+    groups = []
+    for entries in grouped.values():
+        if len(entries) < 2:
+            continue
+        groups.append(
+            build_service_duplicate_group_summary(
+                entries,
+                photo_index.get(build_service_duplicate_photo_key(entries[0]), []),
+            )
+        )
+
+    def group_sort_key(group):
+        parsed = parse_date(group.get("date", ""))
+        timestamp = parsed.timestamp() if parsed else 0
+        return (timestamp, group.get("point", ""), group.get("who", ""))
+
+    groups.sort(key=group_sort_key, reverse=True)
+    if limit and limit > 0:
+        groups = groups[:limit]
+    return groups
+
+
+def build_service_duplicate_report_payload(groups, filters=None, limit=0):
+    filters = filters or {}
+    return {
+        "filters": {
+            "date": str(filters.get("date", "")).strip(),
+            "period": str(filters.get("period", "")).strip(),
+            "worker": str(filters.get("worker", "")).strip(),
+            "point": str(filters.get("point", "")).strip(),
+            "limit": int(limit or 0),
+        },
+        "summary": {
+            "group_count": len(groups),
+            "candidate_delete_count": sum(len(group.get("candidate_rows", [])) for group in groups),
+        },
+        "groups": groups,
+    }
+
+
+def build_service_duplicate_report_text(groups, filters=None, limit=0, include_delete_commands=False):
+    filters = filters or {}
+    applied_filters = []
+    if filters.get("period"):
+        applied_filters.append(f"период {filters['period']}")
+    if filters.get("date"):
+        applied_filters.append(f"дата {filters['date']}")
+    if filters.get("worker"):
+        applied_filters.append(f"сотрудник {filters['worker']}")
+    if filters.get("point"):
+        applied_filters.append(f"точка {filters['point']}")
+
+    total_duplicate_rows = sum(len(group.get("candidate_rows", [])) for group in groups)
+    lines = ["Поиск дублей обслуживания", ""]
+    if applied_filters:
+        lines.append("Фильтры: " + ", ".join(applied_filters))
+        lines.append("")
+    if limit and limit > 0:
+        lines.append(f"Показаны первые {limit} групп.")
+        lines.append("")
+
+    lines.append(f"Найдено групп дублей: {len(groups)}")
+    lines.append(f"Кандидатов на удаление: {total_duplicate_rows}")
+
+    if not groups:
+        return "\n".join(lines)
+
+    for index, group in enumerate(groups, start=1):
+        lines.extend(
+            [
+                "",
+                f"{index}. {group['date']} · {group['point']} · {group['who']}",
+                f"   Строки: {', '.join(f'#{row}' for row in group['rows'])}",
+                f"   Оставить по умолчанию: #{group['keep_row']}",
+                "   Кандидаты на удаление: "
+                + ", ".join(f"#{row}" for row in group["candidate_rows"]),
+                f"   Вода: {group['water'] or 'не указана'}",
+                f"   Нехватка: {group['shortage'] or 'всё в наличии'}",
+            ]
+        )
+        if group.get("shortage_qty"):
+            lines.append(f"   Остатки: {group['shortage_qty']}")
+        if group.get("purchases"):
+            lines.append(f"   Закупки: {group['purchases']}")
+        if group.get("purchase_sum"):
+            lines.append(f"   Сумма закупок: {format_money(group['purchase_sum'])}")
+        if group.get("salary_workers"):
+            lines.append(f"   В ЗП: {group['salary_workers']}")
+        if group.get("matching_photo_rows"):
+            lines.append(
+                "   Фото с той же датой/точкой/сотрудником: "
+                + ", ".join(f"#{row}" for row in group["matching_photo_rows"])
+            )
+
+    if include_delete_commands:
+        lines.extend(
+            [
+                "",
+                "Удаление строк:",
+                "/delete_service_rows 79 76",
+                "/delete_service_rows confirm 79 76",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def build_service_duplicates_command_help():
+    return (
+        "🔎 Поиск дублей обслуживания\n\n"
+        "Команда работает в личке и ничего не удаляет.\n\n"
+        "Примеры:\n"
+        "/service_duplicates\n"
+        "/service_duplicates 2026-04\n"
+        "/service_duplicates 05.04.2026\n"
+        "/service_duplicates 05.04.2026 point=Гиппо worker=Кирилл\n"
+        "/service_duplicates 2026-04 limit=20"
+    )
+
+
+def build_delete_service_rows_command_help():
+    return (
+        "🗑 Удаление строк обслуживания\n\n"
+        "Сначала покажи превью:\n"
+        "/delete_service_rows 79 76\n\n"
+        "Потом подтверди удаление:\n"
+        "/delete_service_rows confirm 79 76\n\n"
+        "Можно указывать и так:\n"
+        "/delete_service_rows confirm #79,76,4"
+    )
+
+
+def parse_service_duplicates_command_args(args):
+    filters = {"date": "", "period": "", "worker": "", "point": "", "limit": 10}
+
+    for raw_token in list(args or []):
+        token = str(raw_token or "").strip()
+        if not token:
+            continue
+
+        if "=" in token:
+            key, value = token.split("=", 1)
+            key = normalize_text_key(key)
+            value = value.strip()
+            if not value:
+                return None, f"❌ Пустое значение в аргументе `{token}`."
+
+            if key in {"date", "дата"}:
+                filters["date"] = value
+            elif key in {"period", "month", "месяц", "период"}:
+                filters["period"] = value
+            elif key in {"worker", "who", "сотрудник"}:
+                filters["worker"] = value
+            elif key in {"point", "location", "точка"}:
+                filters["point"] = value
+            elif key in {"limit", "лимит"}:
+                try:
+                    filters["limit"] = max(int(value), 0)
+                except ValueError:
+                    return None, "❌ `limit` должен быть числом."
+            else:
+                return None, f"❌ Неизвестный фильтр `{key}`."
+            continue
+
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", token):
+            filters["date"] = token
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}", token):
+            filters["period"] = token
+            continue
+
+        return None, f"❌ Не понял аргумент `{token}`."
+
+    if filters["date"] and not parse_date(filters["date"]):
+        return None, "❌ Дата должна быть в формате дд.мм.гггг."
+
+    if filters["period"]:
+        if not re.fullmatch(r"\d{4}-\d{2}", filters["period"]):
+            return None, "❌ Период должен быть в формате гггг-мм, например 2026-04."
+        year_str, month_str = filters["period"].split("-", 1)
+        month = int(month_str)
+        if month < 1 or month > 12:
+            return None, "❌ В периоде месяц должен быть от 01 до 12."
+        filters["period"] = f"{int(year_str):04d}-{month:02d}"
+
+    if filters["date"] and filters["period"]:
+        date_period = get_period_key_for_date(filters["date"])
+        if date_period and date_period != filters["period"]:
+            return None, "❌ Дата и период противоречат друг другу."
+
+    return filters, None
+
+
+def parse_delete_service_rows_command_args(args):
+    confirm = False
+    row_numbers = []
+    seen = set()
+
+    for raw_token in list(args or []):
+        token = str(raw_token or "").strip()
+        if not token:
+            continue
+
+        normalized = normalize_text_key(token)
+        if normalized in {"confirm", "ok", "yes"}:
+            confirm = True
+            continue
+
+        parts = [part.strip() for part in token.split(",") if part.strip()]
+        if not parts:
+            continue
+
+        for part in parts:
+            clean = part.lstrip("#")
+            if not clean.isdigit():
+                return None, None, f"❌ Не понял номер строки `{part}`."
+            row_num = int(clean)
+            if row_num < 2:
+                return None, None, "❌ Номер строки должен быть 2 или больше."
+            if row_num in seen:
+                continue
+            seen.add(row_num)
+            row_numbers.append(row_num)
+
+    if not row_numbers:
+        return None, None, "❌ Укажи номера строк для удаления."
+
+    return row_numbers, confirm, None
+
+
+def split_text_for_telegram(text, limit=3900):
+    chunks = []
+    current = []
+    current_len = 0
+
+    for block in str(text or "").split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        block_len = len(block) + (2 if current else 0)
+        if current and current_len + block_len > limit:
+            chunks.append("\n\n".join(current))
+            current = [block]
+            current_len = len(block)
+            continue
+        current.append(block)
+        current_len += block_len
+
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks or [str(text or "")]
+
+
+def get_service_duplicate_reviews(bot_data):
+    return bot_data.setdefault("service_duplicate_reviews", {})
+
+
+def cleanup_expired_service_duplicate_reviews(bot_data):
+    reviews = get_service_duplicate_reviews(bot_data)
+    now_ts = now_local().timestamp()
+    expired_ids = []
+    for review_id, review in reviews.items():
+        created_at_ts = review.get("created_at_ts")
+        if not created_at_ts:
+            continue
+        if now_ts - created_at_ts > SERVICE_DUPLICATE_REVIEW_TTL_SECONDS:
+            expired_ids.append(review_id)
+    for review_id in expired_ids:
+        reviews.pop(review_id, None)
+
+
+def next_service_duplicate_review_id(bot_data):
+    counter = int(bot_data.get("service_duplicate_review_counter", 0)) + 1
+    bot_data["service_duplicate_review_counter"] = counter
+    return str(counter)
+
+
+def create_service_duplicate_review(bot_data, chat_id, user_id, groups, filters=None, limit=0):
+    cleanup_expired_service_duplicate_reviews(bot_data)
+    review_id = next_service_duplicate_review_id(bot_data)
+    candidate_rows = []
+    row_seen = set()
+    for group in groups:
+        for row_num in group.get("candidate_rows", []):
+            row_num = int(row_num)
+            if row_num in row_seen:
+                continue
+            row_seen.add(row_num)
+            candidate_rows.append(row_num)
+    candidate_rows.sort(reverse=True)
+    review = {
+        "id": review_id,
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "filters": dict(filters or {}),
+        "limit": int(limit or 0),
+        "groups": groups,
+        "candidate_rows": candidate_rows,
+        "selected_rows": list(candidate_rows),
+        "created_at_ts": now_local().timestamp(),
+    }
+    get_service_duplicate_reviews(bot_data)[review_id] = review
+    return review
+
+
+def get_service_duplicate_review(bot_data, review_id, user_id=None, chat_id=None):
+    cleanup_expired_service_duplicate_reviews(bot_data)
+    review = get_service_duplicate_reviews(bot_data).get(str(review_id))
+    if not review:
+        return None
+    if user_id is not None and review.get("user_id") != user_id:
+        return None
+    if chat_id is not None and review.get("chat_id") != chat_id:
+        return None
+    return review
+
+
+def drop_service_duplicate_review(bot_data, review_id):
+    get_service_duplicate_reviews(bot_data).pop(str(review_id), None)
+
+
+def build_service_duplicate_review_text(review, mode="overview"):
+    groups = review.get("groups", [])
+    filters = review.get("filters", {})
+    limit = review.get("limit", 0)
+    total_candidates = len(review.get("candidate_rows", []))
+    selected_rows = review.get("selected_rows", [])
+
+    base_text = build_service_duplicate_report_text(groups, filters, limit=limit)
+    if len(base_text) > 3400:
+        compact_lines = ["Поиск дублей обслуживания", ""]
+        if filters.get("period") or filters.get("date") or filters.get("worker") or filters.get("point"):
+            filter_parts = []
+            if filters.get("period"):
+                filter_parts.append(f"период {filters['period']}")
+            if filters.get("date"):
+                filter_parts.append(f"дата {filters['date']}")
+            if filters.get("worker"):
+                filter_parts.append(f"сотрудник {filters['worker']}")
+            if filters.get("point"):
+                filter_parts.append(f"точка {filters['point']}")
+            compact_lines.append("Фильтры: " + ", ".join(filter_parts))
+            compact_lines.append("")
+        compact_lines.append(f"Найдено групп дублей: {len(groups)}")
+        compact_lines.append(f"Кандидатов на удаление: {total_candidates}")
+        for index, group in enumerate(groups[:12], start=1):
+            compact_lines.append(
+                f"{index}. {group['date']} · {group['point']} · {group['who']} · "
+                f"к удалению {', '.join(f'#{row}' for row in group['candidate_rows'])}"
+            )
+        if len(groups) > 12:
+            compact_lines.append(f"… и ещё {len(groups) - 12} групп.")
+        base_text = "\n".join(compact_lines)
+
+    lines = [base_text]
+    lines.append("")
+    if mode == "overview":
+        if total_candidates:
+            lines.append("Дальше выбери действие кнопками ниже.")
+        else:
+            lines.append("Удалять здесь нечего.")
+    elif mode == "select":
+        lines.append(
+            f"Выбрано строк: {len(selected_rows)} из {total_candidates}."
+        )
+        if selected_rows:
+            lines.append("Сейчас выбраны: " + ", ".join(f"#{row}" for row in selected_rows[:20]))
+            if len(selected_rows) > 20:
+                lines.append(f"… и ещё {len(selected_rows) - 20}.")
+        lines.append("Нажимай по строкам ниже, чтобы снять или вернуть выбор.")
+    elif mode == "confirm_all":
+        lines.append(f"Подтвердить удаление всех кандидатов: {total_candidates} строк?")
+        if total_candidates:
+            lines.append(", ".join(f"#{row}" for row in review.get("candidate_rows", [])[:30]))
+            if total_candidates > 30:
+                lines.append(f"… и ещё {total_candidates - 30}.")
+        lines.append("Фото автоматически не удаляются.")
+    elif mode == "confirm_selected":
+        lines.append(f"Подтвердить удаление выбранных строк: {len(selected_rows)}?")
+        if selected_rows:
+            lines.append(", ".join(f"#{row}" for row in selected_rows[:30]))
+            if len(selected_rows) > 30:
+                lines.append(f"… и ещё {len(selected_rows) - 30}.")
+        lines.append("Фото автоматически не удаляются.")
+    return "\n".join(lines)
+
+
+def build_service_duplicate_review_overview_markup(review_id, has_candidates):
+    keyboard = []
+    if has_candidates:
+        keyboard.append([InlineKeyboardButton("🗑 Удалить все кандидаты", callback_data=f"svcdup:confirm_all:{review_id}")])
+        keyboard.append([InlineKeyboardButton("🎯 Выбрать строки", callback_data=f"svcdup:select:{review_id}")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"svcdup:cancel:{review_id}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_service_duplicate_selection_markup(review):
+    review_id = review["id"]
+    selected_rows = {int(row) for row in review.get("selected_rows", [])}
+    row_meta = {}
+    for group in review.get("groups", []):
+        for entry in group.get("entries", []):
+            row_num = int(entry.get("row", 0))
+            if row_num not in review.get("candidate_rows", []):
+                continue
+            row_meta[row_num] = entry
+
+    keyboard = []
+    for row_num in review.get("candidate_rows", []):
+        entry = row_meta.get(int(row_num), {})
+        prefix = "✅" if int(row_num) in selected_rows else "⬜"
+        label = (
+            f"{prefix} #{row_num} · {entry.get('date', '—')} · "
+            f"{entry.get('point', '—')} · {entry.get('who', '—')}"
+        )
+        keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"svcdup:toggle:{review_id}:{row_num}")])
+
+    actions = []
+    if review.get("candidate_rows"):
+        actions.append(InlineKeyboardButton("✅ Все", callback_data=f"svcdup:select_all:{review_id}"))
+        actions.append(InlineKeyboardButton("⬜ Снять все", callback_data=f"svcdup:clear:{review_id}"))
+    if actions:
+        keyboard.append(actions)
+
+    if selected_rows:
+        keyboard.append([InlineKeyboardButton("🗑 Удалить выбранное", callback_data=f"svcdup:confirm_selected:{review_id}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"svcdup:back:{review_id}")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"svcdup:cancel:{review_id}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_service_duplicate_confirm_markup(review_id, confirm_action):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить", callback_data=f"svcdup:{confirm_action}:{review_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"svcdup:back:{review_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"svcdup:cancel:{review_id}")],
+    ])
+
+
+def build_service_rows_map():
+    return {int(entry.get("__row", 0)): entry for entry in get_all_services_with_rows()}
+
+
+def build_delete_service_rows_preview(row_numbers):
+    service_rows = build_service_rows_map()
+    photos = get_all_photos_with_rows()
+    photo_index = build_service_duplicate_photo_index(photos)
+
+    found_entries = []
+    missing_rows = []
+    for row_num in row_numbers:
+        entry = service_rows.get(row_num)
+        if entry:
+            found_entries.append(entry)
+        else:
+            missing_rows.append(row_num)
+
+    lines = ["🗑 К удалению из Обслуживание", ""]
+    if found_entries:
+        for entry in sorted(found_entries, key=lambda item: int(item.get("__row", 0)), reverse=True):
+            row_num = int(entry.get("__row", 0))
+            lines.extend(
+                [
+                    f"• #{row_num}",
+                    f"  📅 {entry.get('Дата', '—')}",
+                    f"  📍 {entry.get('Точка', '—')}",
+                    f"  👤 {entry.get('Кто', '—')}",
+                    f"  💧 Вода: {format_number(entry.get('Вода(бут)', '')) or 'не указана'}",
+                ]
+            )
+            purchases = str(entry.get("Закупки", "")).strip()
+            purchase_sum = parse_numeric_value(entry.get("Сумма закупок", "")) or 0
+            if purchases:
+                lines.append(f"  🛒 Закупки: {purchases}")
+            if purchase_sum:
+                lines.append(f"  💸 Сумма закупок: {format_money(purchase_sum)}")
+            photo_rows = photo_index.get(build_service_duplicate_photo_key(entry), [])
+            if photo_rows:
+                lines.append(
+                    "  📸 Похожие фото не удаляются автоматически: "
+                    + ", ".join(f"#{photo_row}" for photo_row in photo_rows)
+                )
+            lines.append("")
+
+    if missing_rows:
+        lines.append("⚪ Не найдены строки: " + ", ".join(f"#{row}" for row in missing_rows))
+        lines.append("")
+
+    if found_entries:
+        confirm_command = "/delete_service_rows confirm " + " ".join(
+            str(int(entry.get("__row", 0))) for entry in found_entries
+        )
+        lines.append("Для подтверждения отправь:")
+        lines.append(confirm_command)
+    else:
+        lines.append("Удалять нечего.")
+
+    return "\n".join(lines), found_entries, missing_rows
+
+
+def delete_service_rows_by_numbers(row_numbers):
+    service_rows = build_service_rows_map()
+    existing_rows = []
+    missing_rows = []
+    deleted_entries = []
+
+    for row_num in row_numbers:
+        entry = service_rows.get(row_num)
+        if entry:
+            existing_rows.append(row_num)
+            deleted_entries.append(entry)
+        else:
+            missing_rows.append(row_num)
+
+    if existing_rows:
+        sheet = get_or_create_worksheet("Обслуживание", SERVICE_HEADERS)
+        for row_num in sorted(existing_rows, reverse=True):
+            sheet.delete_rows(row_num)
+
+    deleted_entries.sort(key=lambda item: int(item.get("__row", 0)), reverse=True)
+    return {
+        "deleted_rows": sorted(existing_rows, reverse=True),
+        "missing_rows": missing_rows,
+        "deleted_entries": deleted_entries,
+    }
+
+
+def build_delete_service_rows_result_text(result):
+    deleted_rows = result.get("deleted_rows", [])
+    missing_rows = result.get("missing_rows", [])
+    deleted_entries = result.get("deleted_entries", [])
+
+    lines = ["✅ Строки обслуживания удалены", ""]
+    if deleted_rows:
+        lines.append("Удалены: " + ", ".join(f"#{row}" for row in deleted_rows))
+        lines.append("")
+        for entry in deleted_entries[:10]:
+            lines.append(
+                f"• #{entry.get('__row', '?')} — {entry.get('Дата', '—')} · "
+                f"{entry.get('Точка', '—')} · {entry.get('Кто', '—')}"
+            )
+        if len(deleted_entries) > 10:
+            lines.append(f"… и ещё {len(deleted_entries) - 10} строк.")
+        lines.append("")
+
+    if missing_rows:
+        lines.append("Не найдены: " + ", ".join(f"#{row}" for row in missing_rows))
+        lines.append("")
+
+    lines.append("Фото не удалялись автоматически.")
+    return "\n".join(lines)
+
+
 async def begin_service_edit_from_entry(query, context):
-    entry = context.user_data.get("delete", {}).get("entry")
+    delete_data = context.user_data.get("delete", {})
+    entry = delete_data.get("entry")
     if not entry:
         await show_text_screen(
             query,
@@ -5414,16 +7954,45 @@ async def begin_service_edit_from_entry(query, context):
 
     photos = await run_blocking(get_all_photos_with_rows)
     photo_entry = find_matching_photo_row(entry, photos)
-    context.user_data["svc"] = {
-        "edit_mode": True,
-        "service_row": entry["__row"],
-        "photo_row": photo_entry["__row"] if photo_entry else None,
-        "photo": photo_entry.get("File_ID") if photo_entry else None,
-        "who": entry.get("Кто", ""),
-        "date": entry.get("Дата", ""),
-        "point": entry.get("Точка", ""),
-    }
+    context.user_data["svc"] = build_service_edit_context(entry, photo_entry=photo_entry)
+    if delete_data.get("return_mode") == "payout":
+        context.user_data["svc"].update(
+            build_payout_return_context(
+                delete_data.get("return_period"),
+                screen=delete_data.get("return_screen", "overview"),
+            )
+        )
+        context.user_data["svc"]["allowed_period"] = delete_data.get("return_period")
     return await show_service_photo_prompt(query, context)
+
+
+async def edit_last_service(query, context):
+    await show_loading_state(query, context, "Ищу последнюю запись...")
+    try:
+        entries = await run_blocking(get_all_services_with_rows)
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            await show_sheets_busy_notice(
+                query,
+                context,
+                retry_callback="service_fix_latest",
+                back_callback="back_service_fix",
+            )
+            return SERVICE_MENU_SECTION
+        raise
+
+    last_entry = latest_item(entries) if entries else None
+    if not last_entry:
+        await show_text_screen(
+            query,
+            context,
+            "⚪ Записей обслуживания пока нет.",
+            reply_markup=back_markup("back_service_fix"),
+        )
+        return SERVICE_MENU_SECTION
+
+    context.user_data["delete"] = {"entry": last_entry}
+    return await begin_service_edit_from_entry(query, context)
 
 
 # ============ РЕВИЗИЯ ============
@@ -5512,6 +8081,9 @@ def build_revision_confirm_text(revision):
         "",
     ]
     items_to_show = REVISION_ITEMS if revision["mode"] != "edit_one" else revision["order"]
+    filled = sum(1 for item in items_to_show if revision["values"].get(item, "") not in ("", None))
+    lines.append(f"✅ Заполнено: {filled} из {len(items_to_show)}")
+    lines.append("")
     for item in items_to_show:
         lines.append(f"• {item}: {format_revision_value(item, revision['values'].get(item, ''))}")
     return "\n".join(lines)
@@ -5523,7 +8095,7 @@ async def show_revision_menu(query, context):
         [InlineKeyboardButton("📥 Импорт из текста", callback_data="rev_import")],
         [InlineKeyboardButton("✏️ Изменить ревизию", callback_data="rev_edit")],
         [InlineKeyboardButton("📋 Посмотреть ревизию", callback_data="rev_view")],
-        [InlineKeyboardButton("🛒 Что нужно закупить", callback_data="rev_procurement")],
+        [InlineKeyboardButton("🛒 Закупка и остатки", callback_data="rev_procurement")],
         [InlineKeyboardButton("📊 Сравнить с прошлым месяцем", callback_data="rev_compare")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -5646,9 +8218,13 @@ async def show_revision_edit_action_menu(query, context):
     keyboard = [
         [InlineKeyboardButton("✏️ Изменить один пункт", callback_data="rev_edit_one")],
         [InlineKeyboardButton("📝 Пройти ревизию заново", callback_data="rev_edit_all")],
+    ]
+    if revision.get("group_report_undo_log_row"):
+        keyboard.append([InlineKeyboardButton("↩️ Отменить это пополнение", callback_data="rev_edit_undo_group_import")])
+    keyboard.extend([
         [InlineKeyboardButton("🗑 Удалить ревизию", callback_data="rev_edit_delete")],
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_location")],
-    ]
+    ])
     text = "✏️ Что сделать с ревизией?\n\n" + build_revision_record_text(record)
     await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     return REVISION_EDIT_ACTION
@@ -5985,6 +8561,61 @@ async def revision_edit_action_handler(update: Update, context):
     if query.data == "rev_edit_all":
         start_revision_wizard(context, update, existing_record=revision["existing_record"], mode="edit_all")
         return await ask_revision_item(query, context)
+    if query.data == "rev_edit_undo_group_import":
+        log_row_num = revision.get("group_report_undo_log_row")
+        if not log_row_num:
+            return await show_revision_edit_action_menu(query, context)
+
+        try:
+            status, deleted_record = await run_blocking(delete_group_report_entry_by_log_row, log_row_num)
+        except APIError as error:
+            if is_google_sheets_busy_error(error):
+                await show_sheets_busy_notice(
+                    query,
+                    context,
+                    retry_callback="rev_edit_undo_group_import",
+                    back_callback="back_revision_location",
+                )
+                return REVISION_EDIT_ACTION
+            logger.exception("Failed to undo group revision import log row %s", log_row_num)
+            await show_text_screen(
+                query,
+                context,
+                "❌ Не удалось отменить это пополнение.",
+                reply_markup=back_markup("back_revision_location"),
+            )
+            return REVISION_EDIT_ACTION
+        except Exception:
+            logger.exception("Failed to undo group revision import log row %s", log_row_num)
+            await show_text_screen(
+                query,
+                context,
+                "❌ Не удалось отменить это пополнение.",
+                reply_markup=back_markup("back_revision_location"),
+            )
+            return REVISION_EDIT_ACTION
+
+        revision.pop("group_report_undo_log_row", None)
+        if status == "deleted" and deleted_record:
+            keyboard = [
+                [InlineKeyboardButton("📦 К ревизии", callback_data="revision")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+            ]
+            await show_text_screen(
+                query,
+                context,
+                build_group_report_delete_result_text(deleted_record),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return REVISION_MENU
+
+        await show_text_screen(
+            query,
+            context,
+            "⚪ Это пополнение уже отменено или недоступно.",
+            reply_markup=back_markup("back_revision_location"),
+        )
+        return REVISION_EDIT_ACTION
     if query.data == "rev_edit_delete":
         return await show_revision_delete_confirm_menu(query, context)
     return REVISION_EDIT_ACTION
@@ -6097,6 +8728,24 @@ async def revision_confirm_handler(update: Update, context):
         else:
             await run_blocking(add_revision_row, payload)
             text = "✅ Ревизия сохранена."
+        logger.info(
+            "revision saved: user_id=%s location=%s period=%s mode=%s",
+            getattr(update.effective_user, "id", None),
+            revision["location"],
+            revision["period"],
+            "update" if revision.get("row") else "create",
+        )
+    except APIError as e:
+        if is_google_sheets_busy_error(e):
+            await show_sheets_busy_notice(
+                query,
+                context,
+                retry_callback="rev_confirm_save",
+                back_callback="back_revision_confirm",
+            )
+            return REVISION_CONFIRM
+        await show_text_screen(query, context, f"❌ Ошибка сохранения ревизии: {e}")
+        return REVISION_CONFIRM
     except Exception as e:
         await show_text_screen(query, context, f"❌ Ошибка сохранения ревизии: {e}")
         return REVISION_CONFIRM
@@ -6330,6 +8979,24 @@ async def revision_import_confirm_handler(update: Update, context):
             f"Создано: {created}\n"
             f"Обновлено: {updated}"
         )
+        logger.info(
+            "revision import saved: user_id=%s period=%s created=%s updated=%s locations=%s",
+            getattr(update.effective_user, "id", None),
+            revision["period"],
+            created,
+            updated,
+            len(parsed),
+        )
+    except APIError as e:
+        if is_google_sheets_busy_error(e):
+            await show_sheets_busy_notice(
+                query,
+                context,
+                retry_callback="rev_import_save",
+                back_callback="back_revision_import_text",
+            )
+            return REVISION_IMPORT_CONFIRM
+        text = f"❌ Ошибка импорта: {e}"
     except Exception as e:
         text = f"❌ Ошибка импорта: {e}"
 
@@ -6369,24 +9036,22 @@ async def start(update: Update, context):
         return await deny_private_access(update)
     context.user_data.clear()
     keyboard = [
+        [InlineKeyboardButton("👀 К обслуживанию сегодня", callback_data="service_today")],
         [InlineKeyboardButton("🔧 Обслуживание", callback_data="service")],
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
-        [InlineKeyboardButton("🛒 Закупка и остатки", callback_data="procurement")],
-        [InlineKeyboardButton("🛠 Ремонт", callback_data="repair")],
-        [InlineKeyboardButton("🏠 Аренда", callback_data="rent")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
     ]
-    text = "☕ *Кофе\\-бот*\n\nВыберите действие:"
+    text = "<b>☕ Кофе-бот</b>\n\nВыберите действие:"
     if update.callback_query:
         await show_text_screen(
             update.callback_query,
             context,
             text,
             reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="MarkdownV2",
+            parse_mode="HTML",
         )
     else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="MarkdownV2")
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
     return MAIN_MENU
 
 
@@ -6779,6 +9444,13 @@ async def rent_menu_handler(update: Update, context):
         clear_rent_payment_selection(rent)
 
         if result.get("status") == "saved":
+            logger.info(
+                "rent payment saved: user_id=%s point=%s period=%s lease_id=%s",
+                getattr(update.effective_user, "id", None),
+                result["lease"].get("Точка", ""),
+                period_key,
+                result["lease"].get("id", ""),
+            )
             notice = (
                 f"<b>✅ Оплата отмечена</b>\n"
                 f"📍 {escape_html(result['lease'].get('Точка', '—'))}\n"
@@ -7229,9 +9901,9 @@ async def show_repair_contact_screen(query, context, repair_id):
 async def show_repair_new_point(query, context, notice=None):
     repair_ctx = get_repair_context(context)
     clear_repair_draft(repair_ctx)
-    text = "🆕 Новый ремонт\n\nВыберите точку:"
+    text = f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 1)}\n\n🆕 Новый ремонт\n\nВыберите точку:"
     if notice:
-        text = f"{notice}\n\n{text}"
+        text = f"{text}\n\n{notice}"
     await show_text_screen(query, context, text, reply_markup=build_repair_point_markup())
     return REPAIR_NEW_POINT
 
@@ -7254,13 +9926,13 @@ async def show_repair_machine_step(query, context, point, notice=None):
 
     if not machines:
         text = (
-            f"🆕 Новый ремонт — {point}\n\n"
+            f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 2)}\n\n🆕 Новый ремонт — {point}\n\n"
             "На этой точке пока нет аппарата в реестре.\n"
             "Если знаешь, можно ввести модель вручную.\n"
             "Например: <b>Saeco Aulika</b>"
         )
         if notice:
-            text = f"{notice}\n\n{text}"
+            text = f"{text}\n\n{notice}"
         await show_text_screen(query, context, text, reply_markup=build_repair_no_machine_markup(), parse_mode="HTML")
         return REPAIR_NEW_MACHINE
 
@@ -7268,18 +9940,18 @@ async def show_repair_machine_step(query, context, point, notice=None):
         machine = machines[0]
         repair_ctx["machine_candidate"] = machine
         text = (
-            f"🆕 Новый ремонт — {point}\n\n"
+            f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 2)}\n\n🆕 Новый ремонт — {point}\n\n"
             f"На точке сейчас стоит:\n<b>{escape_html(get_machine_display_name(machine))}</b>\n\n"
             "Ремонтируем этот аппарат?"
         )
         if notice:
-            text = f"{notice}\n\n{text}"
+            text = f"{text}\n\n{notice}"
         await show_text_screen(query, context, text, reply_markup=build_repair_single_machine_markup(), parse_mode="HTML")
         return REPAIR_NEW_MACHINE
 
-    text = f"🆕 Новый ремонт — {point}\n\nВыберите аппарат:"
+    text = f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 2)}\n\n🆕 Новый ремонт — {point}\n\nВыберите аппарат:"
     if notice:
-        text = f"{notice}\n\n{text}"
+        text = f"{text}\n\n{notice}"
     await show_text_screen(query, context, text, reply_markup=build_repair_machine_markup(point, machines))
     return REPAIR_NEW_MACHINE
 
@@ -7287,27 +9959,33 @@ async def show_repair_machine_step(query, context, point, notice=None):
 async def show_repair_reason_step(query, context, notice=None):
     repair_ctx = get_repair_context(context)
     machine = repair_ctx.get("machine_record") or repair_ctx.get("machine_candidate")
-    text = "🧩 Причина поломки\n\nВыберите причину:"
+    text = f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 3)}\n\n🧩 Причина поломки\n\nВыберите причину:"
     if machine:
-        text = f"☕ Аппарат: {escape_html(get_machine_display_name(machine))}\n\n{text}"
+        text = f"{text}\n\n☕ Аппарат: {escape_html(get_machine_display_name(machine))}"
     if notice:
-        text = f"{notice}\n\n{text}"
+        text = f"{text}\n\n{notice}"
     await show_text_screen(query, context, text, reply_markup=build_repair_reason_markup(), parse_mode="HTML")
     return REPAIR_NEW_REASON
 
 
 async def show_repair_description_step(query, context, notice=None):
-    text = "📝 Коротко опиши, что случилось.\n\nМожно пропустить и добавить детали позже."
+    text = (
+        f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 4)}\n\n"
+        "📝 Коротко опиши, что случилось.\n\nМожно пропустить и добавить детали позже."
+    )
     if notice:
-        text = f"{notice}\n\n{text}"
+        text = f"{text}\n\n{notice}"
     await show_text_screen(query, context, text, reply_markup=build_repair_description_markup(), parse_mode="HTML")
     return REPAIR_NEW_DESCRIPTION
 
 
 async def show_repair_photo_step(query, context, notice=None):
-    text = "📎 Пришли фото поломки, если оно есть.\n\nМожно пропустить и добавить позже из карточки."
+    text = (
+        f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 5)}\n\n"
+        "📎 Пришли фото поломки, если оно есть.\n\nМожно пропустить и добавить позже из карточки."
+    )
     if notice:
-        text = f"{notice}\n\n{text}"
+        text = f"{text}\n\n{notice}"
     await show_text_screen(query, context, text, reply_markup=build_repair_photo_markup())
     return REPAIR_NEW_PHOTO
 
@@ -7323,9 +10001,9 @@ async def show_repair_broken_date_step(query, context, notice=None):
                 await show_sheets_busy_notice(query)
                 return REPAIR_NEW_DATE
             raise
-    text = "📅 Когда случилась поломка?"
+    text = f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 6)}\n\n📅 Когда случилась поломка?"
     if notice:
-        text = f"{notice}\n\n{text}"
+        text = f"{text}\n\n{notice}"
     await show_text_screen(query, context, text, reply_markup=build_repair_broken_date_markup(last_service_date))
     return REPAIR_NEW_DATE
 
@@ -7642,12 +10320,19 @@ async def repair_menu_handler(update: Update, context):
                 notice="⚪ Сначала переведи ремонт в допустимый следующий статус.",
             )
         try:
-            await run_blocking(update_repair_status_value, repair_id, REPAIR_STATUS_INSTALLED)
+            repair = await run_blocking(update_repair_status_value, repair_id, REPAIR_STATUS_INSTALLED)
         except APIError as error:
             if is_google_sheets_busy_error(error):
                 await show_sheets_busy_notice(query)
                 return REPAIR_MENU_SECTION
             raise
+        logger.info(
+            "repair status changed: user_id=%s repair_id=%s point=%s status=%s",
+            getattr(update.effective_user, "id", None),
+            repair_id,
+            (repair or {}).get("Точка", ""),
+            REPAIR_STATUS_INSTALLED,
+        )
         await refresh_group_service_today_posts(context.application, force=True)
         return await show_repair_card_screen(query, context, repair_id, notice="✅ Точка возвращена в работу.")
     if data.startswith("repair_delete_") and not data.startswith("repair_delete_confirm_") and not data.startswith("repair_delete_cancel_"):
@@ -7875,7 +10560,7 @@ async def repair_new_description_handler(update: Update, context):
     repair_ctx = get_repair_context(context)
     repair_ctx["description"] = description
     await message.reply_text(
-        "📎 Пришли фото поломки, если оно есть.\n\nМожно пропустить и добавить позже из карточки.",
+        f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 5)}\n\n📎 Пришли фото поломки, если оно есть.\n\nМожно пропустить и добавить позже из карточки.",
         reply_markup=build_repair_photo_markup(),
     )
     return REPAIR_NEW_PHOTO
@@ -7921,7 +10606,7 @@ async def repair_new_photo_handler(update: Update, context):
                 return REPAIR_NEW_PHOTO
             raise
     await message.reply_text(
-        "📅 Когда случилась поломка?",
+        f"{build_progress_text(REPAIR_NEW_FLOW_STEPS, 6)}\n\n📅 Когда случилась поломка?",
         reply_markup=build_repair_broken_date_markup(last_service_date),
     )
     return REPAIR_NEW_DATE
@@ -7943,6 +10628,14 @@ async def repair_new_date_handler(update: Update, context):
         )
     if query.data == "repair_date_yesterday":
         repair_ctx["broken_date"] = yesterday()
+        return await complete_repair_creation(
+            query,
+            context,
+            get_actor_label(update),
+            repair_ctx.get("photo_file_id", ""),
+        )
+    if query.data == "repair_date_daybefore":
+        repair_ctx["broken_date"] = day_before_yesterday()
         return await complete_repair_creation(
             query,
             context,
@@ -8037,12 +10730,19 @@ async def repair_status_update_handler(update: Update, context):
 
     new_status = options[index]
     try:
-        await run_blocking(update_repair_status_value, repair_id, new_status)
+        repair = await run_blocking(update_repair_status_value, repair_id, new_status)
     except APIError as error:
         if is_google_sheets_busy_error(error):
             await show_sheets_busy_notice(query)
             return REPAIR_STATUS_UPDATE
         raise
+    logger.info(
+        "repair status changed: user_id=%s repair_id=%s point=%s status=%s",
+        getattr(update.effective_user, "id", None),
+        repair_id,
+        (repair or {}).get("Точка", ""),
+        new_status,
+    )
     await refresh_group_service_today_posts(context.application, force=True)
     return await show_repair_card_screen(query, context, repair_id, notice=f"✅ Статус обновлён: {escape_html(new_status)}")
 
@@ -8127,6 +10827,8 @@ async def repair_broken_date_handler(update: Update, context):
         value = today()
     elif query.data == "repair_broken_yesterday":
         value = yesterday()
+    elif query.data == "repair_broken_daybefore":
+        value = day_before_yesterday()
     elif query.data == "repair_broken_last_service":
         value = ""
         try:
@@ -8216,6 +10918,8 @@ async def repair_date_sent_handler(update: Update, context):
         repair_ctx["date_sent_value"] = today()
     elif query.data == "repair_sent_yesterday":
         repair_ctx["date_sent_value"] = yesterday()
+    elif query.data == "repair_sent_daybefore":
+        repair_ctx["date_sent_value"] = day_before_yesterday()
     elif query.data == "repair_sent_skip":
         repair_ctx["date_sent_value"] = ""
     elif query.data == "repair_sent_custom":
@@ -8539,11 +11243,11 @@ async def repair_expense_paid_handler(update: Update, context):
 
 async def show_service_section_menu(query, context):
     keyboard = [
-        [InlineKeyboardButton("🔔 К обслуживанию сегодня", callback_data="service_today")],
         [InlineKeyboardButton("📝 Начать обслуживание", callback_data="service_start")],
+        [InlineKeyboardButton("🛠 Ремонт", callback_data="repair")],
         [InlineKeyboardButton("📋 Информация по точкам", callback_data="info")],
         [InlineKeyboardButton("⚠️ Проблемные точки", callback_data="service_problem_points")],
-        [InlineKeyboardButton("✏️ Исправить записи", callback_data="delete_service")],
+        [InlineKeyboardButton("✏️ Исправить запись", callback_data="service_fix")],
         [InlineKeyboardButton("💰 Проезд", callback_data="travel")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -8551,12 +11255,1526 @@ async def show_service_section_menu(query, context):
     return SERVICE_MENU_SECTION
 
 
+async def show_service_fix_menu(query, context):
+    keyboard = [
+        [InlineKeyboardButton("🕘 Последняя запись", callback_data="service_fix_latest")],
+        [InlineKeyboardButton("📅 Выбрать дату", callback_data="service_fix_by_date")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_service_menu")],
+        [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+    ]
+    await show_text_screen(
+        query,
+        context,
+        "✏️ Исправить запись\n\n"
+        "Можно быстро открыть последнюю запись или выбрать дату, чтобы изменить или удалить нужную.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return SERVICE_MENU_SECTION
+
+
+def get_salary_task_context(context):
+    return context.user_data.setdefault("salary_task", {})
+
+
+def clear_salary_task_context(context):
+    context.user_data.pop("salary_task", None)
+
+
+def build_salary_task_confirm_text(task):
+    return "\n".join(
+        [
+            "🧰 Задача / доплата",
+            "",
+            f"👤 {task.get('who', '?')}",
+            f"📅 {task.get('date', '?')}",
+            f"📝 {task.get('description', '—')}",
+            f"💰 {format_money_spaced(task.get('amount', ''))}",
+        ]
+    )
+
+
+async def start_salary_task_flow(query, context, preset_worker=None, return_context=None):
+    salary_task = get_salary_task_context(context)
+    salary_task.clear()
+    if return_context:
+        salary_task.update(return_context)
+    if preset_worker:
+        salary_task["who"] = preset_worker
+        return await show_salary_task_date_menu(query, context)
+    return await show_salary_task_worker_menu(query, context)
+
+
+async def show_salary_task_worker_menu(query, context, notice=None):
+    text = "🧰 Задача / доплата\n\nКому добавить выплату?"
+    if notice:
+        text = f"{notice}\n\n{text}"
+    keyboard = [[InlineKeyboardButton(worker, callback_data=f"salary_task_worker_{idx}")] for idx, worker in enumerate(PAID_WORKERS)]
+    keyboard.append([InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")])
+    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
+    await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return SALARY_TASK_WORKER
+
+
+async def show_salary_task_date_menu(query, context, notice=None):
+    salary_task = get_salary_task_context(context)
+    worker = salary_task.get("who")
+    if not worker:
+        return await show_salary_task_worker_menu(query, context)
+
+    period_key = salary_task.get("return_period") if salary_task.get("return_mode") == "payout" else None
+    period_line = f"\n🗓 Месяц: {format_period_label(period_key)}\n" if period_key else "\n"
+    text = f"🧰 Задача / доплата\n\n👤 {worker}{period_line}\nЗа какую дату добавить?"
+    if notice:
+        text = f"{notice}\n\n{text}"
+    keyboard = [
+        [InlineKeyboardButton(f"Сегодня ({today()})", callback_data="salary_task_date_today")],
+        [InlineKeyboardButton(f"Вчера ({yesterday()})", callback_data="salary_task_date_yesterday")],
+        [InlineKeyboardButton(f"Позавчера ({day_before_yesterday()})", callback_data="salary_task_date_daybefore")],
+        [InlineKeyboardButton("✏️ Другая дата", callback_data="salary_task_date_custom")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back_salary_task_worker")],
+        [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+    ]
+    await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    return SALARY_TASK_DATE
+
+
+async def show_salary_task_description_prompt(query, context, notice=None):
+    salary_task = get_salary_task_context(context)
+    text = (
+        "🧰 Задача / доплата\n\n"
+        f"👤 {salary_task.get('who', '?')}\n"
+        f"📅 {salary_task.get('date', '?')}\n\n"
+        "Напишите коротко, за что выплата.\n"
+        "Например: починка терминала."
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+    if hasattr(query, "reply_text"):
+        await query.reply_text(text, reply_markup=back_markup("back_salary_task_date"))
+    else:
+        await show_text_screen(query, context, text, reply_markup=back_markup("back_salary_task_date"))
+    return SALARY_TASK_DESCRIPTION
+
+
+async def show_salary_task_amount_prompt(query, context, notice=None):
+    salary_task = get_salary_task_context(context)
+    text = (
+        "🧰 Задача / доплата\n\n"
+        f"👤 {salary_task.get('who', '?')}\n"
+        f"📅 {salary_task.get('date', '?')}\n"
+        f"📝 {salary_task.get('description', '—')}\n\n"
+        "Введите сумму в рублях.\n"
+        "Например: 500"
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+    if hasattr(query, "reply_text"):
+        await query.reply_text(text, reply_markup=back_markup("back_salary_task_description"))
+    else:
+        await show_text_screen(query, context, text, reply_markup=back_markup("back_salary_task_description"))
+    return SALARY_TASK_AMOUNT
+
+
+async def show_salary_task_confirm_screen(query, context, notice=None):
+    salary_task = get_salary_task_context(context)
+    text = build_salary_task_confirm_text(salary_task)
+    if notice:
+        text = f"{notice}\n\n{text}"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Сохранить", callback_data="salary_task_save")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_salary_task_amount")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+        ]
+    )
+    if hasattr(query, "reply_text"):
+        await query.reply_text(text, reply_markup=keyboard)
+    else:
+        await show_text_screen(query, context, text, reply_markup=keyboard)
+    return SALARY_TASK_CONFIRM
+
+
+async def show_salary_task_saved_screen(query, context, entry):
+    worker = entry.get("who", "")
+    text = "✅ Задача добавлена в ЗП\n\n" + build_salary_task_confirm_text(entry)
+    keyboard_rows = []
+    user_id = getattr(getattr(query, "from_user", None), "id", None)
+    if worker == "Кирилл" and user_id in PAYOUT_VIEWERS:
+        keyboard_rows.append([InlineKeyboardButton(get_default_salary_button_label(), callback_data="report_salary_kirill")])
+    keyboard_rows.append([InlineKeyboardButton("➕ Ещё задача", callback_data="report_salary_task")])
+    keyboard_rows.append([InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")])
+    keyboard_rows.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
+    clear_salary_task_context(context)
+    await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(keyboard_rows))
+    return REPORT_MENU_SECTION
+
+
+def get_default_payout_period_key():
+    config = get_report_period_config(get_default_salary_period_code())
+    if config and config.get("period_key"):
+        return config["period_key"]
+    return get_previous_month_period_key() or current_period_key()
+
+
+def is_payout_editor_target(target):
+    user_id = getattr(getattr(target, "from_user", None), "id", None)
+    return user_id in PAYOUT_EDITORS
+
+
+def get_payout_screen_access(query, settlement):
+    return is_payout_editor_target(query) and not is_payout_period_locked(settlement)
+
+
+def build_payout_delete_markup(confirm_callback, back_screen):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=confirm_callback)],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"payout_screen:{back_screen}")],
+        ]
+    )
+
+
+def get_payout_retry_callback(screen):
+    screen = str(screen or "overview")
+    if screen == "overview":
+        return "payout_open"
+    return f"payout_screen:{screen}"
+
+
+def build_payout_failure_markup(retry_callback, back_callback):
+    keyboard = []
+    if retry_callback:
+        keyboard.append([InlineKeyboardButton("🔄 Повторить", callback_data=retry_callback)])
+    if back_callback:
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)])
+    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def show_payout_failure_screen(query, context, text, retry_callback, back_callback):
+    await show_text_screen(
+        query,
+        context,
+        text,
+        reply_markup=build_payout_failure_markup(retry_callback, back_callback),
+    )
+    return PAYOUT_SCREEN
+
+
+async def load_payout_settlement_with_timeout(period_key):
+    return await asyncio.wait_for(
+        run_blocking(compute_kirill_settlement, period_key),
+        timeout=PAYOUT_SCREEN_LOAD_TIMEOUT_SECONDS,
+    )
+
+
+async def load_payout_sources_with_timeout():
+    return await asyncio.wait_for(
+        run_blocking(build_payout_sources),
+        timeout=PAYOUT_SCREEN_LOAD_TIMEOUT_SECONDS,
+    )
+
+
+async def show_payout_overview_screen(query, context, period_key=None, notice=None):
+    payout = get_payout_context(context)
+    payout["period"] = period_key or payout.get("period") or get_default_payout_period_key()
+    payout["screen"] = "overview"
+    await show_loading_state(query, context, "Собираю итог по Кириллу...")
+    try:
+        settlement = await load_payout_settlement_with_timeout(payout["period"])
+    except asyncio.TimeoutError:
+        logger.warning("Payout overview timed out for period %s", payout["period"])
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "⏳ Экран Кирилла отвечает слишком долго. Попробуй ещё раз.",
+            retry_callback="payout_open",
+            back_callback="back_reports_menu",
+        )
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            await show_sheets_busy_notice(query, context, retry_callback="payout_open", back_callback="back_reports_menu")
+            return PAYOUT_SCREEN
+        logger.exception("Failed to load payout overview for period %s", payout["period"])
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "❌ Не удалось открыть экран Кирилла.",
+            retry_callback="payout_open",
+            back_callback="back_reports_menu",
+        )
+    except Exception:
+        logger.exception("Failed to load payout overview for period %s", payout["period"])
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "❌ Не удалось открыть экран Кирилла.",
+            retry_callback="payout_open",
+            back_callback="back_reports_menu",
+        )
+    can_edit = get_payout_screen_access(query, settlement)
+    try:
+        await show_text_screen(
+            query,
+            context,
+            build_payout_overview_text(settlement, notice=notice),
+            reply_markup=build_payout_overview_markup(can_edit, is_payout_editor_target(query), settlement),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Failed to render payout overview for period %s", payout["period"])
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "❌ Экран Кирилла не удалось отрисовать.",
+            retry_callback="payout_open",
+            back_callback="back_reports_menu",
+        )
+    return PAYOUT_SCREEN
+
+
+async def show_payout_month_menu_screen(query, context):
+    payout = get_payout_context(context)
+    payout["period"] = payout.get("period") or get_default_payout_period_key()
+    payout["screen"] = "months"
+    await show_loading_state(query, context, "Загружаю месяцы...")
+    period_keys = recent_completed_period_keys(6)
+    try:
+        sources = await load_payout_sources_with_timeout()
+        await show_text_screen(
+            query,
+            context,
+            build_payout_month_menu_text(),
+            reply_markup=build_payout_month_menu_markup(period_keys, sources),
+            parse_mode="HTML",
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Payout months screen timed out")
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "⏳ Список месяцев загружается слишком долго. Попробуй ещё раз.",
+            retry_callback="payout_screen:months",
+            back_callback="payout_screen:overview",
+        )
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            await show_sheets_busy_notice(
+                query,
+                context,
+                retry_callback="payout_screen:months",
+                back_callback="payout_screen:overview",
+            )
+            return PAYOUT_SCREEN
+        logger.exception("Failed to load payout months")
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "❌ Не удалось загрузить месяцы Кирилла.",
+            retry_callback="payout_screen:months",
+            back_callback="payout_screen:overview",
+        )
+    except Exception:
+        logger.exception("Failed to load payout months")
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "❌ Не удалось загрузить месяцы Кирилла.",
+            retry_callback="payout_screen:months",
+            back_callback="payout_screen:overview",
+        )
+    return PAYOUT_SCREEN
+
+
+def build_payout_screen_payload(context, target, settlement, screen, notice=None):
+    can_edit = get_payout_screen_access(target, settlement)
+    payout = get_payout_context(context)
+    effective_screen = screen
+
+    if screen == "services":
+        text = build_payout_date_menu_text("services", settlement)
+        markup = build_payout_date_menu_markup("services", settlement, can_edit)
+    elif screen == "services_points":
+        date_str = payout.get("services_date")
+        if not date_str:
+            return build_payout_screen_payload(context, target, settlement, "services", notice=notice)
+        text = build_payout_point_menu_text("services", settlement, date_str)
+        markup = build_payout_point_menu_markup("services", settlement, date_str)
+    elif screen == "services_entries":
+        date_str = payout.get("services_date")
+        point = payout.get("services_point")
+        if not date_str:
+            return build_payout_screen_payload(context, target, settlement, "services", notice=notice)
+        if not point:
+            return build_payout_screen_payload(context, target, settlement, "services_points", notice=notice)
+        text = build_payout_entries_menu_text("services", settlement, date_str, point=point)
+        markup = build_payout_entries_menu_markup("services", settlement, can_edit, date_str, point=point)
+    elif screen == "purchases":
+        text = build_payout_date_menu_text("purchases", settlement)
+        markup = build_payout_date_menu_markup("purchases", settlement, can_edit)
+    elif screen == "purchases_points":
+        date_str = payout.get("purchases_date")
+        if not date_str:
+            return build_payout_screen_payload(context, target, settlement, "purchases", notice=notice)
+        text = build_payout_point_menu_text("purchases", settlement, date_str)
+        markup = build_payout_point_menu_markup("purchases", settlement, date_str)
+    elif screen == "purchases_entries":
+        date_str = payout.get("purchases_date")
+        point = payout.get("purchases_point")
+        if not date_str:
+            return build_payout_screen_payload(context, target, settlement, "purchases", notice=notice)
+        if not point:
+            return build_payout_screen_payload(context, target, settlement, "purchases_points", notice=notice)
+        text = build_payout_entries_menu_text("purchases", settlement, date_str, point=point)
+        markup = build_payout_entries_menu_markup("purchases", settlement, can_edit, date_str, point=point)
+    elif screen == "travels":
+        text = build_payout_date_menu_text("travels", settlement)
+        markup = build_payout_date_menu_markup("travels", settlement, can_edit)
+    elif screen == "travels_entries":
+        date_str = payout.get("travels_date")
+        if not date_str:
+            return build_payout_screen_payload(context, target, settlement, "travels", notice=notice)
+        text = build_payout_entries_menu_text("travels", settlement, date_str)
+        markup = build_payout_entries_menu_markup("travels", settlement, can_edit, date_str)
+    elif screen == "tasks":
+        text = build_payout_date_menu_text("tasks", settlement)
+        markup = build_payout_date_menu_markup("tasks", settlement, can_edit)
+    elif screen == "tasks_entries":
+        date_str = payout.get("tasks_date")
+        if not date_str:
+            return build_payout_screen_payload(context, target, settlement, "tasks", notice=notice)
+        text = build_payout_entries_menu_text("tasks", settlement, date_str)
+        markup = build_payout_entries_menu_markup("tasks", settlement, can_edit, date_str)
+    else:
+        effective_screen = "overview"
+        text = build_payout_overview_text(settlement, notice=notice)
+        markup = build_payout_overview_markup(can_edit, is_payout_editor_target(target), settlement)
+        return effective_screen, text, markup
+
+    if notice:
+        text = f"{escape_html(notice)}\n\n{text}"
+    return effective_screen, text, markup
+
+
+async def show_payout_services_screen(query, context, notice=None):
+    payout = get_payout_context(context)
+    payout["period"] = payout.get("period") or get_default_payout_period_key()
+    payout["screen"] = "services"
+    await show_loading_state(query, context, "Загружаю обслуживания...")
+    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    _, text, markup = build_payout_screen_payload(context, query, settlement, "services", notice=notice)
+    await show_text_screen(
+        query,
+        context,
+        text,
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    return PAYOUT_SCREEN
+
+
+async def show_payout_purchases_screen(query, context, notice=None):
+    payout = get_payout_context(context)
+    payout["period"] = payout.get("period") or get_default_payout_period_key()
+    payout["screen"] = "purchases"
+    await show_loading_state(query, context, "Загружаю закупки...")
+    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    _, text, markup = build_payout_screen_payload(context, query, settlement, "purchases", notice=notice)
+    await show_text_screen(
+        query,
+        context,
+        text,
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    return PAYOUT_SCREEN
+
+
+async def show_payout_travels_screen(query, context, notice=None):
+    payout = get_payout_context(context)
+    payout["period"] = payout.get("period") or get_default_payout_period_key()
+    payout["screen"] = "travels"
+    await show_loading_state(query, context, "Загружаю проезд...")
+    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    _, text, markup = build_payout_screen_payload(context, query, settlement, "travels", notice=notice)
+    await show_text_screen(
+        query,
+        context,
+        text,
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    return PAYOUT_SCREEN
+
+
+async def show_payout_salary_tasks_screen(query, context, notice=None):
+    payout = get_payout_context(context)
+    payout["period"] = payout.get("period") or get_default_payout_period_key()
+    payout["screen"] = "tasks"
+    await show_loading_state(query, context, "Загружаю допзадачи...")
+    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    _, text, markup = build_payout_screen_payload(context, query, settlement, "tasks", notice=notice)
+    await show_text_screen(
+        query,
+        context,
+        text,
+        reply_markup=markup,
+        parse_mode="HTML",
+    )
+    return PAYOUT_SCREEN
+
+
+async def show_payout_screen(query, context, screen="overview", period_key=None, notice=None):
+    if screen == "months":
+        return await show_payout_month_menu_screen(query, context)
+    if period_key:
+        get_payout_context(context)["period"] = period_key
+    payout = get_payout_context(context)
+    payout["period"] = payout.get("period") or get_default_payout_period_key()
+    payout["screen"] = screen
+    await show_loading_state(query, context, "Обновляю экран Кирилла...")
+    retry_callback = get_payout_retry_callback(screen)
+    back_callback = "payout_screen:overview" if screen != "overview" else "back_reports_menu"
+    try:
+        settlement = await load_payout_settlement_with_timeout(payout["period"])
+        effective_screen, text, markup = build_payout_screen_payload(context, query, settlement, screen, notice=notice)
+        payout["screen"] = effective_screen
+        await show_text_screen(query, context, text, reply_markup=markup, parse_mode="HTML")
+    except asyncio.TimeoutError:
+        logger.warning("Payout screen %s timed out for period %s", screen, payout["period"])
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "⏳ Экран Кирилла отвечает слишком долго. Попробуй ещё раз.",
+            retry_callback=retry_callback,
+            back_callback=back_callback,
+        )
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            await show_sheets_busy_notice(query, context, retry_callback=retry_callback, back_callback=back_callback)
+            return PAYOUT_SCREEN
+        logger.exception("Failed to open payout screen %s for period %s", screen, payout["period"])
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "❌ Не удалось открыть экран Кирилла.",
+            retry_callback=retry_callback,
+            back_callback=back_callback,
+        )
+    except Exception:
+        logger.exception("Failed to open payout screen %s for period %s", screen, payout["period"])
+        return await show_payout_failure_screen(
+            query,
+            context,
+            "❌ Не удалось открыть экран Кирилла.",
+            retry_callback=retry_callback,
+            back_callback=back_callback,
+        )
+    return PAYOUT_SCREEN
+
+
+async def render_payout_screen_target(target, context, screen="overview", period_key=None, notice=None):
+    payout = get_payout_context(context)
+    payout["period"] = period_key or payout.get("period") or get_default_payout_period_key()
+    payout["screen"] = screen
+
+    if screen == "months":
+        sources = await run_blocking(build_payout_sources)
+        await render_text_screen(
+            target,
+            context,
+            build_payout_month_menu_text(),
+            reply_markup=build_payout_month_menu_markup(recent_completed_period_keys(6), sources),
+            parse_mode="HTML",
+        )
+        return PAYOUT_SCREEN
+
+    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    effective_screen, text, markup = build_payout_screen_payload(context, target, settlement, screen, notice=notice)
+    payout["screen"] = effective_screen
+    await render_text_screen(target, context, text, reply_markup=markup, parse_mode="HTML")
+    return PAYOUT_SCREEN
+
+
+async def get_payout_service_entry(period_key, row_num, mode="service"):
+    services = await run_blocking(get_all_services_with_rows)
+    entry = next((item for item in services if int(item.get("__row", 0)) == row_num), None)
+    if not entry or not is_date_in_period_key(entry.get("Дата", ""), period_key):
+        return None
+    if mode == "purchase":
+        if str(entry.get("Кто", "")).strip() != PAYOUT_WORKER:
+            return None
+        has_purchase = parse_numeric_value(entry.get("Сумма закупок", "")) or str(entry.get("Закупки", "")).strip()
+        return entry if has_purchase else None
+    return entry if PAYOUT_WORKER in get_service_salary_workers(entry) else None
+
+
+async def begin_payout_service_edit(query, context, row_num, screen):
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    entry = await get_payout_service_entry(
+        period_key,
+        row_num,
+        mode="purchase" if str(screen).startswith("purchases") else "service",
+    )
+    if not entry:
+        return await show_payout_screen(query, context, screen=screen, notice="❌ Запись не найдена.")
+    context.user_data["delete"] = {
+        "entry": entry,
+        **build_payout_return_context(period_key, screen=screen),
+    }
+    return await begin_service_edit_from_entry(query, context)
+
+
+async def confirm_payout_service_delete(query, context, row_num, screen):
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    entry = await get_payout_service_entry(
+        period_key,
+        row_num,
+        mode="purchase" if str(screen).startswith("purchases") else "service",
+    )
+    if not entry:
+        return await show_payout_screen(query, context, screen=screen, notice="❌ Запись не найдена.")
+    title = "🗑 Удалить запись обслуживания?"
+    if str(screen).startswith("purchases"):
+        title = "🗑 Удалить всю запись обслуживания вместе с закупками?"
+    await show_text_screen(
+        query,
+        context,
+        f"{title}\n\n{build_service_entry_text(entry)}",
+        reply_markup=build_payout_delete_markup(f"payout_service_del_yes:{row_num}:{screen}", screen),
+    )
+    return PAYOUT_SCREEN
+
+
+async def delete_payout_service(query, context, row_num, screen):
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    entry = await get_payout_service_entry(
+        period_key,
+        row_num,
+        mode="purchase" if str(screen).startswith("purchases") else "service",
+    )
+    if not entry:
+        return await show_payout_screen(query, context, screen=screen, notice="❌ Запись не найдена.")
+    photos = await run_blocking(get_all_photos_with_rows)
+    photo_entry = find_matching_photo_row(entry, photos)
+    await run_blocking(delete_service_entry, entry["__row"], photo_entry["__row"] if photo_entry else None)
+    try:
+        await refresh_group_service_today_posts(context.application, force=True)
+    except Exception:
+        logger.exception("Failed to refresh group service-today post after payout service delete")
+    return await show_payout_screen(query, context, screen=screen, notice="✅ Запись удалена.")
+
+
+async def get_payout_travel_entry(period_key, row_num):
+    travels = await run_blocking(get_all_travels_with_rows)
+    entry = next((item for item in travels if int(item.get("__row", 0)) == row_num), None)
+    if not entry:
+        return None
+    if str(entry.get("Кто", "")).strip() != PAYOUT_WORKER:
+        return None
+    if not is_date_in_period_key(entry.get("Дата", ""), period_key):
+        return None
+    return entry
+
+
+async def get_payout_salary_task_entry(period_key, row_num):
+    tasks = await run_blocking(get_all_salary_tasks_with_rows)
+    entry = next((item for item in tasks if int(item.get("__row", 0)) == row_num), None)
+    if not entry:
+        return None
+    if str(entry.get("Кто", "")).strip() != PAYOUT_WORKER:
+        return None
+    if not is_date_in_period_key(entry.get("Дата", ""), period_key):
+        return None
+    return entry
+
+
+async def show_payout_travel_edit_card(query, context, row_num, notice=None):
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    entry = await get_payout_travel_entry(period_key, row_num)
+    if not entry:
+        return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
+    payout["editing_travel_row"] = row_num
+    text_lines = ["<b>🚌 Редактирование проезда</b>"]
+    if notice:
+        text_lines.extend([escape_html(notice), ""])
+    text_lines.extend(
+        [
+            f"📅 {escape_html(entry.get('Дата', ''))}",
+            f"💰 {format_money_spaced(entry.get('Сумма', 0))}",
+            "",
+            "Что изменить?",
+        ]
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💰 Изменить сумму", callback_data=f"payout_travel_edit_amount:{row_num}")],
+            [InlineKeyboardButton("📅 Изменить дату", callback_data=f"payout_travel_edit_date:{row_num}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"payout_travel_del:{row_num}")],
+            [InlineKeyboardButton("⬅️ К проезду", callback_data="payout_screen:travels_entries")],
+        ]
+    )
+    await show_text_screen(query, context, "\n".join(text_lines), reply_markup=keyboard, parse_mode="HTML")
+    return PAYOUT_SCREEN
+
+
+async def show_payout_salary_task_edit_card(query, context, row_num, notice=None):
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    entry = await get_payout_salary_task_entry(period_key, row_num)
+    if not entry:
+        return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
+    payout["editing_task_row"] = row_num
+    description = str(entry.get("Описание", "")).strip() or "Без описания"
+    text_lines = ["<b>🧰 Редактирование допзадачи</b>"]
+    if notice:
+        text_lines.extend([escape_html(notice), ""])
+    text_lines.extend(
+        [
+            f"📅 {escape_html(entry.get('Дата', ''))}",
+            f"📝 {escape_html(description)}",
+            f"💰 {format_money_spaced(entry.get('Сумма', 0))}",
+            "",
+            "Что изменить?",
+        ]
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📝 Изменить описание", callback_data=f"payout_task_edit_description:{row_num}")],
+            [InlineKeyboardButton("💰 Изменить сумму", callback_data=f"payout_task_edit_amount:{row_num}")],
+            [InlineKeyboardButton("📅 Изменить дату", callback_data=f"payout_task_edit_date:{row_num}")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data=f"payout_task_del:{row_num}")],
+            [InlineKeyboardButton("⬅️ К допзадачам", callback_data="payout_screen:tasks_entries")],
+        ]
+    )
+    await show_text_screen(query, context, "\n".join(text_lines), reply_markup=keyboard, parse_mode="HTML")
+    return PAYOUT_SCREEN
+
+
+async def start_payout_service_add_flow(query, context):
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    return_screen = payout.get("screen", "services")
+    if get_payout_screen_section(return_screen) != "services":
+        return_screen = "services"
+    context.user_data["svc"] = {
+        "who": PAYOUT_WORKER,
+        "locked_who": True,
+        "allowed_period": period_key,
+        **build_payout_return_context(period_key, screen=return_screen),
+    }
+    return await show_service_date_menu(query, context)
+
+
+async def start_payout_travel_add_flow(query, context):
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    return_screen = payout.get("screen", "travels")
+    if get_payout_screen_section(return_screen) != "travels":
+        return_screen = "travels"
+    context.user_data["travel_mode"] = "add"
+    context.user_data["travel_who"] = PAYOUT_WORKER
+    context.user_data.pop("travel_date", None)
+    context.user_data["travel_allowed_period"] = period_key
+    context.user_data["travel_return_mode"] = "payout"
+    context.user_data["travel_return_period"] = period_key
+    context.user_data["travel_return_screen"] = return_screen
+    return await show_travel_date_menu(query, context)
+
+
+async def start_payout_salary_task_add_flow(query, context):
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    return_screen = payout.get("screen", "tasks")
+    if get_payout_screen_section(return_screen) != "tasks":
+        return_screen = "tasks"
+    return await start_salary_task_flow(
+        query,
+        context,
+        preset_worker=PAYOUT_WORKER,
+        return_context=build_payout_return_context(period_key, screen=return_screen),
+    )
+
+
+async def payout_handler(update: Update, context):
+    query = update.callback_query
+    if not is_payout_viewer(update):
+        await deny_callback_access(query)
+        return REPORT_MENU_SECTION
+    await query.answer()
+    data = query.data
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+
+    if data == "back_main":
+        clear_payout_context(context)
+        return await start(update, context)
+    if data == "back_reports_menu":
+        clear_payout_context(context)
+        return await show_reports_section_menu(query, context)
+    if data == "payout_open":
+        return await show_payout_overview_screen(query, context)
+    if data.startswith("payout_month:"):
+        return await show_payout_overview_screen(query, context, period_key=data.split(":", 1)[1])
+    if data.startswith("payout_screen:"):
+        return await show_payout_screen(query, context, screen=data.split(":", 1)[1])
+    if data.startswith("payout_date:"):
+        _, section, date_str = data.split(":", 2)
+        payout[f"{section}_date"] = date_str
+        if section in {"services", "purchases"}:
+            payout.pop(f"{section}_point", None)
+            return await show_payout_screen(query, context, screen=f"{section}_points")
+        return await show_payout_screen(query, context, screen=f"{section}_entries")
+    if data.startswith("payout_point:"):
+        _, section, date_str, token = data.split(":", 3)
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        point_groups = build_payout_point_groups(settlement, section, date_str)
+        point = next(
+            (
+                bucket["point"]
+                for bucket in point_groups
+                if build_payout_point_token(section, date_str, bucket["point"]) == token
+            ),
+            None,
+        )
+        payout[f"{section}_date"] = date_str
+        if not point:
+            return await show_payout_screen(query, context, screen=f"{section}_points", notice="❌ Точка не найдена.")
+        payout[f"{section}_point"] = point
+        return await show_payout_screen(query, context, screen=f"{section}_entries")
+
+    if data == "payout_correction":
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        if not get_payout_screen_access(query, settlement):
+            await query.answer("Только Матвей", show_alert=True)
+            return PAYOUT_SCREEN
+        payout["screen"] = "overview"
+        text = (
+            f"<b>✏️ Корректировка — {escape_html(settlement['period_label'])}</b>\n\n"
+            f"Текущая: {format_money_spaced(settlement['correction'])}\n\n"
+            "Введите сумму, например <code>-500</code> или <code>300</code>."
+        )
+        await show_text_screen(
+            query,
+            context,
+            text,
+            reply_markup=back_markup("payout_screen:overview"),
+            parse_mode="HTML",
+        )
+        return PAYOUT_CORRECTION_AMOUNT
+
+    if data == "payout_mark_paid":
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        if not get_payout_screen_access(query, settlement):
+            await query.answer("Только Матвей", show_alert=True)
+            return PAYOUT_SCREEN
+        await show_text_screen(
+            query,
+            context,
+            (
+                "<b>✅ Подтвердить перевод?</b>\n\n"
+                f"📅 {escape_html(settlement['period_label'])}\n"
+                f"💰 {format_money_spaced(settlement['total'])}"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("✅ Подтвердить", callback_data="payout_mark_paid_yes")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="payout_screen:overview")],
+                ]
+            ),
+            parse_mode="HTML",
+        )
+        return PAYOUT_SCREEN
+
+    if data == "payout_mark_paid_yes":
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        if not get_payout_screen_access(query, settlement):
+            await query.answer("Только Матвей", show_alert=True)
+            return PAYOUT_SCREEN
+        await run_blocking(mark_payout_paid, period_key, PAYOUT_WORKER, get_actor_label(update), settlement)
+        return await show_payout_overview_screen(query, context, period_key=period_key, notice="✅ Месяц закрыт.")
+
+    if data == "payout_unmark_paid":
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        user_id = getattr(getattr(query, "from_user", None), "id", None)
+        if user_id not in PAYOUT_EDITORS:
+            await query.answer("Только Матвей", show_alert=True)
+            return PAYOUT_SCREEN
+        await show_text_screen(
+            query,
+            context,
+            "<b>↩️ Снять отметку о переводе?</b>\n\nМесяц снова станет редактируемым.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("↩️ Снять отметку", callback_data="payout_unmark_paid_yes")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="payout_screen:overview")],
+                ]
+            ),
+            parse_mode="HTML",
+        )
+        return PAYOUT_SCREEN
+
+    if data == "payout_unmark_paid_yes":
+        user_id = getattr(getattr(query, "from_user", None), "id", None)
+        if user_id not in PAYOUT_EDITORS:
+            await query.answer("Только Матвей", show_alert=True)
+            return PAYOUT_SCREEN
+        await run_blocking(unmark_payout_paid, period_key, PAYOUT_WORKER)
+        return await show_payout_overview_screen(query, context, period_key=period_key, notice="↩️ Отметка снята.")
+
+    if data == "payout_service_add":
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        if not get_payout_screen_access(query, settlement):
+            await query.answer("Месяц закрыт для редактирования.", show_alert=True)
+            return PAYOUT_SCREEN
+        return await start_payout_service_add_flow(query, context)
+
+    if data == "payout_travel_add":
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        if not get_payout_screen_access(query, settlement):
+            await query.answer("Месяц закрыт для редактирования.", show_alert=True)
+            return PAYOUT_SCREEN
+        return await start_payout_travel_add_flow(query, context)
+
+    if data == "payout_task_add":
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        if not get_payout_screen_access(query, settlement):
+            await query.answer("Месяц закрыт для редактирования.", show_alert=True)
+            return PAYOUT_SCREEN
+        return await start_payout_salary_task_add_flow(query, context)
+
+    if data.startswith(
+        (
+            "payout_service_edit:",
+            "payout_purchase_edit:",
+            "payout_service_del:",
+            "payout_purchase_del:",
+            "payout_service_del_yes:",
+            "payout_travel_edit:",
+            "payout_travel_edit_amount:",
+            "payout_travel_edit_date:",
+            "payout_travel_del:",
+            "payout_travel_del_yes:",
+            "payout_task_edit:",
+            "payout_task_edit_description:",
+            "payout_task_edit_amount:",
+            "payout_task_edit_date:",
+            "payout_task_del:",
+            "payout_task_del_yes:",
+        )
+    ):
+        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        if not get_payout_screen_access(query, settlement):
+            await query.answer("Месяц закрыт для редактирования.", show_alert=True)
+            return PAYOUT_SCREEN
+
+    if data.startswith("payout_service_edit:"):
+        screen = payout.get("screen", "services_entries")
+        if get_payout_screen_section(screen) != "services":
+            screen = "services_entries"
+        return await begin_payout_service_edit(query, context, int(data.split(":")[1]), screen)
+    if data.startswith("payout_purchase_edit:"):
+        screen = payout.get("screen", "purchases_entries")
+        if get_payout_screen_section(screen) != "purchases":
+            screen = "purchases_entries"
+        return await begin_payout_service_edit(query, context, int(data.split(":")[1]), screen)
+    if data.startswith("payout_service_del:"):
+        screen = payout.get("screen", "services_entries")
+        if get_payout_screen_section(screen) != "services":
+            screen = "services_entries"
+        return await confirm_payout_service_delete(query, context, int(data.split(":")[1]), screen)
+    if data.startswith("payout_purchase_del:"):
+        screen = payout.get("screen", "purchases_entries")
+        if get_payout_screen_section(screen) != "purchases":
+            screen = "purchases_entries"
+        return await confirm_payout_service_delete(query, context, int(data.split(":")[1]), screen)
+    if data.startswith("payout_service_del_yes:"):
+        _, row_str, screen = data.split(":", 2)
+        return await delete_payout_service(query, context, int(row_str), screen)
+
+    if data.startswith("payout_travel_edit:"):
+        return await show_payout_travel_edit_card(query, context, int(data.split(":")[1]))
+    if data.startswith("payout_travel_edit_amount:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_travel_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
+        payout["editing_travel_row"] = row_num
+        await show_text_screen(
+            query,
+            context,
+            (
+                "<b>💰 Изменить сумму проезда</b>\n\n"
+                f"📅 {escape_html(entry.get('Дата', ''))}\n"
+                f"Текущая сумма: {format_money_spaced(entry.get('Сумма', 0))}\n\n"
+                "Введите новую сумму числом, например <code>96</code>."
+            ),
+            reply_markup=back_markup(f"payout_travel_edit:{row_num}"),
+            parse_mode="HTML",
+        )
+        return PAYOUT_TRAVEL_EDIT_AMOUNT
+    if data.startswith("payout_travel_edit_date:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_travel_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
+        payout["editing_travel_row"] = row_num
+        await show_text_screen(
+            query,
+            context,
+            (
+                "<b>📅 Изменить дату проезда</b>\n\n"
+                f"Текущая дата: {escape_html(entry.get('Дата', ''))}\n"
+                f"Месяц: {escape_html(format_period_label(period_key))}\n\n"
+                "Введите новую дату в формате <code>дд.мм</code> или <code>дд.мм.гггг</code>."
+            ),
+            reply_markup=back_markup(f"payout_travel_edit:{row_num}"),
+            parse_mode="HTML",
+        )
+        return PAYOUT_TRAVEL_EDIT_DATE
+    if data.startswith("payout_travel_del:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_travel_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
+        await show_text_screen(
+            query,
+            context,
+            (
+                "<b>🗑 Удалить запись проезда?</b>\n\n"
+                f"📅 {escape_html(entry.get('Дата', ''))}\n"
+                f"💰 {format_money_spaced(entry.get('Сумма', 0))}"
+            ),
+            reply_markup=build_payout_delete_markup(f"payout_travel_del_yes:{row_num}", "travels_entries"),
+            parse_mode="HTML",
+        )
+        return PAYOUT_SCREEN
+    if data.startswith("payout_travel_del_yes:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_travel_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
+        await run_blocking(delete_travel_row, row_num)
+        return await show_payout_screen(query, context, screen="travels_entries", notice="✅ Запись проезда удалена.")
+
+    if data.startswith("payout_task_edit:"):
+        return await show_payout_salary_task_edit_card(query, context, int(data.split(":")[1]))
+    if data.startswith("payout_task_edit_description:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_salary_task_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
+        payout["editing_task_row"] = row_num
+        await show_text_screen(
+            query,
+            context,
+            (
+                "<b>📝 Изменить описание допзадачи</b>\n\n"
+                f"Текущее описание: {escape_html(str(entry.get('Описание', '')).strip() or 'Без описания')}\n\n"
+                "Отправьте новое описание."
+            ),
+            reply_markup=back_markup(f"payout_task_edit:{row_num}"),
+            parse_mode="HTML",
+        )
+        return PAYOUT_TASK_EDIT_DESCRIPTION
+    if data.startswith("payout_task_edit_amount:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_salary_task_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
+        payout["editing_task_row"] = row_num
+        await show_text_screen(
+            query,
+            context,
+            (
+                "<b>💰 Изменить сумму допзадачи</b>\n\n"
+                f"Текущая сумма: {format_money_spaced(entry.get('Сумма', 0))}\n\n"
+                "Введите новую сумму числом, например <code>500</code>."
+            ),
+            reply_markup=back_markup(f"payout_task_edit:{row_num}"),
+            parse_mode="HTML",
+        )
+        return PAYOUT_TASK_EDIT_AMOUNT
+    if data.startswith("payout_task_edit_date:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_salary_task_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
+        payout["editing_task_row"] = row_num
+        await show_text_screen(
+            query,
+            context,
+            (
+                "<b>📅 Изменить дату допзадачи</b>\n\n"
+                f"Текущая дата: {escape_html(entry.get('Дата', ''))}\n"
+                f"Месяц: {escape_html(format_period_label(period_key))}\n\n"
+                "Введите новую дату в формате <code>дд.мм</code> или <code>дд.мм.гггг</code>."
+            ),
+            reply_markup=back_markup(f"payout_task_edit:{row_num}"),
+            parse_mode="HTML",
+        )
+        return PAYOUT_TASK_EDIT_DATE
+    if data.startswith("payout_task_del:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_salary_task_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
+        description = str(entry.get("Описание", "")).strip() or "Без описания"
+        await show_text_screen(
+            query,
+            context,
+            (
+                "<b>🗑 Удалить допзадачу?</b>\n\n"
+                f"📅 {escape_html(entry.get('Дата', ''))}\n"
+                f"📝 {escape_html(description)}\n"
+                f"💰 {format_money_spaced(entry.get('Сумма', 0))}"
+            ),
+            reply_markup=build_payout_delete_markup(f"payout_task_del_yes:{row_num}", "tasks_entries"),
+            parse_mode="HTML",
+        )
+        return PAYOUT_SCREEN
+    if data.startswith("payout_task_del_yes:"):
+        row_num = int(data.split(":")[1])
+        entry = await get_payout_salary_task_entry(period_key, row_num)
+        if not entry:
+            return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
+        await run_blocking(delete_salary_task_row, row_num)
+        return await show_payout_screen(query, context, screen="tasks_entries", notice="✅ Допзадача удалена.")
+
+    return PAYOUT_SCREEN
+
+
+async def payout_correction_amount_back_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "payout_screen:overview":
+        get_payout_context(context).pop("correction_draft", None)
+        return await show_payout_overview_screen(query, context)
+    return PAYOUT_CORRECTION_AMOUNT
+
+
+async def payout_correction_amount_handler(update: Update, context):
+    if not is_payout_editor(update):
+        await update.message.reply_text("⛔ Только Матвей может менять итог.")
+        return PAYOUT_CORRECTION_AMOUNT
+    raw_value = update.message.text.strip()
+    normalized = raw_value.replace(" ", "")
+    amount = parse_numeric_value(normalized)
+    if amount is None:
+        await update.message.reply_text(
+            "❌ Введите сумму числом, например -500 или 300.",
+            reply_markup=back_markup("payout_screen:overview"),
+        )
+        return PAYOUT_CORRECTION_AMOUNT
+
+    payout = get_payout_context(context)
+    payout["correction_draft"] = amount
+    await update.message.reply_text(
+        "📝 Комментарий к корректировке.\n\nМожно оставить пустым или нажать «Пропустить».",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Пропустить", callback_data="payout_correction_skip")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="payout_screen:overview")],
+            ]
+        ),
+    )
+    return PAYOUT_CORRECTION_NOTE
+
+
+async def payout_correction_note_back_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    payout = get_payout_context(context)
+    if query.data == "payout_screen:overview":
+        payout.pop("correction_draft", None)
+        return await show_payout_overview_screen(query, context)
+    if query.data != "payout_correction_skip":
+        return PAYOUT_CORRECTION_NOTE
+
+    period_key = payout.get("period") or get_default_payout_period_key()
+    amount = payout.pop("correction_draft", 0)
+    await run_blocking(
+        upsert_payout,
+        period_key,
+        PAYOUT_WORKER,
+        {
+            "correction": amount,
+            "correction_note": "",
+        },
+    )
+    return await show_payout_overview_screen(query, context, period_key=period_key, notice="✅ Корректировка сохранена.")
+
+
+async def payout_correction_note_handler(update: Update, context):
+    if not is_payout_editor(update):
+        await update.message.reply_text("⛔ Только Матвей может менять итог.")
+        return PAYOUT_CORRECTION_NOTE
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    amount = payout.pop("correction_draft", 0)
+    note = update.message.text.strip()
+    await run_blocking(
+        upsert_payout,
+        period_key,
+        PAYOUT_WORKER,
+        {
+            "correction": amount,
+            "correction_note": note,
+        },
+    )
+    return await render_payout_screen_target(
+        update.message,
+        context,
+        screen="overview",
+        period_key=period_key,
+        notice="✅ Корректировка сохранена.",
+    )
+
+
+async def payout_travel_edit_amount_back_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data.startswith("tr_edit_entry:"):
+        return await show_travel_edit_card(query, context, int(query.data.split(":")[1]))
+    if query.data.startswith("payout_travel_edit:"):
+        return await show_payout_travel_edit_card(query, context, int(query.data.split(":")[1]))
+    return PAYOUT_TRAVEL_EDIT_AMOUNT
+
+
+async def payout_travel_edit_amount_handler(update: Update, context):
+    travel_edit = context.user_data.get("travel_edit", {})
+    if travel_edit.get("mode") == "general":
+        if not is_payout_editor(update):
+            await update.message.reply_text("⛔ Только Матвей может менять проезд.")
+            return PAYOUT_TRAVEL_EDIT_AMOUNT
+        try:
+            amount = int(update.message.text.strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            row_num = travel_edit.get("row_num")
+            await update.message.reply_text(
+                "❌ Введите сумму целым числом, например 96.",
+                reply_markup=back_markup(f"tr_edit_entry:{row_num}"),
+            )
+            return PAYOUT_TRAVEL_EDIT_AMOUNT
+
+        row_num = travel_edit.get("row_num")
+        entry = await get_travel_entry_by_row(row_num)
+        if not entry or str(entry.get("Кто", "")).strip() != str(context.user_data.get("travel_who", "")).strip():
+            return await render_travel_edit_entries_screen(
+                update.message,
+                context,
+                notice="❌ Запись проезда не найдена.",
+            )
+        await run_blocking(update_travel_row, row_num, entry.get("Дата", ""), entry.get("Кто", ""), amount)
+        context.user_data.pop("travel_edit", None)
+        return await render_travel_edit_entries_screen(
+            update.message,
+            context,
+            notice="✅ Проезд обновлён.",
+        )
+
+    if not is_payout_editor(update):
+        await update.message.reply_text("⛔ Только Матвей может менять проезд.")
+        return PAYOUT_TRAVEL_EDIT_AMOUNT
+    try:
+        amount = int(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        row_num = get_payout_context(context).get("editing_travel_row")
+        await update.message.reply_text(
+            "❌ Введите сумму целым числом, например 96.",
+            reply_markup=back_markup(f"payout_travel_edit:{row_num}"),
+        )
+        return PAYOUT_TRAVEL_EDIT_AMOUNT
+
+    payout = get_payout_context(context)
+    row_num = payout.get("editing_travel_row")
+    period_key = payout.get("period") or get_default_payout_period_key()
+    return_screen = payout.get("screen", "travels_entries")
+    entry = await get_payout_travel_entry(period_key, row_num)
+    if not entry:
+        return await render_payout_screen_target(
+            update.message,
+            context,
+            screen=return_screen,
+            period_key=period_key,
+            notice="❌ Запись проезда не найдена.",
+        )
+    await run_blocking(update_travel_row, row_num, entry.get("Дата", ""), entry.get("Кто", ""), amount)
+    return await render_payout_screen_target(
+        update.message,
+        context,
+        screen=return_screen,
+        period_key=period_key,
+        notice="✅ Проезд обновлён.",
+    )
+
+
+async def payout_travel_edit_date_back_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data.startswith("tr_edit_entry:"):
+        return await show_travel_edit_card(query, context, int(query.data.split(":")[1]))
+    if query.data.startswith("payout_travel_edit:"):
+        return await show_payout_travel_edit_card(query, context, int(query.data.split(":")[1]))
+    return PAYOUT_TRAVEL_EDIT_DATE
+
+
+async def payout_travel_edit_date_handler(update: Update, context):
+    travel_edit = context.user_data.get("travel_edit", {})
+    if travel_edit.get("mode") == "general":
+        if not is_payout_editor(update):
+            await update.message.reply_text("⛔ Только Матвей может менять проезд.")
+            return PAYOUT_TRAVEL_EDIT_DATE
+        parsed, error = validate_manual_date_input(update.message.text)
+        row_num = travel_edit.get("row_num")
+        if error:
+            await update.message.reply_text(error, reply_markup=back_markup(f"tr_edit_entry:{row_num}"))
+            return PAYOUT_TRAVEL_EDIT_DATE
+
+        date_str = format_date(parsed)
+        period_error = get_period_restriction_error(date_str, context.user_data.get("travel_allowed_period"))
+        if period_error:
+            await update.message.reply_text(period_error, reply_markup=back_markup(f"tr_edit_entry:{row_num}"))
+            return PAYOUT_TRAVEL_EDIT_DATE
+
+        entry = await get_travel_entry_by_row(row_num)
+        if not entry or str(entry.get("Кто", "")).strip() != str(context.user_data.get("travel_who", "")).strip():
+            return await render_travel_edit_entries_screen(
+                update.message,
+                context,
+                notice="❌ Запись проезда не найдена.",
+            )
+        await run_blocking(update_travel_row, row_num, date_str, entry.get("Кто", ""), entry.get("Сумма", ""))
+        context.user_data["travel_date"] = date_str
+        context.user_data.pop("travel_edit", None)
+        return await render_travel_edit_entries_screen(
+            update.message,
+            context,
+            notice="✅ Дата проезда обновлена.",
+        )
+
+    if not is_payout_editor(update):
+        await update.message.reply_text("⛔ Только Матвей может менять проезд.")
+        return PAYOUT_TRAVEL_EDIT_DATE
+    parsed, error = validate_manual_date_input(update.message.text)
+    row_num = get_payout_context(context).get("editing_travel_row")
+    if error:
+        await update.message.reply_text(error, reply_markup=back_markup(f"payout_travel_edit:{row_num}"))
+        return PAYOUT_TRAVEL_EDIT_DATE
+
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    return_screen = payout.get("screen", "travels_entries")
+    date_str = format_date(parsed)
+    period_error = get_period_restriction_error(date_str, period_key)
+    if period_error:
+        await update.message.reply_text(period_error, reply_markup=back_markup(f"payout_travel_edit:{row_num}"))
+        return PAYOUT_TRAVEL_EDIT_DATE
+
+    entry = await get_payout_travel_entry(period_key, row_num)
+    if not entry:
+        return await render_payout_screen_target(
+            update.message,
+            context,
+            screen=return_screen,
+            period_key=period_key,
+            notice="❌ Запись проезда не найдена.",
+        )
+    await run_blocking(update_travel_row, row_num, date_str, entry.get("Кто", ""), entry.get("Сумма", ""))
+    payout["travels_date"] = date_str
+    return await render_payout_screen_target(
+        update.message,
+        context,
+        screen=return_screen,
+        period_key=period_key,
+        notice="✅ Дата проезда обновлена.",
+    )
+
+
+async def payout_task_edit_description_back_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data.startswith("payout_task_edit:"):
+        return await show_payout_salary_task_edit_card(query, context, int(query.data.split(":")[1]))
+    return PAYOUT_TASK_EDIT_DESCRIPTION
+
+
+async def payout_task_edit_description_handler(update: Update, context):
+    if not is_payout_editor(update):
+        await update.message.reply_text("⛔ Только Матвей может менять допзадачи.")
+        return PAYOUT_TASK_EDIT_DESCRIPTION
+    description = str(update.message.text or "").strip()
+    row_num = get_payout_context(context).get("editing_task_row")
+    if not description:
+        await update.message.reply_text(
+            "❌ Напишите короткое описание задачи.",
+            reply_markup=back_markup(f"payout_task_edit:{row_num}"),
+        )
+        return PAYOUT_TASK_EDIT_DESCRIPTION
+
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    return_screen = payout.get("screen", "tasks_entries")
+    entry = await get_payout_salary_task_entry(period_key, row_num)
+    if not entry:
+        return await render_payout_screen_target(
+            update.message,
+            context,
+            screen=return_screen,
+            period_key=period_key,
+            notice="❌ Допзадача не найдена.",
+        )
+    await run_blocking(
+        update_salary_task_row,
+        row_num,
+        {
+            "date": entry.get("Дата", ""),
+            "who": entry.get("Кто", ""),
+            "description": description,
+            "amount": entry.get("Сумма", ""),
+            "added_by": entry.get("Кто добавил", ""),
+        },
+    )
+    return await render_payout_screen_target(
+        update.message,
+        context,
+        screen=return_screen,
+        period_key=period_key,
+        notice="✅ Описание обновлено.",
+    )
+
+
+async def payout_task_edit_amount_back_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data.startswith("payout_task_edit:"):
+        return await show_payout_salary_task_edit_card(query, context, int(query.data.split(":")[1]))
+    return PAYOUT_TASK_EDIT_AMOUNT
+
+
+async def payout_task_edit_amount_handler(update: Update, context):
+    if not is_payout_editor(update):
+        await update.message.reply_text("⛔ Только Матвей может менять допзадачи.")
+        return PAYOUT_TASK_EDIT_AMOUNT
+    try:
+        amount = normalize_number_text(update.message.text)
+    except ValueError:
+        row_num = get_payout_context(context).get("editing_task_row")
+        await update.message.reply_text(
+            "❌ Введите сумму числом, например 500 или 750,5.",
+            reply_markup=back_markup(f"payout_task_edit:{row_num}"),
+        )
+        return PAYOUT_TASK_EDIT_AMOUNT
+
+    payout = get_payout_context(context)
+    row_num = payout.get("editing_task_row")
+    period_key = payout.get("period") or get_default_payout_period_key()
+    return_screen = payout.get("screen", "tasks_entries")
+    entry = await get_payout_salary_task_entry(period_key, row_num)
+    if not entry:
+        return await render_payout_screen_target(
+            update.message,
+            context,
+            screen=return_screen,
+            period_key=period_key,
+            notice="❌ Допзадача не найдена.",
+        )
+    await run_blocking(
+        update_salary_task_row,
+        row_num,
+        {
+            "date": entry.get("Дата", ""),
+            "who": entry.get("Кто", ""),
+            "description": entry.get("Описание", ""),
+            "amount": amount,
+            "added_by": entry.get("Кто добавил", ""),
+        },
+    )
+    return await render_payout_screen_target(
+        update.message,
+        context,
+        screen=return_screen,
+        period_key=period_key,
+        notice="✅ Сумма обновлена.",
+    )
+
+
+async def payout_task_edit_date_back_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data.startswith("payout_task_edit:"):
+        return await show_payout_salary_task_edit_card(query, context, int(query.data.split(":")[1]))
+    return PAYOUT_TASK_EDIT_DATE
+
+
+async def payout_task_edit_date_handler(update: Update, context):
+    if not is_payout_editor(update):
+        await update.message.reply_text("⛔ Только Матвей может менять допзадачи.")
+        return PAYOUT_TASK_EDIT_DATE
+    parsed, error = validate_manual_date_input(update.message.text)
+    row_num = get_payout_context(context).get("editing_task_row")
+    if error:
+        await update.message.reply_text(error, reply_markup=back_markup(f"payout_task_edit:{row_num}"))
+        return PAYOUT_TASK_EDIT_DATE
+
+    payout = get_payout_context(context)
+    period_key = payout.get("period") or get_default_payout_period_key()
+    return_screen = payout.get("screen", "tasks_entries")
+    date_str = format_date(parsed)
+    period_error = get_period_restriction_error(date_str, period_key)
+    if period_error:
+        await update.message.reply_text(period_error, reply_markup=back_markup(f"payout_task_edit:{row_num}"))
+        return PAYOUT_TASK_EDIT_DATE
+
+    entry = await get_payout_salary_task_entry(period_key, row_num)
+    if not entry:
+        return await render_payout_screen_target(
+            update.message,
+            context,
+            screen=return_screen,
+            period_key=period_key,
+            notice="❌ Допзадача не найдена.",
+        )
+    await run_blocking(
+        update_salary_task_row,
+        row_num,
+        {
+            "date": date_str,
+            "who": entry.get("Кто", ""),
+            "description": entry.get("Описание", ""),
+            "amount": entry.get("Сумма", ""),
+            "added_by": entry.get("Кто добавил", ""),
+        },
+    )
+    payout["tasks_date"] = date_str
+    return await render_payout_screen_target(
+        update.message,
+        context,
+        screen=return_screen,
+        period_key=period_key,
+        notice="✅ Дата обновлена.",
+    )
+
+
 async def show_reports_section_menu(query, context):
+    salary_label = get_default_salary_button_label()
     keyboard = [
         [InlineKeyboardButton("📅 Отчёт за день", callback_data="report_day")],
         [InlineKeyboardButton("📆 Отчёт за период", callback_data="report_period")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+        [InlineKeyboardButton("➕ Задача / доплата", callback_data="report_salary_task")],
     ]
+    user_id = getattr(getattr(query, "from_user", None), "id", None)
+    if user_id in PAYOUT_VIEWERS:
+        keyboard.insert(2, [InlineKeyboardButton(salary_label, callback_data="report_salary_kirill")])
+    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
     await show_text_screen(query, context, "📊 Отчёты\n\nВыберите отчёт:", reply_markup=InlineKeyboardMarkup(keyboard))
     return REPORT_MENU_SECTION
 
@@ -8711,6 +12929,245 @@ async def cmd_reports(update: Update, context):
         await update.message.reply_text("❌ Не удалось получить отчёты. Попробуйте позже.")
 
 
+async def cmd_service_duplicates(update: Update, context):
+    if not is_allowed_user(update):
+        return await deny_private_access(update)
+
+    message = update.effective_message
+    if not message:
+        return
+
+    if not is_private_chat(update):
+        await message.reply_text("⚪ Эту команду лучше запускать в личке бота.")
+        return
+
+    if not is_payout_editor(update):
+        await message.reply_text("⛔ Команда доступна только Матвею.")
+        return
+
+    filters, error = parse_service_duplicates_command_args(getattr(context, "args", []))
+    if error:
+        await message.reply_text(f"{error}\n\n{build_service_duplicates_command_help()}")
+        return
+
+    status_message = await message.reply_text("🔎 Ищу дубли обслуживания...")
+    try:
+        groups = await run_blocking(
+            find_service_duplicate_groups,
+            filters,
+            filters.get("limit", 10),
+        )
+        if not groups:
+            await status_message.edit_text(
+                build_service_duplicate_report_text(
+                    groups,
+                    filters,
+                    limit=filters.get("limit", 10),
+                )
+            )
+            return
+
+        review = create_service_duplicate_review(
+            context.application.bot_data,
+            message.chat_id,
+            getattr(getattr(update, "effective_user", None), "id", None),
+            groups,
+            filters=filters,
+            limit=filters.get("limit", 10),
+        )
+        await status_message.edit_text(
+            build_service_duplicate_review_text(review, mode="overview"),
+            reply_markup=build_service_duplicate_review_overview_markup(
+                review["id"],
+                has_candidates=bool(review.get("candidate_rows")),
+            ),
+        )
+    except Exception:
+        logger.exception("Failed to build service duplicates report")
+        await status_message.edit_text("❌ Не удалось собрать отчёт по дублям. Попробуйте позже.")
+
+
+async def cmd_delete_service_rows(update: Update, context):
+    if not is_allowed_user(update):
+        return await deny_private_access(update)
+
+    message = update.effective_message
+    if not message:
+        return
+
+    if not is_private_chat(update):
+        await message.reply_text("⚪ Эту команду лучше запускать в личке бота.")
+        return
+
+    if not is_payout_editor(update):
+        await message.reply_text("⛔ Команда доступна только Матвею.")
+        return
+
+    row_numbers, confirm, error = parse_delete_service_rows_command_args(getattr(context, "args", []))
+    if error:
+        await message.reply_text(f"{error}\n\n{build_delete_service_rows_command_help()}")
+        return
+
+    status_message = await message.reply_text("🧮 Проверяю строки на удаление...")
+    try:
+        if not confirm:
+            preview_text, _, _ = await run_blocking(build_delete_service_rows_preview, row_numbers)
+            await status_message.edit_text(preview_text)
+            return
+
+        result = await run_blocking(delete_service_rows_by_numbers, row_numbers)
+        try:
+            await refresh_group_service_today_posts(context.application, force=True)
+        except Exception:
+            logger.exception("Failed to refresh group service-today post after service row delete command")
+        await status_message.edit_text(build_delete_service_rows_result_text(result))
+    except Exception:
+        logger.exception("Failed to delete service rows via command")
+        await status_message.edit_text("❌ Не удалось удалить строки. Попробуйте позже.")
+
+
+async def service_duplicate_callback_handler(update: Update, context):
+    query = update.callback_query
+    if not query:
+        return
+
+    if not is_allowed_user(update):
+        await deny_callback_access(query)
+        return
+
+    if not is_private_chat(update):
+        await deny_callback_access(query)
+        return
+
+    if not is_payout_editor(update):
+        await deny_callback_access(query)
+        return
+
+    await query.answer()
+    data = str(query.data or "")
+    if not data.startswith("svcdup:"):
+        return
+
+    parts = data.split(":")
+    if len(parts) < 3:
+        return
+
+    action = parts[1]
+    review_id = parts[2]
+    user_id = getattr(getattr(query, "from_user", None), "id", None)
+    chat_id = getattr(getattr(query, "message", None), "chat_id", None)
+    review = get_service_duplicate_review(context.application.bot_data, review_id, user_id=user_id, chat_id=chat_id)
+
+    if not review:
+        await query.edit_message_text("⚪ Подборка дублей уже недоступна. Запусти /service_duplicates ещё раз.")
+        return
+
+    if action == "cancel":
+        drop_service_duplicate_review(context.application.bot_data, review_id)
+        await query.edit_message_text("❌ Проверка дублей закрыта.")
+        return
+
+    if action == "back":
+        await query.edit_message_text(
+            build_service_duplicate_review_text(review, mode="overview"),
+            reply_markup=build_service_duplicate_review_overview_markup(
+                review_id,
+                has_candidates=bool(review.get("candidate_rows")),
+            ),
+        )
+        return
+
+    if action == "select":
+        await query.edit_message_text(
+            build_service_duplicate_review_text(review, mode="select"),
+            reply_markup=build_service_duplicate_selection_markup(review),
+        )
+        return
+
+    if action == "select_all":
+        if review.get("selected_rows", []) == review.get("candidate_rows", []):
+            await query.answer("Все строки уже выбраны.", show_alert=False)
+            return
+        review["selected_rows"] = list(review.get("candidate_rows", []))
+        await query.edit_message_text(
+            build_service_duplicate_review_text(review, mode="select"),
+            reply_markup=build_service_duplicate_selection_markup(review),
+        )
+        return
+
+    if action == "clear":
+        if not review.get("selected_rows"):
+            await query.answer("Сейчас ничего не выбрано.", show_alert=False)
+            return
+        review["selected_rows"] = []
+        await query.edit_message_text(
+            build_service_duplicate_review_text(review, mode="select"),
+            reply_markup=build_service_duplicate_selection_markup(review),
+        )
+        return
+
+    if action == "toggle":
+        if len(parts) < 4 or not parts[3].isdigit():
+            await query.edit_message_text("⚪ Не удалось определить строку.")
+            return
+        row_num = int(parts[3])
+        if row_num not in review.get("candidate_rows", []):
+            await query.edit_message_text("⚪ Эта строка уже недоступна. Запусти /service_duplicates ещё раз.")
+            return
+        selected = set(int(row) for row in review.get("selected_rows", []))
+        if row_num in selected:
+            selected.remove(row_num)
+        else:
+            selected.add(row_num)
+        review["selected_rows"] = sorted(selected, reverse=True)
+        await query.edit_message_text(
+            build_service_duplicate_review_text(review, mode="select"),
+            reply_markup=build_service_duplicate_selection_markup(review),
+        )
+        return
+
+    if action == "confirm_all":
+        await query.edit_message_text(
+            build_service_duplicate_review_text(review, mode="confirm_all"),
+            reply_markup=build_service_duplicate_confirm_markup(review_id, "delete_all"),
+        )
+        return
+
+    if action == "confirm_selected":
+        if not review.get("selected_rows"):
+            await query.answer("Нет выбранных строк.", show_alert=True)
+            return
+        await query.edit_message_text(
+            build_service_duplicate_review_text(review, mode="confirm_selected"),
+            reply_markup=build_service_duplicate_confirm_markup(review_id, "delete_selected"),
+        )
+        return
+
+    if action not in {"delete_all", "delete_selected"}:
+        return
+
+    row_numbers = (
+        list(review.get("candidate_rows", []))
+        if action == "delete_all"
+        else list(review.get("selected_rows", []))
+    )
+    if not row_numbers:
+        await query.answer("Нет строк для удаления.", show_alert=True)
+        return
+
+    try:
+        result = await run_blocking(delete_service_rows_by_numbers, row_numbers)
+        drop_service_duplicate_review(context.application.bot_data, review_id)
+        try:
+            await refresh_group_service_today_posts(context.application, force=True)
+        except Exception:
+            logger.exception("Failed to refresh group service-today post after duplicate cleanup")
+        await query.edit_message_text(build_delete_service_rows_result_text(result))
+    except Exception:
+        logger.exception("Failed to delete duplicate service rows from review %s", review_id)
+        await query.edit_message_text("❌ Не удалось удалить строки. Попробуй ещё раз позже.")
+
+
 async def main_menu_handler(update: Update, context):
     query = update.callback_query
     if not is_allowed_user(update):
@@ -8749,11 +13206,13 @@ async def main_menu_handler(update: Update, context):
         return await service_today_group_details(update, context, "need_today")
     elif d == "service_today_monitor":
         return await service_today_group_details(update, context, "monitor")
+    elif d == "service_fix":
+        return await show_service_fix_menu(query, context)
     elif d == "delete_service":
         context.user_data["delete"] = {}
         return await show_delete_date_menu(query, context)
     elif d == "travel":
-        return await travel_who(update, context)
+        return await show_travel_menu(query, context)
     elif d == "report_day":
         return await report_day(update, context)
     elif d == "report_period":
@@ -8796,15 +13255,28 @@ async def service_section_handler(update: Update, context):
         return await service_today_group_details(update, context, "need_today")
     if d == "service_today_monitor":
         return await service_today_group_details(update, context, "monitor")
+    if d == "repair":
+        return await show_repair_menu(query, context)
     if d == "info":
         return await info_menu(update, context)
     if d == "service_problem_points":
         return await show_service_problem_points(query, context)
+    if d == "service_fix":
+        return await show_service_fix_menu(query, context)
+    if d == "back_service_fix":
+        return await show_service_fix_menu(query, context)
+    if d == "service_fix_latest":
+        return await edit_last_service(query, context)
+    if d == "service_fix_by_date":
+        context.user_data["delete"] = {}
+        return await show_delete_date_menu(query, context)
+    if d == "edit_last_service":
+        return await edit_last_service(query, context)
     if d == "delete_service":
         context.user_data["delete"] = {}
         return await show_delete_date_menu(query, context)
     if d == "travel":
-        return await travel_who(update, context)
+        return await show_travel_menu(query, context)
     if d == "procurement":
         revision = get_revision_context(context)
         revision.clear()
@@ -8828,7 +13300,200 @@ async def report_section_handler(update: Update, context):
         return await report_day(update, context)
     if d == "report_period":
         return await report_period_menu(update, context)
+    if d in {"report_salary_kirill", "payout_open"}:
+        if not is_payout_viewer(update):
+            await deny_callback_access(query)
+            return REPORT_MENU_SECTION
+        return await show_payout_overview_screen(query, context)
+    if d == "report_salary_task":
+        return await start_salary_task_flow(query, context)
+    if d.startswith("salary_task_add_"):
+        worker = d.replace("salary_task_add_", "", 1)
+        return await start_salary_task_flow(query, context, worker)
     return REPORT_MENU_SECTION
+
+
+async def salary_task_worker_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "back_main":
+        clear_salary_task_context(context)
+        return await start(update, context)
+    if data == "back_reports_menu":
+        clear_salary_task_context(context)
+        return await show_reports_section_menu(query, context)
+    if data.startswith("salary_task_worker_"):
+        try:
+            worker = PAID_WORKERS[int(data.rsplit("_", 1)[1])]
+        except (ValueError, IndexError):
+            return await show_salary_task_worker_menu(query, context)
+        salary_task = get_salary_task_context(context)
+        salary_task["who"] = worker
+        return await show_salary_task_date_menu(query, context)
+    return SALARY_TASK_WORKER
+
+
+async def salary_task_date_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    salary_task = get_salary_task_context(context)
+
+    if data == "back_main":
+        clear_salary_task_context(context)
+        return await start(update, context)
+    if data == "back_salary_task_worker":
+        if salary_task.get("return_mode") == "payout":
+            screen = salary_task.get("return_screen", "overview")
+            period_key = salary_task.get("return_period")
+            clear_salary_task_context(context)
+            return await show_payout_screen(query, context, screen=screen, period_key=period_key)
+        if len(PAID_WORKERS) == 1 and salary_task.get("who") == PAID_WORKERS[0]:
+            clear_salary_task_context(context)
+            return await show_reports_section_menu(query, context)
+        salary_task.pop("date", None)
+        return await show_salary_task_worker_menu(query, context)
+    if data == "salary_task_date_today":
+        salary_task["date"] = today()
+        error = get_period_restriction_error(salary_task["date"], salary_task.get("return_period"))
+        if error and salary_task.get("return_mode") == "payout":
+            return await show_salary_task_date_menu(query, context, notice=error)
+        return await show_salary_task_description_prompt(query, context)
+    if data == "salary_task_date_yesterday":
+        salary_task["date"] = yesterday()
+        error = get_period_restriction_error(salary_task["date"], salary_task.get("return_period"))
+        if error and salary_task.get("return_mode") == "payout":
+            return await show_salary_task_date_menu(query, context, notice=error)
+        return await show_salary_task_description_prompt(query, context)
+    if data == "salary_task_date_daybefore":
+        salary_task["date"] = day_before_yesterday()
+        error = get_period_restriction_error(salary_task["date"], salary_task.get("return_period"))
+        if error and salary_task.get("return_mode") == "payout":
+            return await show_salary_task_date_menu(query, context, notice=error)
+        return await show_salary_task_description_prompt(query, context)
+    if data == "salary_task_date_custom":
+        await show_text_screen(
+            query,
+            context,
+            "🧰 Задача / доплата\n\nВведите дату в формате дд.мм или дд.мм.гггг.",
+            reply_markup=back_markup("back_salary_task_date"),
+        )
+        return SALARY_TASK_DATE_CUSTOM
+    return SALARY_TASK_DATE
+
+
+async def salary_task_date_custom_back_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "back_salary_task_date":
+        return await show_salary_task_date_menu(query, context)
+    return SALARY_TASK_DATE_CUSTOM
+
+
+async def salary_task_date_custom_handler(update: Update, context):
+    parsed, error = validate_manual_date_input(update.message.text)
+    if error:
+        await update.message.reply_text(error, reply_markup=back_markup("back_salary_task_date"))
+        return SALARY_TASK_DATE_CUSTOM
+
+    salary_task = get_salary_task_context(context)
+    salary_task["date"] = format_date(parsed)
+    period_error = get_period_restriction_error(salary_task["date"], salary_task.get("return_period"))
+    if period_error and salary_task.get("return_mode") == "payout":
+        await update.message.reply_text(period_error, reply_markup=back_markup("back_salary_task_date"))
+        return SALARY_TASK_DATE_CUSTOM
+    return await show_salary_task_description_prompt(update.message, context)
+
+
+async def salary_task_description_handler(update: Update, context):
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        if query.data == "back_salary_task_date":
+            return await show_salary_task_date_menu(query, context)
+        return SALARY_TASK_DESCRIPTION
+
+    description = str(update.message.text or "").strip()
+    if not description:
+        await update.message.reply_text(
+            "❌ Напишите короткое описание задачи.",
+            reply_markup=back_markup("back_salary_task_date"),
+        )
+        return SALARY_TASK_DESCRIPTION
+
+    salary_task = get_salary_task_context(context)
+    salary_task["description"] = description
+    return await show_salary_task_amount_prompt(update.message, context)
+
+
+async def salary_task_amount_handler(update: Update, context):
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        if query.data == "back_salary_task_description":
+            return await show_salary_task_description_prompt(query, context)
+        return SALARY_TASK_AMOUNT
+
+    try:
+        amount = normalize_number_text(update.message.text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Введите сумму числом, например 500 или 750,5.",
+            reply_markup=back_markup("back_salary_task_description"),
+        )
+        return SALARY_TASK_AMOUNT
+
+    salary_task = get_salary_task_context(context)
+    salary_task["amount"] = amount
+    return await show_salary_task_confirm_screen(update.message, context)
+
+
+async def salary_task_confirm_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "back_main":
+        clear_salary_task_context(context)
+        return await start(update, context)
+    if query.data == "back_salary_task_amount":
+        return await show_salary_task_amount_prompt(query, context)
+    if query.data != "salary_task_save":
+        return SALARY_TASK_CONFIRM
+
+    salary_task = get_salary_task_context(context)
+    entry = {
+        "date": salary_task.get("date", ""),
+        "who": salary_task.get("who", ""),
+        "description": salary_task.get("description", ""),
+        "amount": salary_task.get("amount", ""),
+        "added_by": get_actor_label(update),
+    }
+    try:
+        await run_blocking(add_salary_task_row, entry)
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            await show_sheets_busy_notice(
+                query,
+                context,
+                retry_callback="salary_task_save",
+                back_callback="back_salary_task_amount",
+            )
+            return SALARY_TASK_CONFIRM
+        raise
+    logger.info(
+        "salary task saved: user_id=%s worker=%s date=%s amount=%s",
+        getattr(update.effective_user, "id", None),
+        entry["who"],
+        entry["date"],
+        entry["amount"],
+    )
+    if salary_task.get("return_mode") == "payout":
+        screen = salary_task.get("return_screen", "overview")
+        period_key = salary_task.get("return_period")
+        get_payout_context(context)["tasks_date"] = entry["date"]
+        clear_salary_task_context(context)
+        return await show_payout_screen(query, context, screen=screen, period_key=period_key, notice="✅ Допзадача добавлена.")
+    return await show_salary_task_saved_screen(query, context, entry)
 
 # ============ ИНФОРМАЦИЯ ============
 async def service_today_notice(update: Update, context):
@@ -9139,10 +13804,9 @@ async def service_who(update: Update, context):
     current_svc = context.user_data.get("svc", {})
     if current_svc.get("edit_mode"):
         context.user_data["svc"] = {
-            "edit_mode": True,
-            "service_row": current_svc.get("service_row"),
-            "photo_row": current_svc.get("photo_row"),
-            "photo": current_svc.get("photo"),
+            key: value
+            for key, value in current_svc.items()
+            if key not in {"pidx", "sidx", "purchase_input_mode", "purchase_custom_flow"}
         }
     else:
         context.user_data["svc"] = {}
@@ -9163,16 +13827,29 @@ async def service_who_handler(update: Update, context):
     if query.data == "back_main":
         return await start(update, context)
     who = query.data.replace("sw_", "")
-    context.user_data["svc"]["who"] = who
-    context.user_data["svc"]["date"] = today()
+    svc = context.user_data["svc"]
+    previous_who = svc.get("who", "")
+    previous_workers = normalize_salary_workers(svc.get("salary_workers", [])) if "salary_workers" in svc else None
+    svc["who"] = who
+    svc["date"] = today()
+    if previous_workers is None or previous_workers == default_service_salary_workers(previous_who):
+        svc["salary_workers"] = default_service_salary_workers(who)
     return await show_service_date_menu(query, context)
 
 
 async def service_date_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
+    svc = context.user_data.get("svc", {})
 
     if query.data == "back_service_who":
+        if svc.get("return_mode") == "payout" and svc.get("locked_who"):
+            return await show_payout_screen(
+                query,
+                context,
+                screen=svc.get("return_screen", "overview"),
+                period_key=svc.get("return_period"),
+            )
         return await service_who(update, context)
 
     if query.data == "svc_date_custom":
@@ -9189,6 +13866,12 @@ async def service_date_handler(update: Update, context):
         context.user_data["svc"]["date"] = today()
     elif query.data == "svc_date_yesterday":
         context.user_data["svc"]["date"] = yesterday()
+    elif query.data == "svc_date_daybefore":
+        context.user_data["svc"]["date"] = day_before_yesterday()
+
+    error = get_period_restriction_error(context.user_data["svc"].get("date"), svc.get("allowed_period"))
+    if error:
+        return await show_service_date_menu(query, context, notice=error)
 
     return await show_service_points(query, context)
 
@@ -9212,6 +13895,14 @@ async def service_date_custom_handler(update: Update, context):
         return SERVICE_DATE_CUSTOM
 
     context.user_data["svc"]["date"] = format_date(parsed)
+    allowed_period = context.user_data.get("svc", {}).get("allowed_period")
+    error = get_period_restriction_error(context.user_data["svc"]["date"], allowed_period)
+    if error:
+        await update.message.reply_text(
+            error,
+            reply_markup=back_markup("back_service_date"),
+        )
+        return SERVICE_DATE_CUSTOM
     who = context.user_data.get("svc", {}).get("who", "")
     repair_points = await run_blocking(get_active_repair_record_map)
     title = f"🔧 {who}\n📅 {context.user_data['svc']['date']}\n\nВыберите точку:"
@@ -9227,6 +13918,8 @@ async def delete_date_handler(update: Update, context):
 
     if query.data == "back_main":
         return await start(update, context)
+    if query.data == "back_service_fix":
+        return await show_service_fix_menu(query, context)
     if query.data == "back_service_menu":
         return await show_service_section_menu(query, context)
 
@@ -9248,6 +13941,8 @@ async def delete_date_handler(update: Update, context):
         context.user_data["delete"]["date"] = today()
     elif query.data == "del_date_yesterday":
         context.user_data["delete"]["date"] = yesterday()
+    elif query.data == "del_date_daybefore":
+        context.user_data["delete"]["date"] = day_before_yesterday()
 
     context.user_data["delete"].pop("mode", None)
     context.user_data["delete"].pop("point", None)
@@ -9283,7 +13978,7 @@ async def delete_date_custom_handler(update: Update, context):
 
     if not entries:
         await update.message.reply_text(
-            f"✏️ Исправление записей\n\nЗа {selected_date} записей обслуживания нет.",
+            f"✏️ Исправить запись\n\nЗа {selected_date} записей обслуживания нет.",
             reply_markup=back_markup("back_delete_date"),
         )
         return DELETE_POINT
@@ -9296,7 +13991,7 @@ async def delete_date_custom_handler(update: Update, context):
         [InlineKeyboardButton("⬅️ Назад", callback_data="back_delete_date")],
     ]
     await update.message.reply_text(
-        f"✏️ Исправление записей\n\n📅 {selected_date}\n"
+        f"✏️ Исправить запись\n\n📅 {selected_date}\n"
         f"Записей: {len(entries)}\n"
         f"Точки: {', '.join(points)}",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -9365,6 +14060,7 @@ async def delete_entry_handler(update: Update, context):
         return DELETE_ENTRY
 
     context.user_data["delete"]["entry"] = entry
+    context.user_data["delete"].pop("salary_workers_draft", None)
     if context.user_data["delete"].get("mode") == "edit":
         return await show_fix_entry_action_menu(query, context)
     return await show_delete_confirm_menu(query, context)
@@ -9373,23 +14069,89 @@ async def delete_entry_handler(update: Update, context):
 async def delete_confirm_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
+    delete_data = context.user_data.setdefault("delete", {})
 
     if query.data == "back_main":
         return await start(update, context)
+    if query.data == "service_fix":
+        return await show_service_fix_menu(query, context)
+    if query.data == "back_service_fix":
+        return await show_service_fix_menu(query, context)
     if query.data == "delete_service":
         context.user_data["delete"] = {}
         return await show_delete_date_menu(query, context)
     if query.data == "back_fix_actions":
         return await show_fix_action_menu(query, context)
+    if query.data == "back_fix_entry_actions":
+        delete_data.pop("salary_workers_draft", None)
+        return await show_fix_entry_action_menu(query, context)
     if query.data == "back_delete_entry":
         return await show_delete_entry_menu(query, context)
     if query.data == "fix_entry_edit":
         return await begin_service_edit_from_entry(query, context)
+    if query.data == "fix_entry_salary":
+        return await show_fix_entry_salary_menu(query, context)
     if query.data == "fix_entry_delete":
         return await show_delete_confirm_menu(query, context)
+    if query.data == "fix_entry_salary_reset":
+        entry = delete_data.get("entry", {})
+        delete_data["salary_workers_draft"] = default_service_salary_workers(entry.get("Кто", ""))
+        return await show_fix_entry_salary_menu(query, context)
+    if query.data == "fix_entry_salary_clear":
+        delete_data["salary_workers_draft"] = []
+        return await show_fix_entry_salary_menu(query, context)
+    if query.data.startswith("fix_entry_salary_toggle_"):
+        try:
+            worker = PAID_WORKERS[int(query.data.rsplit("_", 1)[1])]
+        except (ValueError, IndexError):
+            return await show_fix_entry_salary_menu(query, context)
+        selected = normalize_salary_workers(delete_data.get("salary_workers_draft", []))
+        if worker in selected:
+            selected = [item for item in selected if item != worker]
+        else:
+            selected.append(worker)
+        delete_data["salary_workers_draft"] = normalize_salary_workers(selected)
+        return await show_fix_entry_salary_menu(query, context)
+    if query.data == "fix_entry_salary_save":
+        entry = delete_data.get("entry")
+        if not entry:
+            await show_text_screen(
+                query,
+                context,
+                "❌ Не удалось определить запись.",
+                reply_markup=back_markup("back_delete_entry"),
+            )
+            return DELETE_CONFIRM
+        selected = normalize_salary_workers(delete_data.get("salary_workers_draft", []))
+        payload = build_service_update_data_from_entry(entry, selected)
+        try:
+            await run_blocking(update_service_row, entry["__row"], payload)
+            entry["Сумма обслуж"] = payload["service_sum"]
+            entry["В ЗП"] = serialize_salary_workers(selected)
+            try:
+                await refresh_group_service_today_posts(context.application, force=True)
+            except Exception:
+                logger.exception("Failed to refresh group service-today post after salary workers update")
+            delete_data.pop("salary_workers_draft", None)
+            label = entry["В ЗП"] or "не считать"
+            return await show_fix_entry_action_menu(
+                query,
+                context,
+                notice=f"✅ В ЗП обновлено: {label} · {format_money(payload['service_sum'])}",
+            )
+        except APIError as error:
+            if is_google_sheets_busy_error(error):
+                await show_sheets_busy_notice(
+                    query,
+                    context,
+                    retry_callback="fix_entry_salary_save",
+                    back_callback="fix_entry_salary",
+                )
+                return DELETE_CONFIRM
+            raise
 
     if query.data == "del_day_confirm_yes":
-        selected_date = context.user_data.get("delete", {}).get("date")
+        selected_date = delete_data.get("date")
         try:
             deleted_services, deleted_photos = await run_blocking(delete_service_entries_for_date, selected_date)
             try:
@@ -9406,13 +14168,13 @@ async def delete_confirm_handler(update: Update, context):
             text = "❌ Не удалось удалить записи за день."
 
         kb = [
-            [InlineKeyboardButton("✏️ Исправить ещё", callback_data="delete_service")],
+            [InlineKeyboardButton("✏️ Исправить ещё", callback_data="service_fix")],
             [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
         ]
         await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(kb))
         return DELETE_CONFIRM
 
-    entry = context.user_data.get("delete", {}).get("entry")
+    entry = delete_data.get("entry")
     if not entry:
         await show_text_screen(
             query,
@@ -9440,7 +14202,7 @@ async def delete_confirm_handler(update: Update, context):
         text = "❌ Не удалось удалить запись."
 
     kb = [
-        [InlineKeyboardButton("🗑 Удалить ещё", callback_data="delete_service")],
+        [InlineKeyboardButton("✏️ Исправить ещё", callback_data="service_fix")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
     await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(kb))
@@ -9537,6 +14299,7 @@ async def service_purchase_handler(update: Update, context):
         context.user_data["svc"]["plist"] = []
         context.user_data["svc"]["purchases"] = ""
         context.user_data["svc"]["purchase_sum"] = 0
+        context.user_data["svc"]["purchase_parse_failed"] = False
         context.user_data["svc"].pop("pidx", None)
         context.user_data["svc"].pop("purchase_input_mode", None)
         context.user_data["svc"].pop("purchase_custom_flow", None)
@@ -9631,6 +14394,7 @@ def finalize_purchase_summary(svc):
     purchases, total = build_purchase_summary(svc.get("plist", []))
     svc["purchases"] = purchases
     svc["purchase_sum"] = total
+    svc["purchase_parse_failed"] = False
 
 
 def remove_pending_custom_purchase(svc):
@@ -9664,16 +14428,19 @@ async def service_purch_select_handler(update: Update, context):
     d = query.data.replace("sps_", "")
 
     if d == "done":
-        pl = context.user_data["svc"].get("plist", [])
+        svc = context.user_data["svc"]
+        pl = svc.get("plist", [])
         if not pl:
-            context.user_data["svc"]["purchases"] = ""
-            context.user_data["svc"]["purchase_sum"] = 0
+            if svc.get("purchase_parse_failed") and str(svc.get("purchases", "")).strip():
+                return await ask_shortage(query, context)
+            svc["purchases"] = ""
+            svc["purchase_sum"] = 0
             return await ask_shortage(query, context)
         next_idx = get_next_unfilled_purchase_index(pl)
         if next_idx is None:
-            finalize_purchase_summary(context.user_data["svc"])
+            finalize_purchase_summary(svc)
             return await ask_shortage(query, context)
-        context.user_data["svc"]["pidx"] = next_idx
+        svc["pidx"] = next_idx
         return await ask_purch_qty(query, context)
 
     if d == "Другое":
@@ -9916,6 +14683,7 @@ def finalize_shortage_summary(svc):
     shortage, shortage_qty = build_shortage_summary_and_details(svc.get("slist", []))
     svc["shortage"] = shortage
     svc["shortage_qty"] = shortage_qty
+    svc["shortage_parse_failed"] = False
 
 
 async def service_shortage_handler(update: Update, context):
@@ -9927,6 +14695,7 @@ async def service_shortage_handler(update: Update, context):
         context.user_data["svc"]["shortage"] = ""
         context.user_data["svc"]["shortage_qty"] = ""
         context.user_data["svc"]["slist"] = []
+        context.user_data["svc"]["shortage_parse_failed"] = False
         return await show_confirm(query, context)
     if context.user_data["svc"].get("slist"):
         return await show_short_select(query, context)
@@ -9957,12 +14726,17 @@ async def service_short_select_handler(update: Update, context):
         return await ask_shortage(query, context)
     d = query.data.replace("sss_", "")
     if d == "done":
-        sl = context.user_data["svc"].get("slist", [])
+        svc = context.user_data["svc"]
+        sl = svc.get("slist", [])
         if not sl:
-            context.user_data["svc"]["shortage"] = ""
-            context.user_data["svc"]["shortage_qty"] = ""
+            if svc.get("shortage_parse_failed") and (
+                str(svc.get("shortage", "")).strip() or str(svc.get("shortage_qty", "")).strip()
+            ):
+                return await show_confirm(query, context)
+            svc["shortage"] = ""
+            svc["shortage_qty"] = ""
             return await show_confirm(query, context)
-        context.user_data["svc"]["sidx"] = 0
+        svc["sidx"] = 0
         return await ask_short_qty(query, context)
 
     sl = context.user_data["svc"].get("slist", [])
@@ -10106,6 +14880,7 @@ async def service_short_next_visit_handler(update: Update, context):
 # ============ ПОДТВЕРЖДЕНИЕ ============
 async def show_confirm(query, context):
     svc = context.user_data["svc"]
+    svc.pop("duplicate_match_rows", None)
     text = f"{build_service_progress_text(8)}\n\n{build_confirm_text(svc)}"
     kb = [[InlineKeyboardButton("✅ Подтвердить", callback_data="svc_ok"),
            InlineKeyboardButton("⬅️ Назад", callback_data="back_service_confirm")],
@@ -10116,6 +14891,7 @@ async def show_confirm(query, context):
 
 async def show_confirm_msg(message, context):
     svc = context.user_data["svc"]
+    svc.pop("duplicate_match_rows", None)
     text = f"{build_service_progress_text(8)}\n\n{build_confirm_text(svc)}"
     kb = [[InlineKeyboardButton("✅ Подтвердить", callback_data="svc_ok"),
            InlineKeyboardButton("⬅️ Назад", callback_data="back_service_confirm")],
@@ -10133,6 +14909,8 @@ def build_confirm_text(svc):
     purchase_sum = svc.get("purchase_sum", 0)
     shortage = svc.get("shortage", "")
     shortage_qty = svc.get("shortage_qty", "")
+    salary_workers = get_service_salary_workers_from_context(svc)
+    service_total = calculate_service_sum_for_workers(salary_workers)
 
     lines = [
         "✅ Итог обслуживания:",
@@ -10148,12 +14926,16 @@ def build_confirm_text(svc):
 
     append_shortage_block(lines, shortage, shortage_qty)
 
-    if who in PAID_WORKERS:
+    if salary_workers and salary_workers != default_service_salary_workers(who):
         lines.append("")
-        lines.append(f"💰 Обслуживание: {format_money(SERVICE_PRICE)}")
+        lines.append(f"💸 В ЗП: {', '.join(salary_workers)}")
+
+    if service_total:
+        lines.append("")
+        lines.append(f"💰 Обслуживание: {format_money(service_total)}")
         if purchase_sum:
             lines.append(f"💰 Закупки: {format_money(purchase_sum)}")
-        lines.append(f"💰 Итого: {format_money(SERVICE_PRICE + purchase_sum)}")
+        lines.append(f"💰 Итого: {format_money(service_total + purchase_sum)}")
     elif purchase_sum:
         lines.append("")
         lines.append(f"💰 Закупки: {format_money(purchase_sum)}")
@@ -10164,18 +14946,60 @@ async def service_confirm_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
 
+    if query.data == "svc_dup_back":
+        return await show_confirm(query, context)
+
     if query.data == "back_service_confirm":
         return await back_to_shortage_stage(query, context)
 
     if query.data == "svc_cancel":
+        if context.user_data.get("svc", {}).get("return_mode") == "payout":
+            payout = get_payout_context(context)
+            return_screen = context.user_data["svc"].get("return_screen", "overview")
+            section = get_payout_screen_section(return_screen)
+            if section in {"services", "purchases"}:
+                payout[f"{section}_date"] = context.user_data["svc"].get("date")
+                payout[f"{section}_point"] = context.user_data["svc"].get("point")
+            return await show_payout_screen(
+                query,
+                context,
+                screen=return_screen,
+                period_key=context.user_data["svc"].get("return_period"),
+                notice="❌ Добавление отменено.",
+            )
         await query.edit_message_text("❌ Отменено")
         return await start(update, context)
 
     svc = context.user_data["svc"]
-    service_sum = SERVICE_PRICE if svc["who"] in PAID_WORKERS else 0
+    service_sum = calculate_service_sum_for_workers(get_service_salary_workers_from_context(svc))
     payload = build_service_update_data(svc, service_sum)
 
     try:
+        if query.data == "svc_ok":
+            duplicates = await run_blocking(
+                find_service_semantic_duplicates,
+                payload,
+                svc.get("service_row") if svc.get("edit_mode") else None,
+            )
+            if duplicates:
+                svc["duplicate_match_rows"] = [entry.get("__row") for entry in duplicates]
+                await show_text_screen(
+                    query,
+                    context,
+                    build_service_duplicate_warning_text(svc, duplicates),
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton("✅ Всё равно сохранить", callback_data="svc_ok_force")],
+                            [InlineKeyboardButton("✏️ Вернуться", callback_data="svc_dup_back")],
+                            [InlineKeyboardButton("❌ Отмена", callback_data="svc_cancel")],
+                        ]
+                    ),
+                )
+                return SERVICE_CONFIRM
+
+        if query.data not in {"svc_ok", "svc_ok_force"}:
+            return SERVICE_CONFIRM
+
         if svc.get("edit_mode") and svc.get("service_row"):
             await run_blocking(update_service_row, svc["service_row"], payload)
         else:
@@ -10189,28 +15013,434 @@ async def service_confirm_handler(update: Update, context):
             else:
                 await run_blocking(add_photo_row, svc["date"], svc["point"], svc["who"], svc["photo"])
 
+        logger.info(
+            "service saved: user_id=%s point=%s date=%s mode=%s",
+            getattr(update.effective_user, "id", None),
+            svc["point"],
+            svc["date"],
+            "update" if svc.get("edit_mode") else "create",
+        )
         success_text = "✅ Запись обновлена!" if svc.get("edit_mode") else "✅ Записано!"
         try:
             await refresh_group_service_today_posts(context.application, force=True)
         except Exception:
             logger.exception("Failed to refresh group service-today post after service save")
+        if svc.get("return_mode") == "payout":
+            payout = get_payout_context(context)
+            return_screen = svc.get("return_screen", "overview")
+            section = get_payout_screen_section(return_screen)
+            if section in {"services", "purchases"}:
+                payout[f"{section}_date"] = svc["date"]
+                payout[f"{section}_point"] = svc["point"]
+            return await show_payout_screen(
+                query,
+                context,
+                screen=return_screen,
+                period_key=svc.get("return_period"),
+                notice=success_text,
+            )
         await query.edit_message_text(f"{success_text}\n\n📍 {svc['point']} — {svc['who']}")
 
+    except APIError as e:
+        if is_google_sheets_busy_error(e):
+            await show_sheets_busy_notice(
+                query,
+                context,
+                retry_callback="svc_ok",
+                back_callback="back_service_confirm",
+            )
+            return SERVICE_CONFIRM
+        logger.exception("Failed to save service record")
+        await query.edit_message_text("❌ Ошибка записи. Попробуйте позже.")
     except Exception:
         logger.exception("Failed to save service record")
         await query.edit_message_text("❌ Ошибка записи. Попробуйте позже.")
 
+    if svc.get("return_mode") == "payout":
+        payout = get_payout_context(context)
+        return_screen = svc.get("return_screen", "overview")
+        section = get_payout_screen_section(return_screen)
+        if section in {"services", "purchases"}:
+            payout[f"{section}_date"] = svc.get("date")
+            payout[f"{section}_point"] = svc.get("point")
+        return await show_payout_screen(
+            query,
+            context,
+            screen=return_screen,
+            period_key=svc.get("return_period"),
+        )
     return await start(update, context)
 
 
 # ============ ИМПОРТ ИЗ РАБОЧЕЙ ГРУППЫ ============
-async def send_group_report_feedback_message(application, chat_id, source_message_id, text, reply_markup=None):
-    sent = await application.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_to_message_id=source_message_id,
-        reply_markup=reply_markup,
+def build_group_report_saved_markup(save_result):
+    log_row = save_result.get("log_row")
+    current_worker = save_result.get("who", "")
+    revision_meta = save_result.get("revision")
+    service_row = str(save_result.get("service_row", "")).strip()
+    keyboard = []
+    row = []
+    for idx, worker in enumerate(WORKERS):
+        prefix = "✅" if worker == current_worker else "👤"
+        row.append(InlineKeyboardButton(f"{prefix} {worker}", callback_data=f"grp_report_worker_{idx}_{log_row}"))
+        if len(row) == 2 or idx == len(WORKERS) - 1:
+            keyboard.append(row)
+            row = []
+    if service_row:
+        keyboard.append([
+            InlineKeyboardButton("✏️ Редактировать обслуживание", callback_data=f"grp_report_edit_service_{log_row}")
+        ])
+    if revision_meta:
+        keyboard.append([
+            InlineKeyboardButton("📦 Редактировать ревизию", callback_data=f"grp_report_edit_revision_{log_row}")
+        ])
+        keyboard.append([
+            InlineKeyboardButton("📦 Не считать ревизией", callback_data=f"grp_report_remove_revision_{log_row}")
+        ])
+    keyboard.append([InlineKeyboardButton("🗑 Удалить всё", callback_data=f"grp_report_delete_{log_row}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_group_report_save_result_from_record(record):
+    revision = None
+    if str(record.get("Revision_Period", "")).strip() and str(record.get("Revision_Location", "")).strip():
+        revision = {
+            "period": record.get("Revision_Period", ""),
+            "location": record.get("Revision_Location", ""),
+        }
+    return {
+        "log_row": record.get("__row"),
+        "who": record.get("Кто", ""),
+        "service_row": record.get("Service_Row", ""),
+        "revision": revision,
+    }
+
+
+def build_group_report_action_expired_text():
+    return (
+        "⏳ Окно быстрых действий уже истекло.\n\n"
+        "Обслуживание можно поправить через «Исправить записи», "
+        "а ревизию — через раздел «Ревизия»."
     )
+
+
+def build_group_report_delete_result_text(record):
+    service_row = str(record.get("Service_Row", "")).strip()
+    has_revision = any(str(record.get(key, "")).strip() for key in ("Revision_Row", "Revision_Period", "Revision_Location"))
+    point = record.get("Точка", "—")
+    date_value = record.get("Дата", "—")
+    who = record.get("Кто", "—")
+
+    if not service_row and has_revision:
+        return (
+            "🗑 Ревизия убрана из учёта.\n\n"
+            f"📍 {point}\n"
+            f"📅 {date_value}\n"
+            f"👤 {who}"
+        )
+
+    if service_row and has_revision:
+        return (
+            "🗑 Обслуживание и ревизия убраны из базы.\n\n"
+            f"📍 {point}\n"
+            f"📅 {date_value}\n"
+            f"👤 {who}"
+        )
+
+    return (
+        "🗑 Сохранение сообщения отменено.\n\n"
+        f"📍 {point}\n"
+        f"📅 {date_value}\n"
+        f"👤 {who}"
+    )
+
+
+def is_group_report_revision_only_record(record):
+    service_row = str(record.get("Service_Row", "")).strip()
+    has_revision = any(str(record.get(key, "")).strip() for key in ("Revision_Row", "Revision_Period", "Revision_Location"))
+    return not service_row and has_revision
+
+
+def parse_group_report_log_row_from_callback_data(data, action_name):
+    prefix = f"grp_report_{action_name}_"
+    if not str(data or "").startswith(prefix):
+        return None
+    raw_id = str(data).replace(prefix, "", 1).strip()
+    if not raw_id.isdigit():
+        return None
+    return int(raw_id)
+
+
+async def resolve_group_report_quick_action_record(query, context, action_name):
+    log_row_num = parse_group_report_log_row_from_callback_data(query.data, action_name)
+    if not log_row_num:
+        return None, None
+
+    record = await run_blocking(get_group_report_log_entry_by_row, log_row_num)
+    if not record:
+        await query.edit_message_text("⚪ Сообщение уже недоступно.")
+        if query.message:
+            schedule_single_message_cleanup(
+                context.application,
+                query.message.chat_id,
+                query.message.message_id,
+                GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+            )
+        return None, MAIN_MENU
+
+    if record.get("Статус") != "saved":
+        await query.edit_message_text("⚪ Сообщение уже неактуально.")
+        if query.message:
+            schedule_single_message_cleanup(
+                context.application,
+                query.message.chat_id,
+                query.message.message_id,
+                GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+            )
+        return None, MAIN_MENU
+
+    if not is_group_report_action_window_open(record):
+        await query.edit_message_text(build_group_report_action_expired_text())
+        if query.message:
+            schedule_single_message_cleanup(
+                context.application,
+                query.message.chat_id,
+                query.message.message_id,
+                GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+            )
+        return None, MAIN_MENU
+
+    return record, log_row_num
+
+
+async def group_report_edit_service_entry_handler(update: Update, context):
+    query = update.callback_query
+    if not is_allowed_user(update) or not is_allowed_group_report_chat(update):
+        await deny_callback_access(query)
+        return ConversationHandler.END
+
+    await query.answer()
+    cleanup_expired_group_report_drafts(context.application.bot_data)
+
+    record, fallback_state = await resolve_group_report_quick_action_record(query, context, "edit_service")
+    if not record:
+        return fallback_state or MAIN_MENU
+
+    try:
+        entry = await run_blocking(find_group_report_service_entry, record)
+        if not entry:
+            await query.edit_message_text("⚪ Не удалось найти запись обслуживания для редактирования.")
+            if query.message:
+                schedule_single_message_cleanup(
+                    context.application,
+                    query.message.chat_id,
+                    query.message.message_id,
+                    GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                )
+            return MAIN_MENU
+
+        context.user_data["delete"] = {"entry": entry}
+        return await begin_service_edit_from_entry(query, context)
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            await show_sheets_busy_notice(
+                query,
+                context,
+                retry_callback=str(query.data),
+            )
+            return MAIN_MENU
+        logger.exception("Failed to open group report service edit for log row %s", log_row_num)
+        await query.edit_message_text("❌ Не удалось открыть редактирование обслуживания.")
+        return MAIN_MENU
+    except Exception:
+        logger.exception("Failed to open group report service edit for log row %s", log_row_num)
+        await query.edit_message_text("❌ Не удалось открыть редактирование обслуживания.")
+        return MAIN_MENU
+
+
+async def group_report_edit_revision_entry_handler(update: Update, context):
+    query = update.callback_query
+    if not is_allowed_user(update) or not is_allowed_group_report_chat(update):
+        await deny_callback_access(query)
+        return ConversationHandler.END
+
+    await query.answer()
+    cleanup_expired_group_report_drafts(context.application.bot_data)
+
+    record, fallback_state = await resolve_group_report_quick_action_record(query, context, "edit_revision")
+    if not record:
+        return fallback_state or MAIN_MENU
+
+    try:
+        revision_entry = await run_blocking(find_group_report_revision_entry, record)
+        if not revision_entry:
+            await query.edit_message_text("⚪ Для этого сообщения ревизия уже не учитывается.")
+            if query.message:
+                schedule_single_message_cleanup(
+                    context.application,
+                    query.message.chat_id,
+                    query.message.message_id,
+                    GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                )
+            return MAIN_MENU
+
+        revision = get_revision_context(context)
+        revision.clear()
+        revision["action"] = "edit"
+        revision["period"] = revision_entry.get("Период", "")
+        revision["location"] = revision_entry.get("Локация", "")
+        revision["existing_record"] = revision_entry
+        if is_group_report_revision_only_record(record):
+            revision["group_report_undo_log_row"] = log_row_num
+        return await show_revision_edit_action_menu(query, context)
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            await show_sheets_busy_notice(
+                query,
+                context,
+                retry_callback=str(query.data),
+            )
+            return MAIN_MENU
+        logger.exception("Failed to open group report revision edit for log row %s", log_row_num)
+        await query.edit_message_text("❌ Не удалось открыть редактирование ревизии.")
+        return MAIN_MENU
+    except Exception:
+        logger.exception("Failed to open group report revision edit for log row %s", log_row_num)
+        await query.edit_message_text("❌ Не удалось открыть редактирование ревизии.")
+        return MAIN_MENU
+
+
+def remove_group_report_revision_by_log_row(log_row_num):
+    record = next((entry for entry in get_group_report_logs_with_rows() if entry["__row"] == log_row_num), None)
+    if not record:
+        return "missing", None
+
+    if record.get("Статус") != "saved":
+        return record.get("Статус") or "missing", record
+
+    has_revision = any(str(record.get(key, "")).strip() for key in ("Revision_Row", "Revision_Period", "Revision_Location"))
+    if not has_revision:
+        return "no_revision", record
+
+    restore_group_report_revision(record)
+    updated = {
+        "chat_id": record.get("Chat_ID", ""),
+        "source_key": record.get("Source_Key", ""),
+        "source_message_id": record.get("Source_Message_ID", ""),
+        "media_group_id": record.get("Media_Group_ID", ""),
+        "who": record.get("Кто", ""),
+        "point": record.get("Точка", ""),
+        "date": record.get("Дата", ""),
+        "fingerprint": record.get("Fingerprint", ""),
+        "service_row": record.get("Service_Row", ""),
+        "photo_rows": record.get("Photo_Rows", ""),
+        "revision_row": "",
+        "revision_period": "",
+        "revision_location": "",
+        "revision_mode": "",
+        "revision_backup": "",
+        "status": "saved",
+        "created_at": record.get("Создано", ""),
+    }
+    update_group_report_log(log_row_num, updated)
+    return "removed", record
+
+
+def reassign_group_report_worker(log_row_num, worker):
+    record = get_group_report_log_entry_by_row(log_row_num)
+    if not record:
+        return "missing", None
+
+    if record.get("Статус") != "saved":
+        return record.get("Статус") or "missing", record
+
+    entry = find_group_report_service_entry(record)
+    revision_entry = find_group_report_revision_entry(record)
+    if not entry and not revision_entry:
+        return "missing_service", record
+
+    if entry:
+        payload = build_service_update_data_from_entry(entry, default_service_salary_workers(worker))
+        payload["who"] = worker
+        payload["service_sum"] = calculate_service_sum_for_workers(payload.get("salary_workers", []))
+        update_service_row(entry["__row"], payload)
+
+        photo_rows = parse_logged_row_numbers(record.get("Photo_Rows", ""))
+        if photo_rows:
+            photos_by_row = {
+                photo["__row"]: photo
+                for photo in get_all_photos_with_rows()
+                if photo.get("__row") in photo_rows
+            }
+            for row_num in photo_rows:
+                photo = photos_by_row.get(row_num)
+                if not photo:
+                    continue
+                update_photo_row(
+                    row_num,
+                    photo.get("Дата", entry.get("Дата", "")),
+                    photo.get("Точка", entry.get("Точка", "")),
+                    worker,
+                    photo.get("File_ID", ""),
+                )
+
+    if revision_entry:
+        revision_payload = {
+            "period": revision_entry.get("Период", ""),
+            "location": revision_entry.get("Локация", ""),
+            "who": worker,
+            "filled_at": revision_entry.get("Дата заполнения", ""),
+            "values": build_revision_values_from_record(revision_entry),
+        }
+        update_revision_row(revision_entry["__row"], revision_payload)
+
+    updated = {
+        "chat_id": record.get("Chat_ID", ""),
+        "source_key": record.get("Source_Key", ""),
+        "source_message_id": record.get("Source_Message_ID", ""),
+        "media_group_id": record.get("Media_Group_ID", ""),
+        "who": worker,
+        "point": record.get("Точка", ""),
+        "date": record.get("Дата", ""),
+        "fingerprint": record.get("Fingerprint", ""),
+        "service_row": record.get("Service_Row", ""),
+        "photo_rows": record.get("Photo_Rows", ""),
+        "revision_row": record.get("Revision_Row", ""),
+        "revision_period": record.get("Revision_Period", ""),
+        "revision_location": record.get("Revision_Location", ""),
+        "revision_mode": record.get("Revision_Mode", ""),
+        "revision_backup": record.get("Revision_Backup", ""),
+        "status": "saved",
+        "created_at": record.get("Создано", ""),
+    }
+    update_group_report_log(log_row_num, updated)
+    return "updated", updated
+
+
+async def send_group_report_feedback_message(application, chat_id, source_message_id, text, reply_markup=None):
+    send_kwargs = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": reply_markup,
+    }
+    if source_message_id:
+        send_kwargs["reply_to_message_id"] = source_message_id
+
+    try:
+        sent = await application.bot.send_message(**send_kwargs)
+    except BadRequest:
+        if not source_message_id:
+            raise
+        logger.exception(
+            "Failed to send group feedback as reply, retrying without reply: chat=%s source=%s",
+            chat_id,
+            source_message_id,
+        )
+        sent = await application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
     schedule_single_message_cleanup(
         application,
         sent.chat_id,
@@ -10220,16 +15450,13 @@ async def send_group_report_feedback_message(application, chat_id, source_messag
     return sent
 
 
-async def send_group_report_saved_message(application, draft, log_row):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑 Не учитывать", callback_data=f"grp_report_delete_{log_row}")]
-    ])
+async def send_group_report_saved_message(application, draft, save_result):
     await send_group_report_feedback_message(
         application,
         draft["chat_id"],
         draft["source_message_id"],
-        build_group_report_saved_text(draft),
-        reply_markup=kb,
+        build_group_report_saved_text(draft, save_result),
+        reply_markup=build_group_report_saved_markup(save_result),
     )
 
 
@@ -10242,15 +15469,233 @@ async def send_group_travel_saved_message(application, draft, log_row):
     )
 
 
+async def send_revision_restock_saved_message(application, draft, save_result):
+    await send_group_report_feedback_message(
+        application,
+        draft["chat_id"],
+        draft["source_message_id"],
+        build_revision_restock_saved_text(draft, save_result),
+        reply_markup=build_revision_restock_saved_markup(save_result),
+    )
+
+
+async def send_revision_message_saved_message(application, draft, save_result):
+    await send_group_report_feedback_message(
+        application,
+        draft["chat_id"],
+        draft["source_message_id"],
+        build_revision_message_saved_text(draft, save_result),
+        reply_markup=build_group_report_saved_markup(save_result),
+    )
+
+
+async def run_group_sheet_write_with_retry(save_callable, draft, operation_label):
+    delay_seconds = 1.0
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await run_blocking(save_callable, draft)
+        except APIError as error:
+            if not is_google_sheets_busy_error(error) or attempt >= max_attempts:
+                raise
+            logger.warning(
+                "Google Sheets busy during %s, retrying attempt %s/%s: point=%s date=%s who=%s",
+                operation_label,
+                attempt + 1,
+                max_attempts,
+                draft.get("point", ""),
+                draft.get("date", ""),
+                draft.get("who", ""),
+            )
+            await asyncio.sleep(delay_seconds)
+            delay_seconds *= 2
+
+
 async def process_group_report_message(message, application, photo_ids=None):
     if not message or not getattr(message, "chat", None):
         return
-    if message.chat.type not in {"group", "supergroup"}:
+    if message.chat.type not in {"group", "supergroup", "private"}:
         return
     if getattr(message.from_user, "is_bot", False):
         return
 
     body_text = message.caption or message.text or ""
+    restock_parsed = parse_revision_restock_message_text(body_text)
+    if restock_parsed:
+        draft = {
+            **restock_parsed,
+            "point": restock_parsed["location"],
+            "who": get_service_report_author(message),
+            "date": get_message_local_date(message),
+            "period": get_period_key_for_date(get_message_local_date(message)),
+            "chat_id": message.chat_id,
+            "source_message_id": message.message_id,
+            "media_group_id": getattr(message, "media_group_id", "") or "",
+            "source_key": build_group_report_source_key(message),
+        }
+        draft["fingerprint"] = build_revision_restock_fingerprint(draft)
+
+        try:
+            async with GROUP_REPORT_SAVE_LOCK:
+                existing, duplicate = await run_blocking(
+                    find_group_report_duplicate,
+                    draft["chat_id"],
+                    draft["source_key"],
+                    draft["fingerprint"],
+                )
+                if existing and existing.get("Статус") in {"saved", "ignored", "deleted"}:
+                    status = existing.get("Статус")
+                    if status == "saved":
+                        text = "⚪ Это пополнение уже сохранено."
+                    elif status == "deleted":
+                        text = "⚪ Это пополнение уже было отмечено как «не учитывать»."
+                    else:
+                        text = "⚪ Это пополнение уже обработано."
+                    await send_group_report_feedback_message(
+                        application,
+                        draft["chat_id"],
+                        draft["source_message_id"],
+                        text,
+                    )
+                    return
+
+                if duplicate:
+                    await send_group_report_feedback_message(
+                        application,
+                        draft["chat_id"],
+                        draft["source_message_id"],
+                        "⚪ Похоже, это дубль пополнения — оно уже сохранено.",
+                    )
+                    return
+
+                save_result = await run_group_sheet_write_with_retry(
+                    save_revision_restock_entry,
+                    draft,
+                    "revision restock save",
+                )
+            await send_revision_restock_saved_message(application, draft, save_result)
+        except APIError as error:
+            if is_google_sheets_busy_error(error):
+                logger.exception(
+                    "Google Sheets busy during revision restock save chat=%s source=%s",
+                    draft["chat_id"],
+                    draft["source_key"],
+                )
+                await show_sheets_busy_notice(message)
+                return
+            logger.exception(
+                "Failed to auto-save revision restock chat=%s source=%s",
+                draft["chat_id"],
+                draft["source_key"],
+            )
+            await send_group_report_feedback_message(
+                application,
+                draft["chat_id"],
+                draft["source_message_id"],
+                "❌ Не удалось добавить пополнение в ревизию. Попробуйте ещё раз.",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to auto-save revision restock chat=%s source=%s",
+                draft["chat_id"],
+                draft["source_key"],
+            )
+            await send_group_report_feedback_message(
+                application,
+                draft["chat_id"],
+                draft["source_message_id"],
+                "❌ Не удалось добавить пополнение в ревизию. Попробуйте ещё раз.",
+            )
+        return
+
+    revision_parsed = parse_revision_snapshot_message_text(body_text)
+    if revision_parsed:
+        draft = {
+            **revision_parsed,
+            "point": revision_parsed["location"],
+            "who": get_service_report_author(message),
+            "date": get_message_local_date(message),
+            "period": get_period_key_for_date(get_message_local_date(message)),
+            "chat_id": message.chat_id,
+            "source_message_id": message.message_id,
+            "media_group_id": getattr(message, "media_group_id", "") or "",
+            "source_key": build_group_report_source_key(message),
+        }
+        draft["fingerprint"] = build_revision_message_fingerprint(draft)
+
+        try:
+            async with GROUP_REPORT_SAVE_LOCK:
+                existing, duplicate = await run_blocking(
+                    find_group_report_duplicate,
+                    draft["chat_id"],
+                    draft["source_key"],
+                    draft["fingerprint"],
+                )
+                if existing and existing.get("Статус") in {"saved", "ignored", "deleted"}:
+                    status = existing.get("Статус")
+                    if status == "saved":
+                        text = "⚪ Эта ревизия уже сохранена."
+                    elif status == "deleted":
+                        text = "⚪ Эта ревизия уже была отмечена как «не учитывать»."
+                    else:
+                        text = "⚪ Эта ревизия уже обработана."
+                    await send_group_report_feedback_message(
+                        application,
+                        draft["chat_id"],
+                        draft["source_message_id"],
+                        text,
+                    )
+                    return
+
+                if duplicate:
+                    await send_group_report_feedback_message(
+                        application,
+                        draft["chat_id"],
+                        draft["source_message_id"],
+                        "⚪ Похоже, это дубль ревизии — она уже сохранена.",
+                    )
+                    return
+
+                save_result = await run_group_sheet_write_with_retry(
+                    save_revision_message_entry,
+                    draft,
+                    "revision snapshot save",
+                )
+            await send_revision_message_saved_message(application, draft, save_result)
+        except APIError as error:
+            if is_google_sheets_busy_error(error):
+                logger.exception(
+                    "Google Sheets busy during revision snapshot save chat=%s source=%s",
+                    draft["chat_id"],
+                    draft["source_key"],
+                )
+                await show_sheets_busy_notice(message)
+                return
+            logger.exception(
+                "Failed to auto-save revision snapshot chat=%s source=%s",
+                draft["chat_id"],
+                draft["source_key"],
+            )
+            await send_group_report_feedback_message(
+                application,
+                draft["chat_id"],
+                draft["source_message_id"],
+                "❌ Не удалось сохранить ревизию из сообщения. Попробуйте ещё раз.",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to auto-save revision snapshot chat=%s source=%s",
+                draft["chat_id"],
+                draft["source_key"],
+            )
+            await send_group_report_feedback_message(
+                application,
+                draft["chat_id"],
+                draft["source_message_id"],
+                "❌ Не удалось сохранить ревизию из сообщения. Попробуйте ещё раз.",
+            )
+        return
+
     travel_parsed = parse_group_travel_message_text(body_text)
     if travel_parsed:
         draft = {
@@ -10299,8 +15744,32 @@ async def process_group_report_message(message, application, photo_ids=None):
                     )
                     return
 
-                log_row = await run_blocking(save_group_travel_entry, draft)
+                log_row = await run_group_sheet_write_with_retry(
+                    save_group_travel_entry,
+                    draft,
+                    "group travel save",
+                )
             await send_group_travel_saved_message(application, draft, log_row)
+        except APIError as error:
+            if is_google_sheets_busy_error(error):
+                logger.exception(
+                    "Google Sheets busy during auto-save travel chat=%s source=%s",
+                    draft["chat_id"],
+                    draft["source_key"],
+                )
+                await show_sheets_busy_notice(message)
+                return
+            logger.exception(
+                "Failed to auto-save travel report chat=%s source=%s",
+                draft["chat_id"],
+                draft["source_key"],
+            )
+            await send_group_report_feedback_message(
+                application,
+                draft["chat_id"],
+                draft["source_message_id"],
+                "❌ Не удалось сохранить проезд из сообщения. Попробуйте отправить ещё раз.",
+            )
         except Exception:
             logger.exception(
                 "Failed to auto-save travel report chat=%s source=%s",
@@ -10327,12 +15796,17 @@ async def process_group_report_message(message, application, photo_ids=None):
     draft = {
         **parsed,
         "who": get_service_report_author(message),
+        "user_id": getattr(getattr(message, "from_user", None), "id", None),
         "chat_id": message.chat_id,
         "source_message_id": message.message_id,
         "media_group_id": getattr(message, "media_group_id", "") or "",
         "source_key": build_group_report_source_key(message),
         "photo_ids": list(photo_ids or ([message.photo[-1].file_id] if getattr(message, "photo", None) else [])),
     }
+    revision_data, revision_warnings = build_group_report_revision_data(draft)
+    draft["revision"] = revision_data
+    if revision_warnings:
+        draft["warnings"] = list(draft.get("warnings", [])) + revision_warnings
     draft["fingerprint"] = build_group_report_fingerprint(draft)
 
     try:
@@ -10368,12 +15842,53 @@ async def process_group_report_message(message, application, photo_ids=None):
                 )
                 return
 
-            log_row = await run_blocking(save_group_report_entry, draft)
-        try:
-            await refresh_group_service_today_posts(application, force=True)
-        except Exception:
-            logger.exception("Failed to refresh group service-today post after group report save")
-        await send_group_report_saved_message(application, draft, log_row)
+            semantic_duplicates = await run_blocking(
+                find_service_semantic_duplicates,
+                build_group_report_payload(draft),
+                None,
+            )
+            if semantic_duplicates:
+                cleanup_expired_group_report_drafts(application.bot_data)
+                draft_id = next_group_report_draft_id(application.bot_data)
+                draft_copy = dict(draft)
+                draft_copy["created_at_ts"] = datetime.now().timestamp()
+                draft_copy["draft_mode"] = "service_duplicate_warning"
+                get_group_report_drafts(application.bot_data)[draft_id] = draft_copy
+                await send_group_report_feedback_message(
+                    application,
+                    draft["chat_id"],
+                    draft["source_message_id"],
+                    build_group_report_duplicate_warning_text(draft, semantic_duplicates),
+                    reply_markup=build_group_report_duplicate_draft_markup(draft_id),
+                )
+                return
+
+            save_result = await run_group_sheet_write_with_retry(
+                save_group_report_entry,
+                draft,
+                "group report save",
+            )
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            logger.exception(
+                "Google Sheets busy during auto-save group report chat=%s source=%s",
+                draft["chat_id"],
+                draft["source_key"],
+            )
+            await show_sheets_busy_notice(message)
+            return
+        logger.exception(
+            "Failed to auto-save group report chat=%s source=%s",
+            draft["chat_id"],
+            draft["source_key"],
+        )
+        await send_group_report_feedback_message(
+            application,
+            draft["chat_id"],
+            draft["source_message_id"],
+            "❌ Не удалось сохранить отчёт из сообщения. Попробуйте отправить ещё раз или поправьте вручную.",
+        )
+        return
     except Exception:
         logger.exception(
             "Failed to auto-save group report chat=%s source=%s",
@@ -10386,6 +15901,38 @@ async def process_group_report_message(message, application, photo_ids=None):
             draft["source_message_id"],
             "❌ Не удалось сохранить отчёт из сообщения. Попробуйте отправить ещё раз или поправьте вручную.",
         )
+        return
+
+    try:
+        await refresh_group_service_today_posts(application, force=True)
+    except Exception:
+        logger.exception("Failed to refresh group service-today post after group report save")
+
+    try:
+        await send_group_report_saved_message(application, draft, save_result)
+    except Exception:
+        logger.exception(
+            "Failed to send saved group report confirmation chat=%s source=%s",
+            draft["chat_id"],
+            draft["source_key"],
+        )
+        fallback_result = dict(save_result or {})
+        fallback_warnings = list(fallback_result.get("warnings", []))
+        fallback_warnings.append("быстрые кнопки не показались, но запись сохранена")
+        fallback_result["warnings"] = fallback_warnings
+        try:
+            await send_group_report_feedback_message(
+                application,
+                draft["chat_id"],
+                draft["source_message_id"],
+                build_group_report_saved_text(draft, fallback_result),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send fallback group report confirmation chat=%s source=%s",
+                draft["chat_id"],
+                draft["source_key"],
+            )
 
 
 async def finalize_group_report_media_group(application, media_key):
@@ -10405,7 +15952,7 @@ async def group_report_message_handler(update: Update, context):
     message = update.effective_message
     if not message:
         return
-    if not is_allowed_user(update) or not is_allowed_group_chat(update):
+    if not is_allowed_user(update) or not is_allowed_group_report_chat(update):
         return
     if getattr(message.from_user, "is_bot", False):
         return
@@ -10435,21 +15982,189 @@ async def group_report_message_handler(update: Update, context):
 
 async def group_report_callback_handler(update: Update, context):
     query = update.callback_query
-    if not is_allowed_user(update) or not is_allowed_group_chat(update):
+    if not is_allowed_user(update) or not is_allowed_group_report_chat(update):
         await deny_callback_access(query)
         return
     await query.answer()
 
     cleanup_expired_group_report_drafts(context.application.bot_data)
-    match = re.match(r"^grp_report_(save|ignore|delete)_(\d+)$", query.data)
-    if not match:
+    data = str(query.data or "")
+    if not data.startswith("grp_report_"):
         return
 
-    action, raw_id = match.groups()
+    payload = data.replace("grp_report_", "", 1)
+    if "_" not in payload:
+        return
+    action, raw_id = payload.rsplit("_", 1)
+    if not raw_id.isdigit():
+        return
 
-    if action == "delete":
+    quick_actions = {"delete", "edit_service", "edit_revision", "remove_revision"}
+    if action in quick_actions or action.startswith("worker_"):
+        log_row_num = int(raw_id)
+        record = await run_blocking(get_group_report_log_entry_by_row, log_row_num)
+        if not record:
+            await query.edit_message_text("⚪ Сообщение уже недоступно.")
+            if query.message:
+                schedule_single_message_cleanup(
+                    context.application,
+                    query.message.chat_id,
+                    query.message.message_id,
+                    GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                )
+            return MAIN_MENU
+
+        if record.get("Статус") != "saved":
+            await query.edit_message_text("⚪ Сообщение уже неактуально.")
+            if query.message:
+                schedule_single_message_cleanup(
+                    context.application,
+                    query.message.chat_id,
+                    query.message.message_id,
+                    GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                )
+            return MAIN_MENU
+
+        if not is_group_report_action_window_open(record):
+            await query.edit_message_text(build_group_report_action_expired_text())
+            if query.message:
+                schedule_single_message_cleanup(
+                    context.application,
+                    query.message.chat_id,
+                    query.message.message_id,
+                    GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                )
+            return MAIN_MENU
+
+        if action.startswith("worker_"):
+            try:
+                worker_index = int(action.replace("worker_", "", 1))
+                worker = WORKERS[worker_index]
+            except (ValueError, IndexError):
+                await query.edit_message_text("⚪ Не удалось определить сотрудника.")
+                if query.message:
+                    schedule_single_message_cleanup(
+                        context.application,
+                        query.message.chat_id,
+                        query.message.message_id,
+                        GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                    )
+                return MAIN_MENU
+
+            try:
+                status, updated_record = await run_blocking(reassign_group_report_worker, log_row_num, worker)
+            except Exception:
+                logger.exception("Failed to reassign group report log row %s to %s", raw_id, worker)
+                await query.edit_message_text("❌ Не удалось изменить сотрудника.")
+                if query.message:
+                    schedule_single_message_cleanup(
+                        context.application,
+                        query.message.chat_id,
+                        query.message.message_id,
+                        GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                    )
+                return MAIN_MENU
+
+            if status == "updated" and updated_record:
+                await query.edit_message_text(
+                    "✅ Сообщение перезачтено.\n\n"
+                    f"📍 {updated_record.get('point', '—')}\n"
+                    f"📅 {updated_record.get('date', '—')}\n"
+                    f"👤 {updated_record.get('who', '—')}",
+                    reply_markup=build_group_report_saved_markup(build_group_report_save_result_from_record({
+                        "__row": log_row_num,
+                        "Кто": updated_record.get("who", ""),
+                        "Service_Row": updated_record.get("service_row", ""),
+                        "Revision_Period": updated_record.get("revision_period", ""),
+                        "Revision_Location": updated_record.get("revision_location", ""),
+                    })),
+                )
+                try:
+                    await refresh_group_service_today_posts(context.application, force=True)
+                except Exception:
+                    logger.exception("Failed to refresh group service-today post after worker reassignment")
+            else:
+                await query.edit_message_text("⚪ Сообщение уже неактуально.")
+            return MAIN_MENU
+
+        if action == "edit_service":
+            await query.edit_message_text(
+                "⚪ Быстрое полное редактирование обслуживания из группового сообщения отключено.\n\n"
+                "Для смены сотрудника используйте кнопки выше.\n"
+                "Для остальных правок откройте «Исправить записи»."
+            )
+            if query.message:
+                schedule_single_message_cleanup(
+                    context.application,
+                    query.message.chat_id,
+                    query.message.message_id,
+                    GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                )
+            return MAIN_MENU
+
+        if action == "edit_revision":
+            await query.edit_message_text(
+                "⚪ Быстрое пошаговое редактирование ревизии из группового сообщения отключено.\n\n"
+                "Если нужно поправить цифры, откройте раздел «Ревизия».\n"
+                "Если ревизию не нужно учитывать вообще, нажмите «Не считать ревизией»."
+            )
+            if query.message:
+                schedule_single_message_cleanup(
+                    context.application,
+                    query.message.chat_id,
+                    query.message.message_id,
+                    GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                )
+            return MAIN_MENU
+
+        if action == "remove_revision":
+            try:
+                status, updated_record = await run_blocking(remove_group_report_revision_by_log_row, log_row_num)
+            except Exception:
+                logger.exception("Failed to remove revision from group report log row %s", raw_id)
+                await query.edit_message_text("❌ Не удалось убрать ревизию из сообщения.")
+                if query.message:
+                    schedule_single_message_cleanup(
+                        context.application,
+                        query.message.chat_id,
+                        query.message.message_id,
+                        GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                    )
+                return MAIN_MENU
+
+            if status == "removed" and updated_record:
+                if is_group_report_revision_only_record(updated_record):
+                    await query.edit_message_text(
+                        "📦 Ревизия убрана из учёта.\n\n"
+                        "Сообщение больше не влияет на ревизию.\n\n"
+                        f"📍 {updated_record.get('Точка', '—')}\n"
+                        f"📅 {updated_record.get('Дата', '—')}\n"
+                        f"👤 {updated_record.get('Кто', '—')}"
+                    )
+                else:
+                    await query.edit_message_text(
+                        "📦 Ревизия убрана из учёта.\n\n"
+                        "Обслуживание осталось сохранённым.\n\n"
+                        f"📍 {updated_record.get('Точка', '—')}\n"
+                        f"📅 {updated_record.get('Дата', '—')}\n"
+                        f"👤 {updated_record.get('Кто', '—')}"
+                    )
+            elif status == "no_revision":
+                await query.edit_message_text("⚪ Для этого сообщения ревизия уже не учитывается.")
+            else:
+                await query.edit_message_text("⚪ Сообщение уже неактуально.")
+
+            if query.message:
+                schedule_single_message_cleanup(
+                    context.application,
+                    query.message.chat_id,
+                    query.message.message_id,
+                    GROUP_REPORT_FEEDBACK_AUTO_DELETE_SECONDS,
+                )
+            return MAIN_MENU
+
         try:
-            status, record = await run_blocking(delete_group_report_entry_by_log_row, int(raw_id))
+            status, deleted_record = await run_blocking(delete_group_report_entry_by_log_row, log_row_num)
         except Exception:
             logger.exception("Failed to delete saved group report log row %s", raw_id)
             await query.edit_message_text("❌ Не удалось отменить сохранение сообщения.")
@@ -10462,21 +16177,15 @@ async def group_report_callback_handler(update: Update, context):
                 )
             return MAIN_MENU
 
-        if status == "deleted" and record:
+        if status == "deleted" and deleted_record:
             try:
                 await refresh_group_service_today_posts(context.application, force=True)
             except Exception:
                 logger.exception("Failed to refresh group service-today post after group report delete")
-            await query.edit_message_text(
-                "🗑 Сообщение убрано из базы.\n\n"
-                f"📍 {record.get('Точка', '—')}\n"
-                f"📅 {record.get('Дата', '—')}\n"
-                f"👤 {record.get('Кто', '—')}"
-            )
-        elif status == "saved":
-            await query.edit_message_text("⚪ Сообщение уже недоступно для удаления.")
+            await query.edit_message_text(build_group_report_delete_result_text(deleted_record))
         else:
             await query.edit_message_text("⚪ Сообщение уже неактуально.")
+
         if query.message:
             schedule_single_message_cleanup(
                 context.application,
@@ -10513,22 +16222,35 @@ async def group_report_callback_handler(update: Update, context):
             )
         return MAIN_MENU
 
-    payload = build_group_report_payload(draft)
     try:
-        await run_blocking(add_service_row, payload)
-        for file_id in draft.get("photo_ids", []):
-            await run_blocking(add_photo_row, draft["date"], draft["point"], draft["who"], file_id)
+        save_result = await run_group_sheet_write_with_retry(
+            save_group_report_entry,
+            draft,
+            "group report draft save",
+        )
         drafts.pop(draft_id, None)
         try:
             await refresh_group_service_today_posts(context.application, force=True)
         except Exception:
             logger.exception("Failed to refresh group service-today post after draft save")
+        text = build_group_report_saved_text(draft, save_result)
+        if draft.get("draft_mode") == "service_duplicate_warning":
+            text = text.replace(
+                "✅ Отчёт сохранён",
+                "✅ Отчёт сохранён как отдельное обслуживание",
+                1,
+            )
         await query.edit_message_text(
-            "✅ Сообщение сохранено в обслуживание.\n\n"
-            f"📍 {draft['point']}\n"
-            f"📅 {draft['date']}\n"
-            f"👤 {draft['who']}"
+            text,
+            reply_markup=build_group_report_saved_markup(save_result),
         )
+    except APIError as error:
+        if is_google_sheets_busy_error(error):
+            logger.exception("Google Sheets busy during group report draft save %s", draft_id)
+            await show_sheets_busy_notice(query)
+            return MAIN_MENU
+        logger.exception("Failed to save group report draft %s", draft_id)
+        await query.edit_message_text("❌ Не удалось сохранить сообщение.")
     except Exception:
         logger.exception("Failed to save group report draft %s", draft_id)
         await query.edit_message_text("❌ Не удалось сохранить сообщение.")
@@ -10545,41 +16267,260 @@ async def group_report_callback_handler(update: Update, context):
 # ============ ПРОЕЗД ============
 async def travel_who(update: Update, context):
     query = update.callback_query
+    mode = context.user_data.get("travel_mode", "add")
+    if mode == "add":
+        title = "Кто едет?"
+    elif mode == "edit":
+        title = "Чьи записи исправить?"
+    else:
+        title = "По кому показать историю?"
+    if mode == "add":
+        context.user_data.pop("travel_date", None)
     kb = [[InlineKeyboardButton(w, callback_data=f"tw_{w}")] for w in WORKERS]
-    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_service_menu")])
+    kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_menu")])
     kb.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
-    await query.edit_message_text("💰 Проезд\n\nКто едет?", reply_markup=InlineKeyboardMarkup(kb))
+    await query.edit_message_text(
+        f"{build_progress_text(TRAVEL_FLOW_STEPS, 1)}\n\n💰 Проезд\n\n{title}",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
     return TRAVEL_WHO
+
+
+async def travel_menu_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "back_main":
+        return await start(update, context)
+    if data == "back_service_menu":
+        return await show_service_section_menu(query, context)
+    if data == "back_travel_menu":
+        return await show_travel_menu(query, context)
+    if data == "travel_add":
+        context.user_data["travel_mode"] = "add"
+        context.user_data.pop("travel_edit", None)
+        context.user_data.pop("travel_who", None)
+        context.user_data.pop("travel_date", None)
+        context.user_data.pop("travel_allowed_period", None)
+        context.user_data.pop("travel_return_mode", None)
+        context.user_data.pop("travel_return_period", None)
+        context.user_data.pop("travel_return_screen", None)
+        return await travel_who(update, context)
+    if data == "travel_history_person":
+        context.user_data["travel_mode"] = "history"
+        context.user_data.pop("travel_edit", None)
+        context.user_data.pop("travel_who", None)
+        context.user_data.pop("travel_date", None)
+        context.user_data.pop("travel_allowed_period", None)
+        context.user_data.pop("travel_return_mode", None)
+        context.user_data.pop("travel_return_period", None)
+        context.user_data.pop("travel_return_screen", None)
+        return await travel_who(update, context)
+    if data == "travel_history_all":
+        context.user_data["travel_mode"] = "history"
+        context.user_data.pop("travel_edit", None)
+        context.user_data.pop("travel_who", None)
+        context.user_data.pop("travel_allowed_period", None)
+        context.user_data.pop("travel_return_mode", None)
+        context.user_data.pop("travel_return_period", None)
+        context.user_data.pop("travel_return_screen", None)
+        return await show_travel_history_period_menu(query, context, "all")
+    if data == "travel_edit":
+        if not is_payout_editor(update):
+            await query.answer("⛔ Только Матвей может менять проезд.", show_alert=True)
+            return TRAVEL_MENU
+        context.user_data["travel_mode"] = "edit"
+        context.user_data.pop("travel_edit", None)
+        context.user_data.pop("travel_who", None)
+        context.user_data.pop("travel_date", None)
+        context.user_data.pop("travel_allowed_period", None)
+        context.user_data.pop("travel_return_mode", None)
+        context.user_data.pop("travel_return_period", None)
+        context.user_data.pop("travel_return_screen", None)
+        return await travel_who(update, context)
+    return TRAVEL_MENU
+
 
 async def travel_who_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
-    if query.data == "back_service_menu":
-        return await show_service_section_menu(query, context)
+    if query.data == "back_travel_menu":
+        return await show_travel_menu(query, context)
     if query.data == "back_main":
         return await start(update, context)
     who = query.data.replace("tw_", "")
     context.user_data["travel_who"] = who
+    if context.user_data.get("travel_mode") == "history":
+        return await show_travel_history_period_menu(query, context, "person")
+    if context.user_data.get("travel_mode") == "edit":
+        return await show_travel_history_period_menu(query, context, "edit")
     context.user_data.pop("travel_date", None)
     return await show_travel_date_menu(query, context)
+
+
+async def travel_history_period_handler(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    mode = context.user_data.get("travel_history_mode", "person")
+
+    if data == "back_main":
+        return await start(update, context)
+    if data == "back_travel_menu":
+        return await show_travel_menu(query, context)
+    if data == "back_travel_who":
+        return await travel_who(update, context)
+    if data == "back_travel_history_period":
+        return await show_travel_history_period_menu(query, context, mode)
+
+    if mode == "edit":
+        if not is_payout_editor(update):
+            await query.answer("⛔ Только Матвей может менять проезд.", show_alert=True)
+            return TRAVEL_HISTORY_PERIOD
+        if data == "tr_edit_back_dates":
+            return await show_travel_edit_date_screen(query, context, back_callback="back_travel_history_period")
+        if data == "tr_edit_back_entries":
+            return await render_travel_edit_entries_screen(query, context)
+        if data.startswith("tr_edit_date:"):
+            context.user_data["travel_date"] = data.split(":", 1)[1]
+            return await render_travel_edit_entries_screen(query, context)
+        if data.startswith("tr_edit_entry:"):
+            return await show_travel_edit_card(query, context, int(data.split(":")[1]))
+        if data.startswith("tr_edit_amount:"):
+            row_num = int(data.split(":")[1])
+            entry = await get_travel_entry_by_row(row_num)
+            if not entry:
+                return await render_travel_edit_entries_screen(query, context, notice="❌ Запись проезда не найдена.")
+            context.user_data["travel_edit"] = {"mode": "general", "row_num": row_num}
+            await show_text_screen(
+                query,
+                context,
+                (
+                    "<b>💰 Изменить сумму проезда</b>\n\n"
+                    f"📅 {escape_html(entry.get('Дата', ''))}\n"
+                    f"Текущая сумма: {format_money_spaced(entry.get('Сумма', 0))}\n\n"
+                    "Введите новую сумму числом, например <code>96</code>."
+                ),
+                reply_markup=back_markup(f"tr_edit_entry:{row_num}"),
+                parse_mode="HTML",
+            )
+            return PAYOUT_TRAVEL_EDIT_AMOUNT
+        if data.startswith("tr_edit_date_prompt:"):
+            row_num = int(data.split(":")[1])
+            entry = await get_travel_entry_by_row(row_num)
+            if not entry:
+                return await render_travel_edit_entries_screen(query, context, notice="❌ Запись проезда не найдена.")
+            context.user_data["travel_edit"] = {"mode": "general", "row_num": row_num}
+            period_key = context.user_data.get("travel_allowed_period")
+            period_line = (
+                f"Месяц: {escape_html(format_period_label(period_key))}\n\n"
+                if period_key
+                else ""
+            )
+            await show_text_screen(
+                query,
+                context,
+                (
+                    "<b>📅 Изменить дату проезда</b>\n\n"
+                    f"Текущая дата: {escape_html(entry.get('Дата', ''))}\n"
+                    f"{period_line}"
+                    "Введите новую дату в формате <code>дд.мм</code> или <code>дд.мм.гггг</code>."
+                ),
+                reply_markup=back_markup(f"tr_edit_entry:{row_num}"),
+                parse_mode="HTML",
+            )
+            return PAYOUT_TRAVEL_EDIT_DATE
+        if data.startswith("tr_edit_delete:"):
+            row_num = int(data.split(":")[1])
+            entry = await get_travel_entry_by_row(row_num)
+            if not entry:
+                return await render_travel_edit_entries_screen(query, context, notice="❌ Запись проезда не найдена.")
+            await show_text_screen(
+                query,
+                context,
+                (
+                    "<b>🗑 Удалить запись проезда?</b>\n\n"
+                    f"📅 {escape_html(entry.get('Дата', ''))}\n"
+                    f"💰 {format_money_spaced(entry.get('Сумма', 0))}\n"
+                    f"🧾 Строка: #{entry.get('__row', '?')}"
+                ),
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("✅ Да, удалить", callback_data=f"tr_edit_delete_yes:{row_num}")],
+                        [InlineKeyboardButton("⬅️ Назад", callback_data=f"tr_edit_entry:{row_num}")],
+                    ]
+                ),
+                parse_mode="HTML",
+            )
+            return TRAVEL_HISTORY_PERIOD
+        if data.startswith("tr_edit_delete_yes:"):
+            row_num = int(data.split(":")[1])
+            entry = await get_travel_entry_by_row(row_num)
+            if not entry:
+                return await render_travel_edit_entries_screen(query, context, notice="❌ Запись проезда не найдена.")
+            await run_blocking(delete_travel_row, row_num)
+            return await render_travel_edit_entries_screen(query, context, notice="✅ Запись проезда удалена.")
+
+    if data not in {"tr_hist_current", "tr_hist_prev"}:
+        return TRAVEL_HISTORY_PERIOD
+
+    period_code = "rp_month_current" if data == "tr_hist_current" else "rp_month_prev"
+    config = get_report_period_config(period_code)
+    if not config:
+        await show_text_screen(
+            query,
+            context,
+            "❌ Не удалось определить месяц.",
+            reply_markup=back_markup("back_travel_history_period"),
+        )
+        return TRAVEL_HISTORY_PERIOD
+
+    context.user_data["travel_date"] = format_date(config["end_date"])
+    context.user_data["travel_allowed_period"] = config.get("period_key")
+    if mode == "all":
+        return await show_travel_month_all_screen(query, context, back_callback="back_travel_history_period")
+    if mode == "edit":
+        return await show_travel_edit_date_screen(query, context, back_callback="back_travel_history_period")
+    return await show_travel_month_person_screen(query, context, back_callback="back_travel_history_period")
 
 
 async def travel_date_handler(update: Update, context):
     query = update.callback_query
     await query.answer()
     d = query.data
+    allowed_period = context.user_data.get("travel_allowed_period")
 
     if d == "back_main":
         return await start(update, context)
     if d == "back_service_menu":
         return await show_service_section_menu(query, context)
     if d == "back_travel_who":
+        if context.user_data.get("travel_return_mode") == "payout":
+            return await show_payout_screen(
+                query,
+                context,
+                screen=context.user_data.get("travel_return_screen", "overview"),
+                period_key=context.user_data.get("travel_return_period"),
+            )
         return await travel_who(update, context)
     if d == "tr_date_today":
         context.user_data["travel_date"] = today()
+        error = get_period_restriction_error(context.user_data["travel_date"], allowed_period)
+        if error:
+            return await show_travel_date_menu(query, context, notice=error)
         return await show_travel_action_menu(query, context)
     if d == "tr_date_yesterday":
         context.user_data["travel_date"] = yesterday()
+        error = get_period_restriction_error(context.user_data["travel_date"], allowed_period)
+        if error:
+            return await show_travel_date_menu(query, context, notice=error)
+        return await show_travel_action_menu(query, context)
+    if d == "tr_date_daybefore":
+        context.user_data["travel_date"] = day_before_yesterday()
+        error = get_period_restriction_error(context.user_data["travel_date"], allowed_period)
+        if error:
+            return await show_travel_date_menu(query, context, notice=error)
         return await show_travel_action_menu(query, context)
     if d == "tr_date_custom":
         await show_text_screen(
@@ -10607,15 +16548,17 @@ async def travel_date_custom_handler(update: Update, context):
         return TRAVEL_DATE_CUSTOM
 
     context.user_data["travel_date"] = format_date(parsed)
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("➡️ Продолжить", callback_data="tr_summary")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_date")],
-        ]
+    period_error = get_period_restriction_error(
+        context.user_data["travel_date"],
+        context.user_data.get("travel_allowed_period"),
     )
+    if period_error:
+        await update.message.reply_text(period_error, reply_markup=back_markup("back_travel_date"))
+        return TRAVEL_DATE_CUSTOM
+    who = context.user_data.get("travel_who", "?")
     await update.message.reply_text(
-        f"📅 Выбрано: {context.user_data['travel_date']}",
-        reply_markup=kb,
+        f"{build_progress_text(TRAVEL_FLOW_STEPS, 3)}\n\n💰 Проезд — {who}\n\n📅 {context.user_data['travel_date']}\n\n➕ Добавить поездки:",
+        reply_markup=build_travel_action_markup(),
     )
     return TRAVEL_ACTION
 
@@ -10636,21 +16579,7 @@ async def show_travel_summary_screen(query, context, prefix_text=None):
         text_parts.extend(["", prefix_text])
     text_parts.extend(["", summary])
 
-    kb = [
-        [
-            InlineKeyboardButton("1 поездка", callback_data="tr_count_1"),
-            InlineKeyboardButton("2 поездки", callback_data="tr_count_2"),
-        ],
-        [
-            InlineKeyboardButton("3 поездки", callback_data="tr_count_3"),
-            InlineKeyboardButton("4 поездки", callback_data="tr_count_4"),
-        ],
-        [InlineKeyboardButton("🔢 Другое количество", callback_data="tr_count_custom")],
-        [InlineKeyboardButton("💰 Другая сумма", callback_data="tr_custom")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_date")],
-        [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
-    ]
-    await show_text_screen(query, context, "\n".join(text_parts), reply_markup=InlineKeyboardMarkup(kb))
+    await show_text_screen(query, context, "\n".join(text_parts), reply_markup=build_travel_action_markup())
     return TRAVEL_ACTION
 
 
@@ -10660,15 +16589,22 @@ async def travel_action_handler(update: Update, context):
     d = query.data
     who = context.user_data.get("travel_who", "?")
     date_str = get_travel_selected_date(context)
+    payout_return_mode = context.user_data.get("travel_return_mode") == "payout"
+    payout_return_screen = context.user_data.get("travel_return_screen", "overview")
+    payout_return_period = context.user_data.get("travel_return_period")
 
     if d == "back_main":
         return await start(update, context)
     if d == "back_service_menu":
         return await show_service_section_menu(query, context)
     if d == "back_travel_who":
+        if payout_return_mode:
+            return await show_payout_screen(query, context, screen=payout_return_screen, period_key=payout_return_period)
         return await travel_who(update, context)
     if d == "back_travel_date":
         return await show_travel_date_menu(query, context)
+    if d == "back_travel_action":
+        return await show_travel_action_menu(query, context)
 
     if d in {"tr_default", "tr_count_1", "tr_count_2", "tr_count_3", "tr_count_4"}:
         trip_count = 1 if d == "tr_default" else int(d.rsplit("_", 1)[1])
@@ -10681,6 +16617,15 @@ async def travel_action_handler(update: Update, context):
             return TRAVEL_ACTION
 
         label = f"✅ Записано: {trip_count} поездок — {format_money(amount)}"
+        if payout_return_mode:
+            get_payout_context(context)["travels_date"] = date_str
+            return await show_payout_screen(
+                query,
+                context,
+                screen=payout_return_screen,
+                period_key=payout_return_period,
+                notice=label,
+            )
         return await show_travel_summary_screen(query, context, label)
 
     if d == "tr_count_custom":
@@ -10703,6 +16648,10 @@ async def travel_action_handler(update: Update, context):
 
     if d in {"tr_today", "tr_summary"}:
         return await show_travel_summary_screen(query, context)
+    if d == "tr_month_person":
+        return await show_travel_month_person_screen(query, context)
+    if d == "tr_month_all":
+        return await show_travel_month_all_screen(query, context, back_callback="back_travel_action")
 
     return TRAVEL_ACTION
 
@@ -10729,29 +16678,25 @@ async def travel_custom_handler(update: Update, context):
 
     who = context.user_data.get("travel_who", "?")
     date_str = get_travel_selected_date(context)
+    payout_return_mode = context.user_data.get("travel_return_mode") == "payout"
+    payout_return_screen = context.user_data.get("travel_return_screen", "overview")
+    payout_return_period = context.user_data.get("travel_return_period")
     try:
         await run_blocking(add_travel_row, date_str, who, amount)
+        if payout_return_mode:
+            get_payout_context(context)["travels_date"] = date_str
+            return await render_payout_screen_target(
+                update.message,
+                context,
+                screen=payout_return_screen,
+                period_key=payout_return_period,
+                notice=f"✅ Записано: {format_money(amount)}",
+            )
         travels = await run_blocking(get_all_travels)
         summary = build_travel_day_summary(who, date_str, travels)
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("1 поездка", callback_data="tr_count_1"),
-                    InlineKeyboardButton("2 поездки", callback_data="tr_count_2"),
-                ],
-                [
-                    InlineKeyboardButton("3 поездки", callback_data="tr_count_3"),
-                    InlineKeyboardButton("4 поездки", callback_data="tr_count_4"),
-                ],
-                [InlineKeyboardButton("🔢 Другое количество", callback_data="tr_count_custom")],
-                [InlineKeyboardButton("💰 Другая сумма", callback_data="tr_custom")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_date")],
-                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
-            ]
-        )
         await update.message.reply_text(
             f"✅ Записано: {format_money(amount)}\n\n💰 Проезд — {who}\n📅 {date_str}\n\n{summary}",
-            reply_markup=kb,
+            reply_markup=build_travel_action_markup(),
         )
     except Exception:
         logger.exception("Failed to save custom travel record")
@@ -10782,30 +16727,26 @@ async def travel_trips_custom_handler(update: Update, context):
     who = context.user_data.get("travel_who", "?")
     date_str = get_travel_selected_date(context)
     amount = DEFAULT_FARE * trip_count
+    payout_return_mode = context.user_data.get("travel_return_mode") == "payout"
+    payout_return_screen = context.user_data.get("travel_return_screen", "overview")
+    payout_return_period = context.user_data.get("travel_return_period")
     try:
         await run_blocking(add_travel_row, date_str, who, amount)
+        if payout_return_mode:
+            get_payout_context(context)["travels_date"] = date_str
+            return await render_payout_screen_target(
+                update.message,
+                context,
+                screen=payout_return_screen,
+                period_key=payout_return_period,
+                notice=f"✅ Записано: {trip_count} поездок — {format_money(amount)}",
+            )
         travels = await run_blocking(get_all_travels)
         summary = build_travel_day_summary(who, date_str, travels)
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("1 поездка", callback_data="tr_count_1"),
-                    InlineKeyboardButton("2 поездки", callback_data="tr_count_2"),
-                ],
-                [
-                    InlineKeyboardButton("3 поездки", callback_data="tr_count_3"),
-                    InlineKeyboardButton("4 поездки", callback_data="tr_count_4"),
-                ],
-                [InlineKeyboardButton("🔢 Другое количество", callback_data="tr_count_custom")],
-                [InlineKeyboardButton("💰 Другая сумма", callback_data="tr_custom")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_date")],
-                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
-            ]
-        )
         await update.message.reply_text(
             f"✅ Записано: {trip_count} поездок — {format_money(amount)}\n\n"
             f"💰 Проезд — {who}\n📅 {date_str}\n\n{summary}",
-            reply_markup=kb,
+            reply_markup=build_travel_action_markup(),
         )
     except Exception:
         logger.exception("Failed to save travel trips count")
@@ -10821,63 +16762,81 @@ async def report_day(update: Update, context):
         await show_loading_state(query, context, "Собираю отчёт за день...")
         services = await run_blocking(get_all_services)
         travels = await run_blocking(get_all_travels)
+        salary_tasks = await run_blocking(get_all_salary_tasks)
         td = today()
 
         today_svc = [s for s in services if s.get("Дата") == td]
         today_trv = [t for t in travels if t.get("Дата") == td]
+        today_tasks = [task for task in salary_tasks if task.get("Дата") == td]
 
         text = f"📊 Отчёт за {td}:\n\n"
 
         workers_today = set()
         for s in today_svc:
             workers_today.add(s.get("Кто", "?"))
+            for salary_worker in get_service_salary_workers(s):
+                workers_today.add(salary_worker)
         for t in today_trv:
             workers_today.add(t.get("Кто", "?"))
+        for task in today_tasks:
+            workers_today.add(task.get("Кто", "?"))
 
         if not workers_today:
             text += "Нет данных за сегодня"
         else:
             grand_total = 0
-            for w in sorted(workers_today):
+            for w in order_workers(workers_today):
+                credited_svc = filter_services_for_salary_worker(today_svc, w)
                 w_svc = [s for s in today_svc if s.get("Кто") == w]
                 w_trv = [t for t in today_trv if t.get("Кто") == w]
+                w_tasks = [task for task in today_tasks if task.get("Кто") == w]
+                transferred_in = [s for s in credited_svc if s.get("Кто") != w]
 
                 text += f"👤 {w}:\n"
 
-                svc_sum = 0
-                purch_sum = 0
+                svc_sum = sum_service_amounts_for_worker(credited_svc, w)
+                purch_sum = sum_amounts(w_svc, "Сумма закупок")
+                task_sum = sum_amounts(w_tasks, "Сумма")
                 if w_svc:
                     text += f"  🔧 Обслужено: {len(w_svc)} точек\n"
                     for s in w_svc:
-                        ss = int(s.get("Сумма обслуж", 0))
-                        ps = int(s.get("Сумма закупок", 0))
-                        svc_sum += ss
-                        purch_sum += ps
                         point = s.get("Точка", "?")
-                        if ss > 0:
-                            text += f"    ✅ {point} — {ss}₽\n"
+                        transfer_note = build_service_salary_transfer_note(s)
+                        text += f"    ✅ {point}{transfer_note}\n"
+                if transferred_in:
+                    text += f"  🔁 В ЗП зачтено от других: {len(transferred_in)}\n"
+                    for s in credited_svc:
+                        if s.get("Кто") == w:
+                            continue
+                        point = s.get("Точка", "?")
+                        source_worker = s.get("Кто", "?")
+                        service_amount = get_service_worker_amount(s, w)
+                        if service_amount > 0:
+                            text += f"    ↪️ {point} от {source_worker} — {format_money_spaced(service_amount)}\n"
                         else:
-                            text += f"    ✅ {point}\n"
+                            text += f"    ↪️ {point} от {source_worker}\n"
 
-                trv_sum = sum(int(t.get("Сумма", 0)) for t in w_trv)
+                trv_sum = int(sum_amounts(w_trv, "Сумма"))
                 trv_count = len(w_trv)
 
                 if purch_sum:
-                    text += f"  🛒 Закупки: {purch_sum}₽\n"
+                    text += f"  🛒 Закупки: {format_money_spaced(purch_sum)}\n"
                 if trv_count:
-                    text += f"  🚌 Проезд: {trv_sum}₽ ({trv_count} поездок)\n"
+                    text += f"  🚌 Проезд: {format_money_spaced(trv_sum)} ({trv_count} поездок)\n"
+                if task_sum:
+                    text += f"  🧰 Допзадачи: {format_money_spaced(task_sum)}\n"
 
-                w_total = svc_sum + purch_sum + trv_sum
+                w_total = svc_sum + purch_sum + trv_sum + task_sum
                 if w in PAID_WORKERS:
-                    text += f"  💰 Итого {w}: {w_total}₽\n"
+                    text += f"  💰 Итого {w}: {format_money_spaced(w_total)}\n"
                 else:
-                    if purch_sum or trv_sum:
-                        text += f"  💰 Расходы {w}: {purch_sum + trv_sum}₽\n"
+                    if purch_sum or trv_sum or task_sum:
+                        text += f"  💰 Расходы {w}: {format_money_spaced(purch_sum + trv_sum + task_sum)}\n"
 
                 grand_total += w_total
                 text += "\n"
 
-            text += f"━━━━━━━━━━━━━━━━\n💰 Общие расходы: {grand_total}₽"
+            text += f"━━━━━━━━━━━━━━━━\n💰 Общие расходы: {format_money_spaced(grand_total)}"
 
     except Exception:
         logger.exception("Failed to build day report")
@@ -10900,12 +16859,1077 @@ async def report_day_handler(update: Update, context):
     return REPORT_DAY
 
 # ============ ОТЧЁТ ЗА ПЕРИОД ============
+def get_previous_month_period_key():
+    return shift_period(current_period_key(), -1)
+
+
+def get_report_period_config(period_code):
+    today_date = now_local().date()
+
+    if period_code == "rp_week":
+        start_date = today_date - timedelta(days=6)
+        return {
+            "start_date": start_date,
+            "end_date": today_date,
+            "title": f"Последние 7 дней ({format_date(start_date)}–{format_date(today_date)})",
+        }
+
+    period_key = current_period_key() if period_code in {"rp_month", "rp_month_current"} else get_previous_month_period_key()
+    year, month = parse_period_key(period_key)
+    if year is None:
+        return None
+
+    start_date = date(year, month, 1)
+    end_date = date(year, month, month_last_day(start_date))
+    if period_code in {"rp_month", "rp_month_current"}:
+        end_date = min(end_date, today_date)
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "title": format_period_label(period_key),
+        "period_key": period_key,
+    }
+
+
+def get_default_salary_period_code():
+    return "rp_month_prev" if now_local().date().day <= 7 else "rp_month_current"
+
+
+def get_default_salary_button_label():
+    config = get_report_period_config(get_default_salary_period_code())
+    if not config:
+        return "💼 Кирилл"
+    month_name = str(config["title"]).split(" ", 1)[0]
+    return f"💼 Кирилл · {month_name}"
+
+
+def is_date_in_report_range(date_str, start_date, end_date):
+    dt = parse_date(date_str)
+    if not dt:
+        return False
+    current_date = dt.date()
+    return start_date <= current_date <= end_date
+
+
+def order_workers(workers):
+    known = [worker for worker in WORKERS if worker in workers]
+    extras = sorted(worker for worker in workers if worker not in WORKERS)
+    return known + extras
+
+
+def sum_amounts(items, key):
+    total = 0.0
+    for item in items:
+        amount = parse_numeric_value(item.get(key, ""))
+        if amount is not None:
+            total += amount
+    return total
+
+
+def filter_services_for_salary_worker(services, worker):
+    return [service for service in services if worker in get_service_salary_workers(service)]
+
+
+def get_service_worker_amount(service, worker):
+    paid_workers = [item for item in get_service_salary_workers(service) if item in PAID_WORKERS]
+    if worker not in paid_workers:
+        return 0.0
+
+    stored_sum = parse_numeric_value(service.get("Сумма обслуж", ""))
+    if stored_sum is None:
+        return float(SERVICE_PRICE)
+
+    if not paid_workers:
+        return 0.0
+    return float(stored_sum) / len(paid_workers)
+
+
+def sum_service_amounts_for_worker(services, worker):
+    return sum(get_service_worker_amount(service, worker) for service in services)
+
+
+def build_service_salary_transfer_note(service):
+    actor = str(service.get("Кто", "")).strip()
+    credited = get_service_salary_workers(service)
+    default_workers = default_service_salary_workers(actor)
+    if credited == default_workers:
+        return ""
+    if credited:
+        return f" → ЗП: {', '.join(credited)}"
+    return " → не в ЗП"
+
+
+def build_worker_service_day_lines(worker_services):
+    if not worker_services:
+        return []
+
+    points_by_day = {}
+    for service in worker_services:
+        date_key = service.get("Дата", "")
+        point = str(service.get("Точка", "")).strip() or "?"
+        points_by_day.setdefault(date_key, []).append(point)
+
+    lines = []
+    ordered_dates = sorted(points_by_day.keys(), key=lambda value: parse_date(value) or datetime.min)
+    for date_key in ordered_dates:
+        points = order_points(set(points_by_day[date_key]))
+        lines.append(f"• {date_key} — {', '.join(points)}")
+    return lines
+
+
+def build_worker_travel_day_lines(worker_travels):
+    if not worker_travels:
+        return []
+
+    totals_by_day = {}
+    counts_by_day = {}
+    for travel in worker_travels:
+        date_key = travel.get("Дата", "")
+        amount = parse_numeric_value(travel.get("Сумма", ""))
+        if amount is None:
+            continue
+        totals_by_day[date_key] = totals_by_day.get(date_key, 0.0) + amount
+        counts_by_day[date_key] = counts_by_day.get(date_key, 0) + 1
+
+    lines = []
+    ordered_dates = sorted(totals_by_day.keys(), key=lambda value: parse_date(value) or datetime.min)
+    for date_key in ordered_dates:
+        trip_word = "поездка" if counts_by_day[date_key] == 1 else "поездок"
+        lines.append(
+            f"• {date_key} — {format_money_spaced(totals_by_day[date_key])} ({counts_by_day[date_key]} {trip_word})"
+        )
+    return lines
+
+
+def build_worker_salary_task_lines(worker_tasks):
+    if not worker_tasks:
+        return []
+
+    ordered_tasks = sorted(
+        worker_tasks,
+        key=lambda item: (parse_date(item.get("Дата", "")) or datetime.min, str(item.get("Описание", ""))),
+    )
+    lines = []
+    for task in ordered_tasks:
+        date_key = task.get("Дата", "")
+        description = str(task.get("Описание", "")).strip() or "Без описания"
+        amount_text = format_money_spaced(task.get("Сумма", ""))
+        lines.append(f"• {date_key} — {description} ({amount_text})")
+    return lines
+
+
+def build_period_report_text(title, services, travels, salary_tasks=None):
+    salary_tasks = salary_tasks or []
+    workers_all = set()
+    for service in services:
+        who = str(service.get("Кто", "")).strip()
+        if who:
+            workers_all.add(who)
+        workers_all.update(get_service_salary_workers(service))
+    for item in [*travels, *salary_tasks]:
+        who = str(item.get("Кто", "")).strip()
+        if who:
+            workers_all.add(who)
+    lines = [f"📈 Отчёт — {title}", ""]
+
+    if not workers_all:
+        lines.append("Нет данных за выбранный период.")
+        return "\n".join(lines)
+
+    grand_service = 0.0
+    grand_purchases = 0.0
+    grand_travel = 0.0
+    grand_salary_tasks = 0.0
+    grand_total = 0.0
+
+    for worker in order_workers(workers_all):
+        credited_services = filter_services_for_salary_worker(services, worker)
+        worker_services = [service for service in services if service.get("Кто") == worker]
+        worker_travels = [travel for travel in travels if travel.get("Кто") == worker]
+        worker_salary_tasks = [task for task in salary_tasks if task.get("Кто") == worker]
+        transferred_in = [service for service in credited_services if service.get("Кто") != worker]
+        transferred_out = [
+            service
+            for service in worker_services
+            if get_service_salary_workers(service) != default_service_salary_workers(worker)
+        ]
+
+        service_sum = sum_service_amounts_for_worker(credited_services, worker)
+        purchase_sum = sum_amounts(worker_services, "Сумма закупок")
+        travel_sum = sum_amounts(worker_travels, "Сумма")
+        salary_task_sum = sum_amounts(worker_salary_tasks, "Сумма")
+        worker_total = service_sum + purchase_sum + travel_sum + salary_task_sum
+
+        lines.append(f"👤 {worker}")
+
+        if worker_services:
+            lines.append(f"🔧 Обслуживаний: {len(worker_services)}")
+            lines.extend(build_worker_service_day_lines(worker_services))
+        else:
+            lines.append("🔧 Обслуживаний: 0")
+
+        if transferred_in:
+            lines.append(f"🔁 Зачтено в ЗП от других: {len(transferred_in)}")
+        if transferred_out:
+            lines.append(f"↪️ Передано в ЗП другому: {len(transferred_out)}")
+
+        travel_lines = build_worker_travel_day_lines(worker_travels)
+        if travel_lines:
+            lines.append("🚌 Проезд по дням")
+            lines.extend(travel_lines)
+        salary_task_lines = build_worker_salary_task_lines(worker_salary_tasks)
+        if salary_task_lines:
+            lines.append("🧰 Задачи и доплаты")
+            lines.extend(salary_task_lines)
+
+        lines.append(f"💰 Обслуживание: {format_money_spaced(service_sum)}")
+        if purchase_sum:
+            lines.append(f"🛒 Закупки: {format_money_spaced(purchase_sum)}")
+        if travel_sum:
+            lines.append(f"🚌 Проезд: {format_money_spaced(travel_sum)}")
+        if salary_task_sum:
+            lines.append(f"🧰 Допзадачи: {format_money_spaced(salary_task_sum)}")
+
+        if worker in PAID_WORKERS:
+            lines.append(f"✅ К выплате: {format_money_spaced(worker_total)}")
+        else:
+            lines.append(f"💸 Расходы: {format_money_spaced(purchase_sum + travel_sum + salary_task_sum)}")
+
+        lines.append("")
+
+        grand_service += service_sum
+        grand_purchases += purchase_sum
+        grand_travel += travel_sum
+        grand_salary_tasks += salary_task_sum
+        grand_total += worker_total
+
+    lines.extend(
+        [
+            "━━━━━━━━━━━━━━━━",
+            f"🔧 Обслуживание: {format_money_spaced(grand_service)}",
+            f"🛒 Закупки: {format_money_spaced(grand_purchases)}",
+            f"🚌 Проезд: {format_money_spaced(grand_travel)}",
+            f"🧰 Допзадачи: {format_money_spaced(grand_salary_tasks)}",
+            f"💰 Общие расходы: {format_money_spaced(grand_total)}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_worker_salary_card_text(worker, title, services, travels, salary_tasks=None):
+    salary_tasks = salary_tasks or []
+    credited_services = filter_services_for_salary_worker(services, worker)
+    worker_services = [service for service in services if service.get("Кто") == worker]
+    worker_travels = [travel for travel in travels if travel.get("Кто") == worker]
+    worker_salary_tasks = [task for task in salary_tasks if task.get("Кто") == worker]
+
+    service_sum = sum_service_amounts_for_worker(credited_services, worker)
+    purchase_sum = sum_amounts(worker_services, "Сумма закупок")
+    travel_sum = sum_amounts(worker_travels, "Сумма")
+    salary_task_sum = sum_amounts(worker_salary_tasks, "Сумма")
+    total_sum = service_sum + purchase_sum + travel_sum + salary_task_sum
+
+    lines = [f"💸 {worker} · {title}", ""]
+
+    if not credited_services and not worker_travels and not worker_salary_tasks and not worker_services:
+        lines.append("⚪ За выбранный период данных пока нет.")
+        return "\n".join(lines)
+
+    service_day_lines = build_worker_service_day_lines(credited_services)
+    travel_day_lines = build_worker_travel_day_lines(worker_travels)
+    salary_task_lines = build_worker_salary_task_lines(worker_salary_tasks)
+
+    lines.append(f"🔧 Обслуживаний: {len(credited_services)}")
+    lines.append(f"💰 Обслуживание: {format_money_spaced(service_sum)}")
+    if purchase_sum:
+        lines.append(f"🛒 Закупки: {format_money_spaced(purchase_sum)}")
+    if travel_sum:
+        lines.append(f"🚌 Проезд: {format_money_spaced(travel_sum)}")
+    if salary_task_sum:
+        lines.append(f"🧰 Допзадачи: {format_money_spaced(salary_task_sum)}")
+    lines.append(f"✅ К выплате: {format_money_spaced(total_sum)}")
+
+    if service_day_lines:
+        lines.extend(["", "📍 Точки по датам"])
+        lines.extend(service_day_lines)
+
+    if travel_day_lines:
+        lines.extend(["", "🚌 Проезд по датам"])
+        lines.extend(travel_day_lines)
+
+    if salary_task_lines:
+        lines.extend(["", "🧰 Задачи и доплаты"])
+        lines.extend(salary_task_lines)
+
+    return "\n".join(lines)
+
+
+def build_payout_sources():
+    return {
+        "services": get_all_services_with_rows(),
+        "travels": get_all_travels_with_rows(),
+        "salary_tasks": get_all_salary_tasks_with_rows(),
+        "payouts": get_all_payouts_with_rows(),
+    }
+
+
+def is_payout_period_locked(settlement):
+    return settlement.get("status") == PAYOUT_STATUS_PAID
+
+
+def get_payout_status_icon(status):
+    return "✅" if status == PAYOUT_STATUS_PAID else "⚪"
+
+
+def get_payout_display_total(settlement):
+    return settlement.get("display_total", settlement.get("total", 0))
+
+
+def format_short_date_label(date_str):
+    parsed = parse_date(date_str)
+    if not parsed:
+        return str(date_str)
+    return parsed.strftime("%d.%m")
+
+
+def compute_kirill_settlement(period_key, sources=None, worker=PAYOUT_WORKER):
+    sources = sources or build_payout_sources()
+    services = sources.get("services", [])
+    travels = sources.get("travels", [])
+    salary_tasks = sources.get("salary_tasks", [])
+    payouts = sources.get("payouts", [])
+
+    payout_record = find_payout_record(payouts, period_key, worker)
+    payout_entry = build_payout_entry_from_record(payout_record)
+
+    credited_services = sorted(
+        [
+            service
+            for service in services
+            if is_date_in_period_key(service.get("Дата", ""), period_key)
+            and worker in get_service_salary_workers(service)
+        ],
+        key=lambda item: (
+            parse_date(item.get("Дата", "")) or datetime.min,
+            str(item.get("Точка", "")),
+            int(item.get("__row", 0)),
+        ),
+    )
+    worker_services = sorted(
+        [
+            service
+            for service in services
+            if str(service.get("Кто", "")).strip() == worker
+            and is_date_in_period_key(service.get("Дата", ""), period_key)
+        ],
+        key=lambda item: (
+            parse_date(item.get("Дата", "")) or datetime.min,
+            str(item.get("Точка", "")),
+            int(item.get("__row", 0)),
+        ),
+    )
+    purchase_entries = [
+        service
+        for service in worker_services
+        if parse_numeric_value(service.get("Сумма закупок", "")) or str(service.get("Закупки", "")).strip()
+    ]
+    worker_travels = sorted(
+        [
+            travel
+            for travel in travels
+            if str(travel.get("Кто", "")).strip() == worker
+            and is_date_in_period_key(travel.get("Дата", ""), period_key)
+        ],
+        key=lambda item: (
+            parse_date(item.get("Дата", "")) or datetime.min,
+            int(item.get("__row", 0)),
+        ),
+    )
+    worker_salary_tasks = sorted(
+        [
+            task
+            for task in salary_tasks
+            if str(task.get("Кто", "")).strip() == worker
+            and is_date_in_period_key(task.get("Дата", ""), period_key)
+        ],
+        key=lambda item: (
+            parse_date(item.get("Дата", "")) or datetime.min,
+            str(item.get("Описание", "")),
+            int(item.get("__row", 0)),
+        ),
+    )
+
+    live_service_sum = sum_service_amounts_for_worker(credited_services, worker)
+    live_purchase_sum = sum_amounts(worker_services, "Сумма закупок")
+    live_travel_sum = sum_amounts(worker_travels, "Сумма")
+    live_salary_task_sum = sum_amounts(worker_salary_tasks, "Сумма")
+    correction = payout_entry.get("correction", 0)
+    live_total = live_service_sum + live_purchase_sum + live_travel_sum + live_salary_task_sum + correction
+
+    is_paid = payout_entry.get("status") == PAYOUT_STATUS_PAID and payout_record is not None
+    display_service_sum = payout_entry.get("service_sum", 0) if is_paid else live_service_sum
+    display_service_count = payout_entry.get("service_count", 0) if is_paid else len(credited_services)
+    display_purchase_sum = payout_entry.get("purchase_sum", 0) if is_paid else live_purchase_sum
+    display_travel_sum = payout_entry.get("travel_sum", 0) if is_paid else live_travel_sum
+    display_travel_count = payout_entry.get("travel_count", 0) if is_paid else len(worker_travels)
+    display_salary_task_sum = payout_entry.get("salary_task_sum", 0) if is_paid else live_salary_task_sum
+    display_salary_task_count = payout_entry.get("salary_task_count", 0) if is_paid else len(worker_salary_tasks)
+    display_total = payout_entry.get("total", 0) if is_paid else live_total
+
+    return {
+        "period_key": period_key,
+        "period_label": format_period_label(period_key),
+        "worker": worker,
+        "services": credited_services,
+        "service_count": len(credited_services),
+        "service_sum": live_service_sum,
+        "purchases": purchase_entries,
+        "purchase_sum": live_purchase_sum,
+        "travels": worker_travels,
+        "travel_count": len(worker_travels),
+        "travel_sum": live_travel_sum,
+        "salary_tasks": worker_salary_tasks,
+        "salary_task_count": len(worker_salary_tasks),
+        "salary_task_sum": live_salary_task_sum,
+        "correction": correction,
+        "correction_note": payout_entry.get("correction_note", ""),
+        "total": live_total,
+        "status": payout_entry.get("status", PAYOUT_STATUS_PENDING),
+        "paid_date": payout_entry.get("paid_date", ""),
+        "paid_by": payout_entry.get("paid_by", ""),
+        "display_service_sum": display_service_sum,
+        "display_service_count": display_service_count,
+        "display_purchase_sum": display_purchase_sum,
+        "display_travel_sum": display_travel_sum,
+        "display_travel_count": display_travel_count,
+        "display_salary_task_sum": display_salary_task_sum,
+        "display_salary_task_count": display_salary_task_count,
+        "display_total": display_total,
+        "has_snapshot": is_paid,
+        "has_post_close_changes": is_paid and abs(live_total - display_total) > 0.009,
+    }
+
+
+def get_payout_screen_section(screen):
+    screen = str(screen or "")
+    for section in ("services", "purchases", "travels", "tasks"):
+        if screen == section or screen.startswith(f"{section}_"):
+            return section
+    return "overview"
+
+
+def get_payout_section_title(section):
+    return {
+        "services": "🔧 Обслуживания",
+        "purchases": "🛒 Закупки",
+        "travels": "🚌 Проезд",
+        "tasks": "🧰 Допзадачи",
+    }.get(section, "💼 Кирилл")
+
+
+def get_payout_section_records(settlement, section):
+    return {
+        "services": settlement.get("services", []),
+        "purchases": settlement.get("purchases", []),
+        "travels": settlement.get("travels", []),
+        "tasks": settlement.get("salary_tasks", []),
+    }.get(section, [])
+
+
+def get_payout_section_item_amount(item, section, settlement):
+    if section == "services":
+        return get_service_worker_amount(item, settlement["worker"])
+    if section == "purchases":
+        return parse_numeric_value(item.get("Сумма закупок", "")) or 0
+    if section == "travels":
+        return parse_numeric_value(item.get("Сумма", "")) or 0
+    if section == "tasks":
+        return parse_numeric_value(item.get("Сумма", "")) or 0
+    return 0
+
+
+def build_payout_point_token(section, date_str, point):
+    raw = f"{section}|{date_str}|{point}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:10]
+
+
+def build_payout_date_groups(settlement, section):
+    grouped = {}
+    for item in get_payout_section_records(settlement, section):
+        date_key = str(item.get("Дата", "")).strip()
+        if not date_key:
+            continue
+        bucket = grouped.setdefault(date_key, {"date": date_key, "items": [], "amount": 0, "count": 0})
+        bucket["items"].append(item)
+        bucket["count"] += 1
+        bucket["amount"] += get_payout_section_item_amount(item, section, settlement)
+
+    return sorted(
+        grouped.values(),
+        key=lambda bucket: parse_date(bucket["date"]) or datetime.min,
+        reverse=True,
+    )
+
+
+def build_payout_point_groups(settlement, section, date_str):
+    grouped = {}
+    for item in get_payout_section_records(settlement, section):
+        if str(item.get("Дата", "")).strip() != str(date_str).strip():
+            continue
+        point = str(item.get("Точка", "")).strip() or "Без точки"
+        bucket = grouped.setdefault(point, {"point": point, "items": [], "amount": 0})
+        bucket["items"].append(item)
+        bucket["amount"] += get_payout_section_item_amount(item, section, settlement)
+
+    ordered = []
+    for point in order_points(set(grouped.keys())):
+        ordered.append(grouped[point])
+    return ordered
+
+
+def build_payout_service_entry_compact_text(entry, settlement):
+    lines = [f"<b>#{entry['__row']}</b>"]
+    lines.append(escape_html(build_service_entry_text(entry)))
+    service_sum = get_service_worker_amount(entry, settlement["worker"])
+    purchase_sum = parse_numeric_value(entry.get("Сумма закупок", "")) or 0
+    if service_sum:
+        lines.append(f"💰 В выплату: {format_money_spaced(service_sum)}")
+    if purchase_sum:
+        lines.append(f"🛒 Сумма закупок: {format_money_spaced(purchase_sum)}")
+    return "\n".join(lines)
+
+
+def build_payout_travel_entry_compact_text(entry):
+    return "\n".join(
+        [
+            f"<b>#{entry['__row']}</b>",
+            f"📅 {escape_html(entry.get('Дата', ''))}",
+            f"💰 {format_money_spaced(entry.get('Сумма', 0))}",
+        ]
+    )
+
+
+def build_payout_salary_task_entry_compact_text(entry):
+    description = str(entry.get("Описание", "")).strip() or "Без описания"
+    lines = [
+        f"<b>#{entry['__row']}</b>",
+        f"📅 {escape_html(entry.get('Дата', ''))}",
+        f"📝 {escape_html(description)}",
+        f"💰 {format_money_spaced(entry.get('Сумма', 0))}",
+    ]
+    added_by = str(entry.get("Кто добавил", "")).strip()
+    if added_by:
+        lines.append(f"👤 Добавил: {escape_html(added_by)}")
+    return "\n".join(lines)
+
+
+def build_payout_date_menu_text(section, settlement):
+    title = get_payout_section_title(section)
+    lines = [f"<b>{title} — {escape_html(settlement['period_label'])}</b>", ""]
+    groups = build_payout_date_groups(settlement, section)
+    if not groups:
+        empty_text = {
+            "services": "⚪ За выбранный месяц обслуживаний в выплату не найдено.",
+            "purchases": "⚪ За выбранный месяц закупок нет.",
+            "travels": "⚪ За выбранный месяц записей проезда нет.",
+            "tasks": "⚪ За выбранный месяц допзадач нет.",
+        }.get(section, "⚪ За выбранный месяц записей нет.")
+        lines.append(empty_text)
+        return "\n".join(lines)
+
+    lines.append("Сначала выберите дату:")
+    lines.append("")
+    for bucket in groups:
+        lines.append(
+            f"• {escape_html(bucket['date'])} — {bucket['count']} зап. · {format_money_spaced(bucket['amount'])}"
+        )
+    lines.extend(
+        [
+            "",
+            "━━━━━━━━━━━━━━━━",
+        ]
+    )
+    if section == "services":
+        lines.append(
+            f"Итого: {settlement['service_count']} × {format_money_spaced(SERVICE_PRICE)} = "
+            f"{format_money_spaced(settlement['service_sum'])}"
+        )
+    elif section == "purchases":
+        lines.append(f"Итого: {format_money_spaced(settlement['purchase_sum'])}")
+    elif section == "travels":
+        lines.append(
+            f"Итого: {settlement['travel_count']} записей — {format_money_spaced(settlement['travel_sum'])}"
+        )
+    else:
+        lines.append(f"Итого: {format_money_spaced(settlement['salary_task_sum'])}")
+    return "\n".join(lines)
+
+
+def build_payout_point_menu_text(section, settlement, date_str):
+    title = get_payout_section_title(section)
+    lines = [
+        f"<b>{title} — {escape_html(settlement['period_label'])}</b>",
+        "",
+        f"📅 {escape_html(date_str)}",
+        "",
+    ]
+    groups = build_payout_point_groups(settlement, section, date_str)
+    if not groups:
+        lines.append("⚪ За выбранную дату записей по точкам не найдено.")
+        return "\n".join(lines)
+    lines.append("Теперь выберите точку:")
+    lines.append("")
+    for bucket in groups:
+        lines.append(
+            f"• {escape_html(bucket['point'])} — {len(bucket['items'])} зап. · {format_money_spaced(bucket['amount'])}"
+        )
+    return "\n".join(lines)
+
+
+def build_payout_entries_menu_text(section, settlement, date_str, point=None):
+    title = get_payout_section_title(section)
+    lines = [
+        f"<b>{title} — {escape_html(settlement['period_label'])}</b>",
+        "",
+        f"📅 {escape_html(date_str)}",
+    ]
+    if point:
+        lines.append(f"📍 {escape_html(point)}")
+    lines.append("")
+
+    items = [
+        item for item in get_payout_section_records(settlement, section)
+        if str(item.get("Дата", "")).strip() == str(date_str).strip()
+        and (point is None or (str(item.get("Точка", "")).strip() or "Без точки") == point)
+    ]
+    items.sort(key=lambda item: int(item.get("__row", 0)), reverse=True)
+
+    if not items:
+        lines.append("⚪ Записей не найдено.")
+        return "\n".join(lines)
+
+    if section == "purchases":
+        lines.append("Удаление строки удалит всю запись обслуживания целиком.")
+        lines.append("")
+
+    for idx, item in enumerate(items, start=1):
+        lines.append(f"{idx}.")
+        if section in {"services", "purchases"}:
+            lines.append(build_payout_service_entry_compact_text(item, settlement))
+        elif section == "travels":
+            lines.append(build_payout_travel_entry_compact_text(item))
+        else:
+            lines.append(build_payout_salary_task_entry_compact_text(item))
+        if idx != len(items):
+            lines.append("")
+            lines.append("────────")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def build_payout_date_menu_markup(section, settlement, can_edit):
+    keyboard = []
+    for bucket in build_payout_date_groups(settlement, section):
+        label = (
+            f"{bucket['date']} · {len(bucket['items'])} зап. · "
+            f"{format_money_spaced(bucket['amount'])}"
+        )
+        keyboard.append(
+            [InlineKeyboardButton(label, callback_data=f"payout_date:{section}:{bucket['date']}")]
+        )
+    if can_edit:
+        add_callback = {
+            "services": "payout_service_add",
+            "travels": "payout_travel_add",
+            "tasks": "payout_task_add",
+        }.get(section)
+        if add_callback:
+            add_title = {
+                "services": "➕ Добавить обслуживание",
+                "travels": "➕ Добавить проезд",
+                "tasks": "➕ Добавить допзадачу",
+            }[section]
+            keyboard.append([InlineKeyboardButton(add_title, callback_data=add_callback)])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="payout_screen:overview")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_payout_point_menu_markup(section, settlement, date_str):
+    keyboard = []
+    for bucket in build_payout_point_groups(settlement, section, date_str):
+        label = (
+            f"{bucket['point']} · {len(bucket['items'])} зап. · "
+            f"{format_money_spaced(bucket['amount'])}"
+        )
+        token = build_payout_point_token(section, date_str, bucket["point"])
+        keyboard.append(
+            [InlineKeyboardButton(label, callback_data=f"payout_point:{section}:{date_str}:{token}")]
+        )
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"payout_screen:{section}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_payout_entries_menu_markup(section, settlement, can_edit, date_str, point=None):
+    keyboard = []
+    items = [
+        item for item in get_payout_section_records(settlement, section)
+        if str(item.get("Дата", "")).strip() == str(date_str).strip()
+        and (point is None or (str(item.get("Точка", "")).strip() or "Без точки") == point)
+    ]
+    items.sort(key=lambda item: int(item.get("__row", 0)), reverse=True)
+
+    if can_edit:
+        for item in items:
+            if section == "services":
+                label = f"#{item['__row']} · {item.get('Кто', '?')} · {format_number(item.get('Вода(бут)', 0))} бут"
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(f"✏️ {label}", callback_data=f"payout_service_edit:{item['__row']}"),
+                        InlineKeyboardButton("🗑", callback_data=f"payout_service_del:{item['__row']}"),
+                    ]
+                )
+            elif section == "purchases":
+                label = (
+                    f"#{item['__row']} · {item.get('Точка', '?')} · "
+                    f"{format_money_spaced(item.get('Сумма закупок', 0))}"
+                )
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(f"✏️ {label}", callback_data=f"payout_purchase_edit:{item['__row']}"),
+                        InlineKeyboardButton("🗑", callback_data=f"payout_purchase_del:{item['__row']}"),
+                    ]
+                )
+            elif section == "travels":
+                label = f"#{item['__row']} · {format_money_spaced(item.get('Сумма', 0))}"
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(f"✏️ {label}", callback_data=f"payout_travel_edit:{item['__row']}"),
+                        InlineKeyboardButton("🗑", callback_data=f"payout_travel_del:{item['__row']}"),
+                    ]
+                )
+            elif section == "tasks":
+                description = str(item.get("Описание", "")).strip() or "Без описания"
+                label = f"#{item['__row']} · {description[:20]}"
+                keyboard.append(
+                    [
+                        InlineKeyboardButton(f"✏️ {label}", callback_data=f"payout_task_edit:{item['__row']}"),
+                        InlineKeyboardButton("🗑", callback_data=f"payout_task_del:{item['__row']}"),
+                    ]
+                )
+
+        add_callback = {
+            "services": "payout_service_add",
+            "travels": "payout_travel_add",
+            "tasks": "payout_task_add",
+        }.get(section)
+        if add_callback:
+            add_title = {
+                "services": "➕ Добавить обслуживание",
+                "travels": "➕ Добавить проезд",
+                "tasks": "➕ Добавить допзадачу",
+            }[section]
+            keyboard.append([InlineKeyboardButton(add_title, callback_data=add_callback)])
+
+    back_screen = {
+        "services": "services_points",
+        "purchases": "purchases_points",
+        "travels": "travels",
+        "tasks": "tasks",
+    }[section]
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"payout_screen:{back_screen}")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_payout_month_menu_text():
+    return "<b>💼 Кирилл — итоги и выплата</b>\n\nВыберите месяц:"
+
+
+def build_payout_month_menu_markup(period_keys, sources):
+    keyboard = []
+    for period_key in period_keys:
+        settlement = compute_kirill_settlement(period_key, sources=sources)
+        label = (
+            f"{get_payout_status_icon(settlement['status'])} "
+            f"{format_period_label(period_key)} · {format_money_spaced(get_payout_display_total(settlement))}"
+        )
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"payout_month:{period_key}")])
+    keyboard.append([InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")])
+    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_payout_overview_text(settlement, notice=None):
+    lines = [f"<b>💼 {escape_html(settlement['worker'])} — итоги и выплата</b>"]
+    if notice:
+        lines.extend([escape_html(notice), ""])
+    lines.extend(
+        [
+            f"📅 {escape_html(settlement['period_label'])}",
+            "",
+        ]
+    )
+    if settlement["status"] == PAYOUT_STATUS_PAID:
+        lines.append(f"✅ Переведено: {format_money_spaced(settlement['display_total'])}")
+        if settlement.get("paid_date") or settlement.get("paid_by"):
+            paid_bits = [part for part in [settlement.get("paid_date", ""), settlement.get("paid_by", "")] if part]
+            lines.append(f"🧾 {' · '.join(escape_html(part) for part in paid_bits)}")
+    else:
+        lines.append(f"⚪ К переводу: {format_money_spaced(settlement['display_total'])}")
+
+    lines.extend(
+        [
+            "",
+            (
+                f"🔧 Обслуживания: {settlement['display_service_count']} × "
+                f"{format_money_spaced(SERVICE_PRICE)} = {format_money_spaced(settlement['display_service_sum'])}"
+            ),
+            f"🛒 Закупки: {format_money_spaced(settlement['display_purchase_sum'])}",
+            (
+                f"🚌 Проезд: {format_money_spaced(settlement['display_travel_sum'])} "
+                f"({settlement['display_travel_count']} записей)"
+            ),
+        ]
+    )
+    if settlement["display_salary_task_sum"]:
+        lines.append(
+            f"🧰 Допзадачи: {format_money_spaced(settlement['display_salary_task_sum'])}"
+            f" ({settlement['display_salary_task_count']})"
+        )
+    lines.append(f"✏️ Корректировка: {format_money_spaced(settlement['correction'])}")
+    if settlement.get("correction_note"):
+        lines.append(f"📝 {escape_html(settlement['correction_note'])}")
+    lines.extend(
+        [
+            "━━━━━━━━━━━━━━━━",
+            f"💰 Итого: {format_money_spaced(settlement['display_total'])}",
+        ]
+    )
+    if settlement.get("has_post_close_changes"):
+        lines.extend(
+            [
+                "",
+                "ℹ️ После закрытия месяца исходные записи изменились.",
+                "Вверху показана зафиксированная сумма перевода.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def build_payout_overview_markup(can_edit, can_manage_payment, settlement):
+    keyboard = [
+        [InlineKeyboardButton("🔧 Обслуживания", callback_data="payout_screen:services")],
+        [InlineKeyboardButton("🛒 Закупки", callback_data="payout_screen:purchases")],
+        [InlineKeyboardButton("🚌 Проезд", callback_data="payout_screen:travels")],
+        [InlineKeyboardButton("🧰 Допзадачи", callback_data="payout_screen:tasks")],
+    ]
+    if can_edit:
+        keyboard.append([InlineKeyboardButton("✏️ Корректировка", callback_data="payout_correction")])
+    if settlement["status"] == PAYOUT_STATUS_PAID:
+        if can_manage_payment:
+            keyboard.append([InlineKeyboardButton("↩️ Снять отметку", callback_data="payout_unmark_paid")])
+    elif can_manage_payment:
+        keyboard.append([InlineKeyboardButton("✅ Перевёл", callback_data="payout_mark_paid")])
+    keyboard.append([InlineKeyboardButton("🔄 Сменить месяц", callback_data="payout_screen:months")])
+    keyboard.append([InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")])
+    keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_payout_services_text(settlement):
+    lines = [f"<b>🔧 Обслуживания — {escape_html(settlement['period_label'])}</b>", ""]
+    if not settlement["services"]:
+        lines.append("⚪ За выбранный месяц обслуживаний в выплату не найдено.")
+        return "\n".join(lines)
+
+    grouped = {}
+    for service in settlement["services"]:
+        grouped.setdefault(service.get("Точка", "") or "Без точки", []).append(service)
+
+    for point in order_points(set(grouped.keys())):
+        items = grouped.get(point, [])
+        point_sum = sum(get_service_worker_amount(item, settlement["worker"]) for item in items)
+        lines.append(
+            f"📍 {escape_html(point)} "
+            f"({len(items)} × {format_money_spaced(SERVICE_PRICE)} = {format_money_spaced(point_sum)})"
+        )
+        for item in items:
+            row = f"• {escape_html(format_short_date_label(item.get('Дата', '')))}"
+            actor = str(item.get("Кто", "")).strip()
+            if actor and actor != settlement["worker"]:
+                row += f" — {escape_html(actor)} → в ЗП {escape_html(settlement['worker'])}"
+            lines.append(row)
+        lines.append("")
+
+    if lines[-1] == "":
+        lines.pop()
+    lines.extend(
+        [
+            "━━━━━━━━━━━━━━━━",
+            (
+                f"Итого: {settlement['service_count']} × {format_money_spaced(SERVICE_PRICE)} = "
+                f"{format_money_spaced(settlement['service_sum'])}"
+            ),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_payout_services_markup(settlement, can_edit):
+    keyboard = []
+    if can_edit:
+        for item in settlement["services"]:
+            label = f"{format_short_date_label(item.get('Дата', ''))} · {item.get('Точка', '?')}"
+            keyboard.append(
+                [
+                    InlineKeyboardButton(f"✏️ {label}", callback_data=f"payout_service_edit:{item['__row']}"),
+                    InlineKeyboardButton("🗑", callback_data=f"payout_service_del:{item['__row']}"),
+                ]
+            )
+        keyboard.append([InlineKeyboardButton("➕ Добавить обслуживание", callback_data="payout_service_add")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="payout_screen:overview")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_payout_purchases_text(settlement):
+    lines = [f"<b>🛒 Закупки — {escape_html(settlement['period_label'])}</b>", ""]
+    if not settlement["purchases"]:
+        lines.append("⚪ За выбранный месяц закупок нет.")
+        return "\n".join(lines)
+
+    lines.append("Удаление строки удалит всю запись обслуживания целиком.")
+    lines.append("")
+    for item in settlement["purchases"]:
+        point = str(item.get("Точка", "")).strip() or "Без точки"
+        purchases = str(item.get("Закупки", "")).strip() or "Без списка"
+        lines.append(
+            f"• {escape_html(format_short_date_label(item.get('Дата', '')))} — "
+            f"{escape_html(point)} — {format_money_spaced(item.get('Сумма закупок', 0))}"
+        )
+        lines.append(f"↳ {escape_html(purchases)}")
+    lines.extend(["", "━━━━━━━━━━━━━━━━", f"Итого: {format_money_spaced(settlement['purchase_sum'])}"])
+    return "\n".join(lines)
+
+
+def build_payout_purchases_markup(settlement, can_edit):
+    keyboard = []
+    if can_edit:
+        for item in settlement["purchases"]:
+            label = (
+                f"{format_short_date_label(item.get('Дата', ''))} · "
+                f"{item.get('Точка', '?')} · {format_money_spaced(item.get('Сумма закупок', 0))}"
+            )
+            keyboard.append(
+                [
+                    InlineKeyboardButton(f"✏️ {label}", callback_data=f"payout_purchase_edit:{item['__row']}"),
+                    InlineKeyboardButton("🗑", callback_data=f"payout_purchase_del:{item['__row']}"),
+                ]
+            )
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="payout_screen:overview")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_payout_travels_text(settlement):
+    lines = [f"<b>🚌 Проезд — {escape_html(settlement['period_label'])}</b>", ""]
+    if not settlement["travels"]:
+        lines.append("⚪ За выбранный месяц записей проезда нет.")
+        return "\n".join(lines)
+
+    for item in settlement["travels"]:
+        lines.append(
+            f"• {escape_html(format_short_date_label(item.get('Дата', '')))} — "
+            f"{format_money_spaced(item.get('Сумма', 0))}"
+        )
+    lines.extend(
+        [
+            "",
+            "━━━━━━━━━━━━━━━━",
+            f"Итого: {settlement['travel_count']} записей — {format_money_spaced(settlement['travel_sum'])}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_payout_travels_markup(settlement, can_edit):
+    keyboard = []
+    if can_edit:
+        for item in settlement["travels"]:
+            label = f"{format_short_date_label(item.get('Дата', ''))} · {format_money_spaced(item.get('Сумма', 0))}"
+            keyboard.append(
+                [
+                    InlineKeyboardButton(f"✏️ {label}", callback_data=f"payout_travel_edit:{item['__row']}"),
+                    InlineKeyboardButton("🗑", callback_data=f"payout_travel_del:{item['__row']}"),
+                ]
+            )
+        keyboard.append([InlineKeyboardButton("➕ Добавить проезд", callback_data="payout_travel_add")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="payout_screen:overview")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_payout_salary_tasks_text(settlement):
+    lines = [f"<b>🧰 Допзадачи — {escape_html(settlement['period_label'])}</b>", ""]
+    if not settlement["salary_tasks"]:
+        lines.append("⚪ За выбранный месяц допзадач нет.")
+        return "\n".join(lines)
+
+    for item in settlement["salary_tasks"]:
+        description = str(item.get("Описание", "")).strip() or "Без описания"
+        lines.append(
+            f"• {escape_html(format_short_date_label(item.get('Дата', '')))} — "
+            f"{escape_html(description)} ({format_money_spaced(item.get('Сумма', 0))})"
+        )
+    lines.extend(
+        [
+            "",
+            "━━━━━━━━━━━━━━━━",
+            f"Итого: {format_money_spaced(settlement['salary_task_sum'])}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_payout_salary_tasks_markup(can_edit):
+    keyboard = []
+    if can_edit:
+        keyboard.append([InlineKeyboardButton("➕ Добавить допзадачу", callback_data="payout_task_add")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="payout_screen:overview")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def show_salary_report_screen(query, context, worker):
+    if worker != PAYOUT_WORKER:
+        await show_text_screen(
+            query,
+            context,
+            f"❌ Для {worker} единый экран пока не настроен.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+            ]),
+        )
+        return REPORT_MENU_SECTION
+    user_id = getattr(getattr(query, "from_user", None), "id", None)
+    if user_id not in PAYOUT_VIEWERS:
+        await show_text_screen(
+            query,
+            context,
+            "⛔ Этот экран доступен не всем.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+            ]),
+        )
+        return REPORT_MENU_SECTION
+    return await show_payout_overview_screen(query, context)
+
+
 async def report_period_menu(update: Update, context):
     query = update.callback_query
     await query.answer()
     kb = [
         [InlineKeyboardButton("За неделю", callback_data="rp_week")],
-        [InlineKeyboardButton("За месяц", callback_data="rp_month")],
+        [InlineKeyboardButton("Текущий месяц", callback_data="rp_month_current")],
+        [InlineKeyboardButton("Прошлый месяц", callback_data="rp_month_prev")],
         [InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")],
         [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
     ]
@@ -10928,62 +17952,24 @@ async def report_period_handler(update: Update, context):
         await show_loading_state(query, context, "Собираю отчёт за период...")
         services = await run_blocking(get_all_services)
         travels = await run_blocking(get_all_travels)
-
-        now = now_local()
-        if d == "rp_week":
-            start_date = now - timedelta(days=7)
-            period_name = "неделю"
+        salary_tasks = await run_blocking(get_all_salary_tasks)
+        config = get_report_period_config(d)
+        if not config:
+            text = "❌ Не удалось определить период."
         else:
-            start_date = now - timedelta(days=30)
-            period_name = "месяц"
-
-        def in_period(date_str):
-            try:
-                dt = datetime.strptime(str(date_str), "%d.%m.%Y")
-                return dt >= start_date
-            except Exception:
-                return False
-
-        p_svc = [s for s in services if in_period(s.get("Дата", ""))]
-        p_trv = [t for t in travels if in_period(t.get("Дата", ""))]
-
-        text = f"📈 Отчёт за {period_name}:\n\n"
-
-        workers_all = set()
-        for s in p_svc:
-            workers_all.add(s.get("Кто", "?"))
-        for t in p_trv:
-            workers_all.add(t.get("Кто", "?"))
-
-        if not workers_all:
-            text += "Нет данных"
-        else:
-            grand_total = 0
-            for w in sorted(workers_all):
-                w_svc = [s for s in p_svc if s.get("Кто") == w]
-                w_trv = [t for t in p_trv if t.get("Кто") == w]
-
-                svc_sum = sum(int(s.get("Сумма обслуж", 0)) for s in w_svc)
-                purch_sum = sum(int(s.get("Сумма закупок", 0)) for s in w_svc)
-                trv_sum = sum(int(t.get("Сумма", 0)) for t in w_trv)
-
-                text += f"👤 {w}:\n"
-                if w_svc:
-                    text += f"  🔧 Обслуживаний: {len(w_svc)} ({svc_sum}₽)\n"
-                if purch_sum:
-                    text += f"  🛒 Закупки: {purch_sum}₽\n"
-                if trv_sum:
-                    text += f"  🚌 Проезд: {trv_sum}₽\n"
-
-                w_total = svc_sum + purch_sum + trv_sum
-                if w in PAID_WORKERS:
-                    text += f"  💰 Итого к выплате: {w_total}₽\n"
-                else:
-                    text += f"  💰 Расходы: {purch_sum + trv_sum}₽\n"
-                text += "\n"
-                grand_total += w_total
-
-            text += f"━━━━━━━━━━━━━━━━\n💰 Общие расходы: {grand_total}₽"
+            p_svc = [
+                service for service in services
+                if is_date_in_report_range(service.get("Дата", ""), config["start_date"], config["end_date"])
+            ]
+            p_trv = [
+                travel for travel in travels
+                if is_date_in_report_range(travel.get("Дата", ""), config["start_date"], config["end_date"])
+            ]
+            p_tasks = [
+                task for task in salary_tasks
+                if is_date_in_report_range(task.get("Дата", ""), config["start_date"], config["end_date"])
+            ]
+            text = build_period_report_text(config["title"], p_svc, p_trv, p_tasks)
 
     except Exception:
         logger.exception("Failed to build period report")
@@ -11242,6 +18228,7 @@ async def reminder_loop(application):
 
 
 async def on_app_startup(application):
+    await run_blocking(get_user_directory)
     if ALLOWED_GROUP_CHAT_IDS:
         try:
             await process_group_reminders(application)
@@ -11265,20 +18252,38 @@ def main():
         raise RuntimeError("BOT_TOKEN is not set")
     if not SPREADSHEET_ID:
         raise RuntimeError("SPREADSHEET_ID is not set")
+    if PHOTO_CHAT_ID is None:
+        raise RuntimeError("PHOTO_CHAT_ID is not set")
+    persistence = PicklePersistence(filepath=resolve_runtime_path(PERSISTENCE_FILE))
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .persistence(persistence)
         .post_init(on_app_startup)
         .post_shutdown(on_app_shutdown)
         .build()
     )
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(
+                group_report_edit_service_entry_handler,
+                pattern=r"^grp_report_edit_service_\d+$",
+            ),
+            CallbackQueryHandler(
+                group_report_edit_revision_entry_handler,
+                pattern=r"^grp_report_edit_revision_\d+$",
+            ),
+        ],
+        allow_reentry=True,
+        name="coffee_bot_conv",
+        persistent=True,
         states={
             MAIN_MENU: [CallbackQueryHandler(main_menu_handler)],
             SERVICE_MENU_SECTION: [CallbackQueryHandler(service_section_handler)],
             REPORT_MENU_SECTION: [CallbackQueryHandler(report_section_handler)],
+            PAYOUT_SCREEN: [CallbackQueryHandler(payout_handler)],
             RENT_MENU_SECTION: [CallbackQueryHandler(rent_menu_handler)],
             REPAIR_MENU_SECTION: [CallbackQueryHandler(repair_menu_handler)],
             INFO_MENU: [CallbackQueryHandler(info_handler)],
@@ -11318,7 +18323,9 @@ def main():
             ],
             SERVICE_SHORTAGE_NEXT_VISIT: [CallbackQueryHandler(service_short_next_visit_handler)],
             SERVICE_CONFIRM: [CallbackQueryHandler(service_confirm_handler)],
+            TRAVEL_MENU: [CallbackQueryHandler(travel_menu_handler)],
             TRAVEL_WHO: [CallbackQueryHandler(travel_who_handler)],
+            TRAVEL_HISTORY_PERIOD: [CallbackQueryHandler(travel_history_period_handler)],
             TRAVEL_DATE: [CallbackQueryHandler(travel_date_handler)],
             TRAVEL_DATE_CUSTOM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, travel_date_custom_handler),
@@ -11400,6 +18407,49 @@ def main():
             REPAIR_HISTORY_MACHINE: [CallbackQueryHandler(repair_menu_handler)],
             REPORT_DAY: [CallbackQueryHandler(report_day_handler)],
             REPORT_PERIOD: [CallbackQueryHandler(report_period_handler)],
+            SALARY_TASK_WORKER: [CallbackQueryHandler(salary_task_worker_handler)],
+            SALARY_TASK_DATE: [CallbackQueryHandler(salary_task_date_handler)],
+            SALARY_TASK_DATE_CUSTOM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, salary_task_date_custom_handler),
+                CallbackQueryHandler(salary_task_date_custom_back_handler),
+            ],
+            SALARY_TASK_DESCRIPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, salary_task_description_handler),
+                CallbackQueryHandler(salary_task_description_handler),
+            ],
+            SALARY_TASK_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, salary_task_amount_handler),
+                CallbackQueryHandler(salary_task_amount_handler),
+            ],
+            SALARY_TASK_CONFIRM: [CallbackQueryHandler(salary_task_confirm_handler)],
+            PAYOUT_CORRECTION_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payout_correction_amount_handler),
+                CallbackQueryHandler(payout_correction_amount_back_handler),
+            ],
+            PAYOUT_CORRECTION_NOTE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payout_correction_note_handler),
+                CallbackQueryHandler(payout_correction_note_back_handler),
+            ],
+            PAYOUT_TRAVEL_EDIT_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payout_travel_edit_amount_handler),
+                CallbackQueryHandler(payout_travel_edit_amount_back_handler),
+            ],
+            PAYOUT_TRAVEL_EDIT_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payout_travel_edit_date_handler),
+                CallbackQueryHandler(payout_travel_edit_date_back_handler),
+            ],
+            PAYOUT_TASK_EDIT_DESCRIPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payout_task_edit_description_handler),
+                CallbackQueryHandler(payout_task_edit_description_back_handler),
+            ],
+            PAYOUT_TASK_EDIT_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payout_task_edit_amount_handler),
+                CallbackQueryHandler(payout_task_edit_amount_back_handler),
+            ],
+            PAYOUT_TASK_EDIT_DATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payout_task_edit_date_handler),
+                CallbackQueryHandler(payout_task_edit_date_back_handler),
+            ],
             DELETE_DATE: [CallbackQueryHandler(delete_date_handler)],
             DELETE_DATE_CUSTOM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, delete_date_custom_handler),
@@ -11435,6 +18485,10 @@ def main():
         fallbacks=[
             CommandHandler("start", start),
             CommandHandler("ids", cmd_ids),
+            CommandHandler("service_duplicates", cmd_service_duplicates),
+            CommandHandler("dupes", cmd_service_duplicates),
+            CommandHandler("delete_service_rows", cmd_delete_service_rows),
+            CommandHandler("delrows", cmd_delete_service_rows),
         ],
     )
 
@@ -11443,7 +18497,17 @@ def main():
     app.add_handler(CommandHandler("ids", cmd_ids))
     app.add_handler(CommandHandler("shortages", cmd_shortages))
     app.add_handler(CommandHandler("reports", cmd_reports))
-    app.add_handler(CallbackQueryHandler(group_report_callback_handler, pattern=r"^grp_report_(save|ignore|delete)_\d+$"))
+    app.add_handler(CommandHandler("service_duplicates", cmd_service_duplicates))
+    app.add_handler(CommandHandler("dupes", cmd_service_duplicates))
+    app.add_handler(CommandHandler("delete_service_rows", cmd_delete_service_rows))
+    app.add_handler(CommandHandler("delrows", cmd_delete_service_rows))
+    app.add_handler(CallbackQueryHandler(service_duplicate_callback_handler, pattern=r"^svcdup:"))
+    app.add_handler(
+        CallbackQueryHandler(
+            group_report_callback_handler,
+            pattern=r"^grp_report_",
+        )
+    )
     app.add_handler(MessageHandler((filters.PHOTO | (filters.TEXT & ~filters.COMMAND)), group_report_message_handler))
     app.add_error_handler(global_error_handler)
     logger.info("🤖 Бот запущен")
