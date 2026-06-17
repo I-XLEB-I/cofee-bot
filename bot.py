@@ -607,7 +607,11 @@ def get_sheet():
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    credentials_json = os.getenv("CREDENTIALS_JSON", "").strip()
+    if credentials_json:
+        creds = Credentials.from_service_account_info(json.loads(credentials_json), scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     client = gspread.authorize(creds)
     book = client.open_by_key(SPREADSHEET_ID)
     _BOOK_CACHE["book"] = book
