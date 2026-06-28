@@ -2591,19 +2591,49 @@ def resolve_runtime_path(path_value):
     return Path(__file__).resolve().parent / path
 
 
-def load_reminder_state():
+REMINDER_STATE_CACHE_KEY = "_reminder_state"
+
+
+def load_reminder_state(application=None):
+    if application is not None:
+        cached_state = application.bot_data.get(REMINDER_STATE_CACHE_KEY)
+        if isinstance(cached_state, dict):
+            return cached_state
+
     path = resolve_runtime_path(REMINDER_STATE_FILE)
     if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+        state = {}
+    else:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Failed to load reminder state from %s; using empty state", path)
+            state = {}
+
+    if not isinstance(state, dict):
+        state = {}
+
+    if application is not None:
+        application.bot_data[REMINDER_STATE_CACHE_KEY] = state
+
+    return state
 
 
-def save_reminder_state(state):
+def save_reminder_state(state, application=None):
+    if not isinstance(state, dict):
+        state = {}
+
+    if application is not None:
+        application.bot_data[REMINDER_STATE_CACHE_KEY] = state
+
     path = resolve_runtime_path(REMINDER_STATE_FILE)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+    except OSError:
+        logger.exception("Failed to save reminder state to %s", path)
 
 
 MONTH_NAMES_RU = [
@@ -18525,7 +18555,7 @@ async def cleanup_expired_service_today_posts(application, state, current_dt):
         changed = True
 
     if changed:
-        save_reminder_state(state)
+        save_reminder_state(state, application)
 
 
 async def cleanup_expired_group_reminders(application, state, current_dt):
@@ -18558,7 +18588,7 @@ async def cleanup_expired_group_reminders(application, state, current_dt):
         changed = True
 
     if changed:
-        save_reminder_state(state)
+        save_reminder_state(state, application)
 
 
 async def refresh_group_service_today_posts(application, force=False):
@@ -18574,7 +18604,7 @@ async def refresh_group_service_today_posts(application, force=False):
     text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
     date_str = format_date(current_dt)
 
-    state = load_reminder_state()
+    state = load_reminder_state(application)
     posts = get_service_today_post_state(state)
     changed = False
 
@@ -18639,11 +18669,11 @@ async def refresh_group_service_today_posts(application, force=False):
             logger.exception("Failed to refresh service-today post in chat %s", chat_id)
 
     if changed:
-        save_reminder_state(state)
+        save_reminder_state(state, application)
 
 
 async def maybe_send_group_reminder(application, reminder_key, text):
-    state = load_reminder_state()
+    state = load_reminder_state(application)
     sent = state.setdefault("sent", {})
     reminders = get_group_reminder_message_state(state)
     changed = False
@@ -18665,7 +18695,7 @@ async def maybe_send_group_reminder(application, reminder_key, text):
             logger.exception("Failed to send reminder %s to chat %s", reminder_key, chat_id)
 
     if changed:
-        save_reminder_state(state)
+        save_reminder_state(state, application)
 
 
 async def process_group_reminders(application):
@@ -18675,7 +18705,7 @@ async def process_group_reminders(application):
     current_date = now_local().date()
     current_dt = now_local()
     period_key = build_period_key(current_date.year, current_date.month)
-    state = load_reminder_state()
+    state = load_reminder_state(application)
 
     await cleanup_expired_service_today_posts(application, state, current_dt)
     await cleanup_expired_group_reminders(application, state, current_dt)
@@ -18709,6 +18739,7 @@ async def reminder_loop(application):
 
 async def on_app_startup(application):
     await run_blocking(get_user_directory)
+    load_reminder_state(application)
     if ALLOWED_GROUP_CHAT_IDS:
         try:
             await process_group_reminders(application)
