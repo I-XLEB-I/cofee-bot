@@ -19002,7 +19002,8 @@ def main():
     app.add_handler(MessageHandler((filters.PHOTO | (filters.TEXT & ~filters.COMMAND)), group_report_message_handler))
     app.add_error_handler(global_error_handler)
     logger.info("🤖 Бот запущен")
-    app.run_polling()
+    # Keep retrying bootstrap requests when Telegram is temporarily unreachable.
+    app.run_polling(bootstrap_retries=-1)
 
 if __name__ == "__main__":
     main()
