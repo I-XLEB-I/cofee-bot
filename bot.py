@@ -85,26 +85,85 @@ else:
 USER_DIRECTORY_SHEET = "Пользователи"
 USER_DIRECTORY_HEADERS = ["telegram_id", "имя", "роль"]
 
-DEPRECATED_USERS = {
+USER_ROLE_WORKER = "worker"
+USER_ROLE_PAID_WORKER = "paid_worker"
+USER_ROLE_PAYOUT_VIEWER = "payout_viewer"
+USER_ROLE_PAYOUT_EDITOR = "payout_editor"
+
+
+def normalize_role_token(value):
+    return re.sub(r"[^0-9a-zа-яё]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+USER_ROLE_ALIAS_MAP = {
+    normalize_role_token(alias): role
+    for role, aliases in {
+        USER_ROLE_WORKER: {
+            USER_ROLE_WORKER,
+            "сотрудник",
+            "работник",
+            "worker",
+            "staff",
+            "employee",
+        },
+        USER_ROLE_PAID_WORKER: {
+            USER_ROLE_PAID_WORKER,
+            "зп",
+            "зарплата",
+            "выплаты",
+            "salary",
+            "salary_worker",
+            "paid",
+            "paid_worker",
+        },
+        USER_ROLE_PAYOUT_VIEWER: {
+            USER_ROLE_PAYOUT_VIEWER,
+            "зп_просмотр",
+            "выплаты_просмотр",
+            "salary_viewer",
+            "payout_viewer",
+            "viewer",
+        },
+        USER_ROLE_PAYOUT_EDITOR: {
+            USER_ROLE_PAYOUT_EDITOR,
+            "зп_редактор",
+            "выплаты_редактор",
+            "salary_editor",
+            "payout_editor",
+            "editor",
+        },
+    }.items()
+    for alias in aliases
+}
+
+DEPRECATED_USER_DIRECTORY = {
     # DEPRECATED: перенести в Sheets.
-    1395822345: "Матвей",
-    611556433: "Владислав",
-    5075547917: "Начальник",
-    874403512: "Кирилл",
+    1395822345: {
+        "name": "Матвей",
+        "roles": [USER_ROLE_WORKER, USER_ROLE_PAYOUT_VIEWER, USER_ROLE_PAYOUT_EDITOR],
+    },
+    611556433: {
+        "name": "Владислав",
+        "roles": [USER_ROLE_WORKER],
+    },
+    5075547917: {
+        "name": "Начальник",
+        "roles": [USER_ROLE_WORKER],
+    },
+    874403512: {
+        "name": "Кирилл",
+        "roles": [USER_ROLE_WORKER, USER_ROLE_PAID_WORKER, USER_ROLE_PAYOUT_VIEWER],
+    },
+    8370154716: {
+        "name": "Александр",
+        "roles": [USER_ROLE_WORKER, USER_ROLE_PAID_WORKER, USER_ROLE_PAYOUT_VIEWER],
+    },
 }
 ALLOWED_USER_IDS = parse_env_id_set("ALLOWED_USER_IDS")
 ALLOWED_GROUP_CHAT_IDS = parse_env_id_set("ALLOWED_GROUP_CHAT_IDS")
 
-PAID_WORKERS = ["Кирилл"]
 SERVICE_PRICE = 250
 DEFAULT_FARE = 48
-WORKERS = ["Кирилл", "Матвей", "Владислав", "Начальник"]
-OWNER_ID = 5075547917
-MATVEY_ID = 1395822345
-KIRILL_ID = 874403512
-PAYOUT_WORKER = "Кирилл"
-PAYOUT_VIEWERS = {MATVEY_ID, KIRILL_ID}
-PAYOUT_EDITORS = {MATVEY_ID}
 PAYOUT_SHEET = "Выплаты"
 PAYOUT_STATUS_PENDING = "ожидает"
 PAYOUT_STATUS_PAID = "переведено"
@@ -386,24 +445,64 @@ def parse_users_json(raw_value):
         raise RuntimeError("USERS_JSON must be valid JSON") from exc
 
     if not isinstance(payload, dict):
-        raise RuntimeError("USERS_JSON must be a JSON object mapping Telegram IDs to names")
+        raise RuntimeError("USERS_JSON must be a JSON object mapping Telegram IDs to names or user objects")
 
-    users = {}
-    for raw_id, raw_name in payload.items():
+    entries = {}
+    for raw_id, raw_user in payload.items():
         try:
             telegram_id = int(str(raw_id).strip())
         except ValueError as exc:
             raise RuntimeError("USERS_JSON keys must be Telegram integer IDs") from exc
 
-        name = str(raw_name).strip()
+        if isinstance(raw_user, dict):
+            name = str(raw_user.get("name", "")).strip()
+            raw_roles = raw_user.get("roles", "")
+        else:
+            name = str(raw_user).strip()
+            raw_roles = ""
         if not name:
-            raise RuntimeError("USERS_JSON values must be non-empty names")
-        users[telegram_id] = name
-    return users
+            raise RuntimeError("USERS_JSON values must include non-empty user names")
+        entries[telegram_id] = {
+            "telegram_id": telegram_id,
+            "name": name,
+            "roles": get_bootstrap_user_roles(telegram_id, name, raw_roles),
+        }
+    return entries
 
 
-def build_users_from_records(records):
-    users = {}
+def normalize_user_roles(raw_roles):
+    if isinstance(raw_roles, str):
+        parts = [part.strip() for part in re.split(r"[,;/|\n]+", raw_roles)]
+    elif isinstance(raw_roles, (list, tuple, set)):
+        parts = [str(part).strip() for part in raw_roles]
+    elif raw_roles in (None, ""):
+        parts = []
+    else:
+        parts = [str(raw_roles).strip()]
+
+    normalized = []
+    seen = set()
+    for part in parts:
+        token = normalize_role_token(part)
+        if not token:
+            continue
+        role = USER_ROLE_ALIAS_MAP.get(token)
+        if not role or role in seen:
+            continue
+        seen.add(role)
+        normalized.append(role)
+
+    if not normalized:
+        normalized.append(USER_ROLE_WORKER)
+    if USER_ROLE_PAYOUT_EDITOR in normalized and USER_ROLE_PAYOUT_VIEWER not in normalized:
+        normalized.append(USER_ROLE_PAYOUT_VIEWER)
+    if USER_ROLE_PAID_WORKER in normalized and USER_ROLE_WORKER not in normalized:
+        normalized.append(USER_ROLE_WORKER)
+    return normalized
+
+
+def build_user_directory_entries_from_records(records):
+    entries = {}
     for record in records:
         raw_id = str(record.get("telegram_id", "")).strip()
         name = str(record.get("имя", "")).strip()
@@ -421,20 +520,53 @@ def build_users_from_records(records):
         except ValueError:
             logger.warning("Skipping invalid telegram_id in %s: %r", USER_DIRECTORY_SHEET, raw_id)
             continue
-        users[telegram_id] = name
-    return users
+        entries[telegram_id] = {
+            "telegram_id": telegram_id,
+            "name": name,
+            "roles": get_bootstrap_user_roles(telegram_id, name, record.get("роль", "")),
+        }
+    return entries
+
+
+def build_user_directory_entries_from_fallback():
+    return {
+        telegram_id: {
+            "telegram_id": telegram_id,
+            "name": str(payload.get("name", "")).strip(),
+            "roles": normalize_user_roles(payload.get("roles", [])),
+        }
+        for telegram_id, payload in DEPRECATED_USER_DIRECTORY.items()
+        if str(payload.get("name", "")).strip()
+    }
+
+
+def get_bootstrap_user_roles(telegram_id, name, raw_roles):
+    if str(raw_roles or "").strip():
+        return normalize_user_roles(raw_roles)
+
+    payload = DEPRECATED_USER_DIRECTORY.get(telegram_id)
+    if payload:
+        return normalize_user_roles(payload.get("roles", []))
+
+    normalized_name = normalize_text_key(name)
+    for deprecated_payload in DEPRECATED_USER_DIRECTORY.values():
+        deprecated_name = str(deprecated_payload.get("name", "")).strip()
+        if deprecated_name and normalize_text_key(deprecated_name) == normalized_name:
+            return normalize_user_roles(deprecated_payload.get("roles", []))
+
+    return normalize_user_roles([])
 
 
 @lru_cache(maxsize=1)
-def get_user_directory():
+def get_user_directory_entries():
     if USERS_JSON:
         return parse_users_json(USERS_JSON)
 
     try:
         get_or_create_worksheet(USER_DIRECTORY_SHEET, USER_DIRECTORY_HEADERS)
-        users = build_users_from_records(get_records(USER_DIRECTORY_SHEET, USER_DIRECTORY_HEADERS))
-        if users:
-            return users
+        entries = build_user_directory_entries_from_records(get_records(USER_DIRECTORY_SHEET, USER_DIRECTORY_HEADERS))
+        if entries:
+            return entries
         logger.warning(
             "%s is empty, using deprecated user directory fallback",
             USER_DIRECTORY_SHEET,
@@ -445,11 +577,67 @@ def get_user_directory():
             USER_DIRECTORY_SHEET,
         )
 
-    return dict(DEPRECATED_USERS)
+    return build_user_directory_entries_from_fallback()
+
+
+@lru_cache(maxsize=1)
+def get_user_directory():
+    return {
+        telegram_id: payload["name"]
+        for telegram_id, payload in get_user_directory_entries().items()
+    }
+
+
+def get_users_with_role(role):
+    return [
+        payload
+        for payload in get_user_directory_entries().values()
+        if role in payload.get("roles", [])
+    ]
+
+
+@lru_cache(maxsize=1)
+def get_worker_names():
+    return [
+        payload["name"]
+        for payload in sorted(get_user_directory_entries().values(), key=lambda item: item["telegram_id"])
+        if payload.get("name")
+    ]
+
+
+@lru_cache(maxsize=1)
+def get_paid_workers():
+    return [
+        payload["name"]
+        for payload in sorted(get_users_with_role(USER_ROLE_PAID_WORKER), key=lambda item: item["telegram_id"])
+        if payload.get("name")
+    ]
+
+
+@lru_cache(maxsize=1)
+def get_payout_viewer_ids():
+    return {
+        payload["telegram_id"]
+        for payload in get_user_directory_entries().values()
+        if USER_ROLE_PAYOUT_VIEWER in payload.get("roles", [])
+        or USER_ROLE_PAYOUT_EDITOR in payload.get("roles", [])
+    }
+
+
+@lru_cache(maxsize=1)
+def get_payout_editor_ids():
+    return {
+        payload["telegram_id"]
+        for payload in get_user_directory_entries().values()
+        if USER_ROLE_PAYOUT_EDITOR in payload.get("roles", [])
+    }
 
 
 def get_allowed_user_ids():
-    return ALLOWED_USER_IDS or set(get_user_directory().keys())
+    directory_ids = set(get_user_directory().keys())
+    if ALLOWED_USER_IDS:
+        return directory_ids | ALLOWED_USER_IDS
+    return directory_ids
 
 
 def get_configured_user_name(user_id):
@@ -465,12 +653,12 @@ def is_allowed_user(update):
 
 def is_payout_viewer(update):
     user = getattr(update, "effective_user", None)
-    return bool(user and user.id in PAYOUT_VIEWERS)
+    return bool(user and user.id in get_payout_viewer_ids())
 
 
 def is_payout_editor(update):
     user = getattr(update, "effective_user", None)
-    return bool(user and user.id in PAYOUT_EDITORS)
+    return bool(user and user.id in get_payout_editor_ids())
 
 
 def is_allowed_group_chat(update):
@@ -679,7 +867,7 @@ def append_row_and_get_index(sheet, values):
 
 def default_service_salary_workers(who):
     worker = str(who or "").strip()
-    if worker in PAID_WORKERS:
+    if worker in get_paid_workers():
         return [worker]
     return []
 
@@ -727,14 +915,15 @@ def get_service_salary_workers_from_context(svc):
 
 
 def calculate_service_sum_for_workers(workers):
-    paid_count = sum(1 for worker in normalize_salary_workers(workers) if worker in PAID_WORKERS)
+    paid_workers = set(get_paid_workers())
+    paid_count = sum(1 for worker in normalize_salary_workers(workers) if worker in paid_workers)
     return SERVICE_PRICE * paid_count
 
 
 def build_service_row_values(data):
     salary_workers = normalize_salary_workers(data.get("salary_workers"))
     salary_workers_raw = serialize_salary_workers(salary_workers)
-    if not salary_workers_raw and "salary_workers" in data and str(data.get("who", "")).strip() in PAID_WORKERS:
+    if not salary_workers_raw and "salary_workers" in data and str(data.get("who", "")).strip() in set(get_paid_workers()):
         salary_workers_raw = "нет"
     return [
         data["date"], data["who"], data["point"], data["water"],
@@ -2785,7 +2974,7 @@ def resolve_worker_name(value):
     if not normalized:
         return None
 
-    for worker in WORKERS:
+    for worker in get_worker_names():
         if normalize_text_key(worker) == normalized:
             return worker
 
@@ -3283,11 +3472,21 @@ def clear_payout_context(context):
     context.user_data.pop("payout", None)
 
 
+def get_selected_payout_worker(context):
+    payout = get_payout_context(context)
+    worker = str(payout.get("worker", "")).strip()
+    paid_workers = get_paid_workers()
+    if worker in paid_workers:
+        return worker
+    return paid_workers[0] if paid_workers else ""
+
+
 def build_payout_return_context(period_key, screen="overview"):
     return {
         "return_mode": "payout",
         "return_period": period_key,
         "return_screen": screen,
+        "return_worker": get_default_payout_worker_name(),
     }
 
 
@@ -6919,8 +7118,9 @@ def build_travel_month_all_text(travels, reference_date):
     if not totals_by_day:
         return f"💰 Проезд — все сотрудники\n\n📆 {month_caption}\n\n⚪ За этот месяц нет корректных сумм."
 
-    known_people = [name for name in WORKERS if name in totals_by_person]
-    other_people = sorted(name for name in totals_by_person if name not in WORKERS)
+    worker_names = get_worker_names()
+    known_people = [name for name in worker_names if name in totals_by_person]
+    other_people = sorted(name for name in totals_by_person if name not in worker_names)
     ordered_people = known_people + other_people
 
     lines = ["💰 Проезд — все сотрудники", "", f"📆 {month_caption}", "", "📅 По дням"]
@@ -7396,7 +7596,7 @@ async def show_fix_entry_salary_menu(query, context, notice=None):
         text = f"{notice}\n\n{text}"
 
     kb = []
-    for idx, worker in enumerate(PAID_WORKERS):
+    for idx, worker in enumerate(get_paid_workers()):
         prefix = "✅" if worker in selected_workers else "⚪"
         kb.append([InlineKeyboardButton(f"{prefix} {worker}", callback_data=f"fix_entry_salary_toggle_{idx}")])
     kb.append([
@@ -11727,7 +11927,10 @@ async def show_salary_task_worker_menu(query, context, notice=None):
     text = "🧰 Задача / доплата\n\nКому добавить выплату?"
     if notice:
         text = f"{notice}\n\n{text}"
-    keyboard = [[InlineKeyboardButton(worker, callback_data=f"salary_task_worker_{idx}")] for idx, worker in enumerate(PAID_WORKERS)]
+    keyboard = [
+        [InlineKeyboardButton(worker, callback_data=f"salary_task_worker_{idx}")]
+        for idx, worker in enumerate(get_paid_workers())
+    ]
     keyboard.append([InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")])
     keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
     await show_text_screen(query, context, text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -11818,8 +12021,10 @@ async def show_salary_task_saved_screen(query, context, entry):
     text = "✅ Задача добавлена в ЗП\n\n" + build_salary_task_confirm_text(entry)
     keyboard_rows = []
     user_id = getattr(getattr(query, "from_user", None), "id", None)
-    if worker == "Кирилл" and user_id in PAYOUT_VIEWERS:
-        keyboard_rows.append([InlineKeyboardButton(get_default_salary_button_label(), callback_data="report_salary_kirill")])
+    if worker in get_paid_workers() and user_id in get_payout_viewer_ids():
+        keyboard_rows.append(
+            [InlineKeyboardButton(get_salary_button_label(worker), callback_data=f"report_salary_worker:{worker}")]
+        )
     keyboard_rows.append([InlineKeyboardButton("➕ Ещё задача", callback_data="report_salary_task")])
     keyboard_rows.append([InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")])
     keyboard_rows.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
@@ -11837,7 +12042,7 @@ def get_default_payout_period_key():
 
 def is_payout_editor_target(target):
     user_id = getattr(getattr(target, "from_user", None), "id", None)
-    return user_id in PAYOUT_EDITORS
+    return user_id in get_payout_editor_ids()
 
 
 def get_payout_screen_access(query, settlement):
@@ -11880,9 +12085,10 @@ async def show_payout_failure_screen(query, context, text, retry_callback, back_
     return PAYOUT_SCREEN
 
 
-async def load_payout_settlement_with_timeout(period_key):
+async def load_payout_settlement_with_timeout(period_key, worker=None):
+    worker = str(worker or get_default_payout_worker_name()).strip()
     return await asyncio.wait_for(
-        run_blocking(compute_kirill_settlement, period_key),
+        run_blocking(compute_payout_settlement, period_key, worker=worker),
         timeout=PAYOUT_SCREEN_LOAD_TIMEOUT_SECONDS,
     )
 
@@ -11896,17 +12102,22 @@ async def load_payout_sources_with_timeout():
 
 async def show_payout_overview_screen(query, context, period_key=None, notice=None):
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
     payout["period"] = period_key or payout.get("period") or get_default_payout_period_key()
     payout["screen"] = "overview"
-    await show_loading_state(query, context, "Собираю итог по Кириллу...")
+    worker = get_selected_payout_worker(context)
+    await show_loading_state(query, context, f"Собираю итог по {worker}...")
     try:
-        settlement = await load_payout_settlement_with_timeout(payout["period"])
+        settlement = await asyncio.wait_for(
+            run_blocking(compute_payout_settlement, payout["period"], worker=worker),
+            timeout=PAYOUT_SCREEN_LOAD_TIMEOUT_SECONDS,
+        )
     except asyncio.TimeoutError:
         logger.warning("Payout overview timed out for period %s", payout["period"])
         return await show_payout_failure_screen(
             query,
             context,
-            "⏳ Экран Кирилла отвечает слишком долго. Попробуй ещё раз.",
+            "⏳ Экран выплат отвечает слишком долго. Попробуй ещё раз.",
             retry_callback="payout_open",
             back_callback="back_reports_menu",
         )
@@ -11918,7 +12129,7 @@ async def show_payout_overview_screen(query, context, period_key=None, notice=No
         return await show_payout_failure_screen(
             query,
             context,
-            "❌ Не удалось открыть экран Кирилла.",
+            "❌ Не удалось открыть экран выплат.",
             retry_callback="payout_open",
             back_callback="back_reports_menu",
         )
@@ -11927,7 +12138,7 @@ async def show_payout_overview_screen(query, context, period_key=None, notice=No
         return await show_payout_failure_screen(
             query,
             context,
-            "❌ Не удалось открыть экран Кирилла.",
+            "❌ Не удалось открыть экран выплат.",
             retry_callback="payout_open",
             back_callback="back_reports_menu",
         )
@@ -11945,7 +12156,7 @@ async def show_payout_overview_screen(query, context, period_key=None, notice=No
         return await show_payout_failure_screen(
             query,
             context,
-            "❌ Экран Кирилла не удалось отрисовать.",
+            "❌ Экран выплат не удалось отрисовать.",
             retry_callback="payout_open",
             back_callback="back_reports_menu",
         )
@@ -11954,17 +12165,19 @@ async def show_payout_overview_screen(query, context, period_key=None, notice=No
 
 async def show_payout_month_menu_screen(query, context):
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
     payout["period"] = payout.get("period") or get_default_payout_period_key()
     payout["screen"] = "months"
     await show_loading_state(query, context, "Загружаю месяцы...")
     period_keys = recent_completed_period_keys(6)
+    worker = get_selected_payout_worker(context)
     try:
         sources = await load_payout_sources_with_timeout()
         await show_text_screen(
             query,
             context,
-            build_payout_month_menu_text(),
-            reply_markup=build_payout_month_menu_markup(period_keys, sources),
+            build_payout_month_menu_text(worker),
+            reply_markup=build_payout_month_menu_markup(period_keys, sources, worker),
             parse_mode="HTML",
         )
     except asyncio.TimeoutError:
@@ -11989,7 +12202,7 @@ async def show_payout_month_menu_screen(query, context):
         return await show_payout_failure_screen(
             query,
             context,
-            "❌ Не удалось загрузить месяцы Кирилла.",
+            "❌ Не удалось загрузить месяцы выплат.",
             retry_callback="payout_screen:months",
             back_callback="payout_screen:overview",
         )
@@ -11998,7 +12211,7 @@ async def show_payout_month_menu_screen(query, context):
         return await show_payout_failure_screen(
             query,
             context,
-            "❌ Не удалось загрузить месяцы Кирилла.",
+            "❌ Не удалось загрузить месяцы выплат.",
             retry_callback="payout_screen:months",
             back_callback="payout_screen:overview",
         )
@@ -12077,10 +12290,11 @@ def build_payout_screen_payload(context, target, settlement, screen, notice=None
 
 async def show_payout_services_screen(query, context, notice=None):
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
     payout["period"] = payout.get("period") or get_default_payout_period_key()
     payout["screen"] = "services"
     await show_loading_state(query, context, "Загружаю обслуживания...")
-    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    settlement = await run_blocking(compute_payout_settlement, payout["period"], worker=get_selected_payout_worker(context))
     _, text, markup = build_payout_screen_payload(context, query, settlement, "services", notice=notice)
     await show_text_screen(
         query,
@@ -12094,10 +12308,11 @@ async def show_payout_services_screen(query, context, notice=None):
 
 async def show_payout_purchases_screen(query, context, notice=None):
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
     payout["period"] = payout.get("period") or get_default_payout_period_key()
     payout["screen"] = "purchases"
     await show_loading_state(query, context, "Загружаю закупки...")
-    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    settlement = await run_blocking(compute_payout_settlement, payout["period"], worker=get_selected_payout_worker(context))
     _, text, markup = build_payout_screen_payload(context, query, settlement, "purchases", notice=notice)
     await show_text_screen(
         query,
@@ -12111,10 +12326,11 @@ async def show_payout_purchases_screen(query, context, notice=None):
 
 async def show_payout_travels_screen(query, context, notice=None):
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
     payout["period"] = payout.get("period") or get_default_payout_period_key()
     payout["screen"] = "travels"
     await show_loading_state(query, context, "Загружаю проезд...")
-    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    settlement = await run_blocking(compute_payout_settlement, payout["period"], worker=get_selected_payout_worker(context))
     _, text, markup = build_payout_screen_payload(context, query, settlement, "travels", notice=notice)
     await show_text_screen(
         query,
@@ -12128,10 +12344,11 @@ async def show_payout_travels_screen(query, context, notice=None):
 
 async def show_payout_salary_tasks_screen(query, context, notice=None):
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
     payout["period"] = payout.get("period") or get_default_payout_period_key()
     payout["screen"] = "tasks"
     await show_loading_state(query, context, "Загружаю допзадачи...")
-    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    settlement = await run_blocking(compute_payout_settlement, payout["period"], worker=get_selected_payout_worker(context))
     _, text, markup = build_payout_screen_payload(context, query, settlement, "tasks", notice=notice)
     await show_text_screen(
         query,
@@ -12149,13 +12366,18 @@ async def show_payout_screen(query, context, screen="overview", period_key=None,
     if period_key:
         get_payout_context(context)["period"] = period_key
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
     payout["period"] = payout.get("period") or get_default_payout_period_key()
     payout["screen"] = screen
-    await show_loading_state(query, context, "Обновляю экран Кирилла...")
+    worker = get_selected_payout_worker(context)
+    await show_loading_state(query, context, f"Обновляю экран выплат: {worker}...")
     retry_callback = get_payout_retry_callback(screen)
     back_callback = "payout_screen:overview" if screen != "overview" else "back_reports_menu"
     try:
-        settlement = await load_payout_settlement_with_timeout(payout["period"])
+        settlement = await asyncio.wait_for(
+            run_blocking(compute_payout_settlement, payout["period"], worker=worker),
+            timeout=PAYOUT_SCREEN_LOAD_TIMEOUT_SECONDS,
+        )
         effective_screen, text, markup = build_payout_screen_payload(context, query, settlement, screen, notice=notice)
         payout["screen"] = effective_screen
         await show_text_screen(query, context, text, reply_markup=markup, parse_mode="HTML")
@@ -12164,7 +12386,7 @@ async def show_payout_screen(query, context, screen="overview", period_key=None,
         return await show_payout_failure_screen(
             query,
             context,
-            "⏳ Экран Кирилла отвечает слишком долго. Попробуй ещё раз.",
+            "⏳ Экран выплат отвечает слишком долго. Попробуй ещё раз.",
             retry_callback=retry_callback,
             back_callback=back_callback,
         )
@@ -12176,7 +12398,7 @@ async def show_payout_screen(query, context, screen="overview", period_key=None,
         return await show_payout_failure_screen(
             query,
             context,
-            "❌ Не удалось открыть экран Кирилла.",
+            "❌ Не удалось открыть экран выплат.",
             retry_callback=retry_callback,
             back_callback=back_callback,
         )
@@ -12185,7 +12407,7 @@ async def show_payout_screen(query, context, screen="overview", period_key=None,
         return await show_payout_failure_screen(
             query,
             context,
-            "❌ Не удалось открыть экран Кирилла.",
+            "❌ Не удалось открыть экран выплат.",
             retry_callback=retry_callback,
             back_callback=back_callback,
         )
@@ -12194,6 +12416,7 @@ async def show_payout_screen(query, context, screen="overview", period_key=None,
 
 async def render_payout_screen_target(target, context, screen="overview", period_key=None, notice=None):
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
     payout["period"] = period_key or payout.get("period") or get_default_payout_period_key()
     payout["screen"] = screen
 
@@ -12202,38 +12425,48 @@ async def render_payout_screen_target(target, context, screen="overview", period
         await render_text_screen(
             target,
             context,
-            build_payout_month_menu_text(),
-            reply_markup=build_payout_month_menu_markup(recent_completed_period_keys(6), sources),
+            build_payout_month_menu_text(get_selected_payout_worker(context)),
+            reply_markup=build_payout_month_menu_markup(
+                recent_completed_period_keys(6),
+                sources,
+                get_selected_payout_worker(context),
+            ),
             parse_mode="HTML",
         )
         return PAYOUT_SCREEN
 
-    settlement = await run_blocking(compute_kirill_settlement, payout["period"])
+    settlement = await run_blocking(
+        compute_payout_settlement,
+        payout["period"],
+        worker=get_selected_payout_worker(context),
+    )
     effective_screen, text, markup = build_payout_screen_payload(context, target, settlement, screen, notice=notice)
     payout["screen"] = effective_screen
     await render_text_screen(target, context, text, reply_markup=markup, parse_mode="HTML")
     return PAYOUT_SCREEN
 
 
-async def get_payout_service_entry(period_key, row_num, mode="service"):
+async def get_payout_service_entry(period_key, row_num, worker, mode="service"):
     services = await run_blocking(get_all_services_with_rows)
     entry = next((item for item in services if int(item.get("__row", 0)) == row_num), None)
     if not entry or not is_date_in_period_key(entry.get("Дата", ""), period_key):
         return None
     if mode == "purchase":
-        if str(entry.get("Кто", "")).strip() != PAYOUT_WORKER:
+        if str(entry.get("Кто", "")).strip() != worker:
             return None
         has_purchase = parse_numeric_value(entry.get("Сумма закупок", "")) or str(entry.get("Закупки", "")).strip()
         return entry if has_purchase else None
-    return entry if PAYOUT_WORKER in get_service_salary_workers(entry) else None
+    return entry if worker in get_service_salary_workers(entry) else None
 
 
 async def begin_payout_service_edit(query, context, row_num, screen):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
+    worker = get_selected_payout_worker(context)
     entry = await get_payout_service_entry(
         period_key,
         row_num,
+        worker,
         mode="purchase" if str(screen).startswith("purchases") else "service",
     )
     if not entry:
@@ -12248,9 +12481,11 @@ async def begin_payout_service_edit(query, context, row_num, screen):
 async def confirm_payout_service_delete(query, context, row_num, screen):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
+    worker = get_selected_payout_worker(context)
     entry = await get_payout_service_entry(
         period_key,
         row_num,
+        worker,
         mode="purchase" if str(screen).startswith("purchases") else "service",
     )
     if not entry:
@@ -12270,9 +12505,11 @@ async def confirm_payout_service_delete(query, context, row_num, screen):
 async def delete_payout_service(query, context, row_num, screen):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
+    worker = get_selected_payout_worker(context)
     entry = await get_payout_service_entry(
         period_key,
         row_num,
+        worker,
         mode="purchase" if str(screen).startswith("purchases") else "service",
     )
     if not entry:
@@ -12287,24 +12524,24 @@ async def delete_payout_service(query, context, row_num, screen):
     return await show_payout_screen(query, context, screen=screen, notice="✅ Запись удалена.")
 
 
-async def get_payout_travel_entry(period_key, row_num):
+async def get_payout_travel_entry(period_key, row_num, worker):
     travels = await run_blocking(get_all_travels_with_rows)
     entry = next((item for item in travels if int(item.get("__row", 0)) == row_num), None)
     if not entry:
         return None
-    if str(entry.get("Кто", "")).strip() != PAYOUT_WORKER:
+    if str(entry.get("Кто", "")).strip() != worker:
         return None
     if not is_date_in_period_key(entry.get("Дата", ""), period_key):
         return None
     return entry
 
 
-async def get_payout_salary_task_entry(period_key, row_num):
+async def get_payout_salary_task_entry(period_key, row_num, worker):
     tasks = await run_blocking(get_all_salary_tasks_with_rows)
     entry = next((item for item in tasks if int(item.get("__row", 0)) == row_num), None)
     if not entry:
         return None
-    if str(entry.get("Кто", "")).strip() != PAYOUT_WORKER:
+    if str(entry.get("Кто", "")).strip() != worker:
         return None
     if not is_date_in_period_key(entry.get("Дата", ""), period_key):
         return None
@@ -12314,7 +12551,7 @@ async def get_payout_salary_task_entry(period_key, row_num):
 async def show_payout_travel_edit_card(query, context, row_num, notice=None):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
-    entry = await get_payout_travel_entry(period_key, row_num)
+    entry = await get_payout_travel_entry(period_key, row_num, get_selected_payout_worker(context))
     if not entry:
         return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
     payout["editing_travel_row"] = row_num
@@ -12344,7 +12581,7 @@ async def show_payout_travel_edit_card(query, context, row_num, notice=None):
 async def show_payout_salary_task_edit_card(query, context, row_num, notice=None):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
-    entry = await get_payout_salary_task_entry(period_key, row_num)
+    entry = await get_payout_salary_task_entry(period_key, row_num, get_selected_payout_worker(context))
     if not entry:
         return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
     payout["editing_task_row"] = row_num
@@ -12378,13 +12615,17 @@ async def start_payout_service_add_flow(query, context):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
     return_screen = payout.get("screen", "services")
+    worker = get_selected_payout_worker(context)
     if get_payout_screen_section(return_screen) != "services":
         return_screen = "services"
     context.user_data["svc"] = {
-        "who": PAYOUT_WORKER,
+        "who": worker,
         "locked_who": True,
         "allowed_period": period_key,
-        **build_payout_return_context(period_key, screen=return_screen),
+        **{
+            **build_payout_return_context(period_key, screen=return_screen),
+            "return_worker": worker,
+        },
     }
     return await show_service_date_menu(query, context)
 
@@ -12393,15 +12634,17 @@ async def start_payout_travel_add_flow(query, context):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
     return_screen = payout.get("screen", "travels")
+    worker = get_selected_payout_worker(context)
     if get_payout_screen_section(return_screen) != "travels":
         return_screen = "travels"
     context.user_data["travel_mode"] = "add"
-    context.user_data["travel_who"] = PAYOUT_WORKER
+    context.user_data["travel_who"] = worker
     context.user_data.pop("travel_date", None)
     context.user_data["travel_allowed_period"] = period_key
     context.user_data["travel_return_mode"] = "payout"
     context.user_data["travel_return_period"] = period_key
     context.user_data["travel_return_screen"] = return_screen
+    context.user_data["travel_return_worker"] = worker
     return await show_travel_date_menu(query, context)
 
 
@@ -12409,13 +12652,17 @@ async def start_payout_salary_task_add_flow(query, context):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
     return_screen = payout.get("screen", "tasks")
+    worker = get_selected_payout_worker(context)
     if get_payout_screen_section(return_screen) != "tasks":
         return_screen = "tasks"
     return await start_salary_task_flow(
         query,
         context,
-        preset_worker=PAYOUT_WORKER,
-        return_context=build_payout_return_context(period_key, screen=return_screen),
+        preset_worker=worker,
+        return_context={
+            **build_payout_return_context(period_key, screen=return_screen),
+            "return_worker": worker,
+        },
     )
 
 
@@ -12427,6 +12674,8 @@ async def payout_handler(update: Update, context):
     await query.answer()
     data = query.data
     payout = get_payout_context(context)
+    payout["worker"] = payout.get("worker") or get_default_payout_worker_name()
+    worker = get_selected_payout_worker(context)
     period_key = payout.get("period") or get_default_payout_period_key()
 
     if data == "back_main":
@@ -12450,7 +12699,7 @@ async def payout_handler(update: Update, context):
         return await show_payout_screen(query, context, screen=f"{section}_entries")
     if data.startswith("payout_point:"):
         _, section, date_str, token = data.split(":", 3)
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         point_groups = build_payout_point_groups(settlement, section, date_str)
         point = next(
             (
@@ -12467,9 +12716,9 @@ async def payout_handler(update: Update, context):
         return await show_payout_screen(query, context, screen=f"{section}_entries")
 
     if data == "payout_correction":
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         if not get_payout_screen_access(query, settlement):
-            await query.answer("Только Матвей", show_alert=True)
+            await query.answer("Только редактор выплат", show_alert=True)
             return PAYOUT_SCREEN
         payout["screen"] = "overview"
         text = (
@@ -12487,9 +12736,9 @@ async def payout_handler(update: Update, context):
         return PAYOUT_CORRECTION_AMOUNT
 
     if data == "payout_mark_paid":
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         if not get_payout_screen_access(query, settlement):
-            await query.answer("Только Матвей", show_alert=True)
+            await query.answer("Только редактор выплат", show_alert=True)
             return PAYOUT_SCREEN
         await show_text_screen(
             query,
@@ -12510,18 +12759,18 @@ async def payout_handler(update: Update, context):
         return PAYOUT_SCREEN
 
     if data == "payout_mark_paid_yes":
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         if not get_payout_screen_access(query, settlement):
-            await query.answer("Только Матвей", show_alert=True)
+            await query.answer("Только редактор выплат", show_alert=True)
             return PAYOUT_SCREEN
-        await run_blocking(mark_payout_paid, period_key, PAYOUT_WORKER, get_actor_label(update), settlement)
+        await run_blocking(mark_payout_paid, period_key, worker, get_actor_label(update), settlement)
         return await show_payout_overview_screen(query, context, period_key=period_key, notice="✅ Месяц закрыт.")
 
     if data == "payout_unmark_paid":
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         user_id = getattr(getattr(query, "from_user", None), "id", None)
-        if user_id not in PAYOUT_EDITORS:
-            await query.answer("Только Матвей", show_alert=True)
+        if user_id not in get_payout_editor_ids():
+            await query.answer("Только редактор выплат", show_alert=True)
             return PAYOUT_SCREEN
         await show_text_screen(
             query,
@@ -12539,28 +12788,28 @@ async def payout_handler(update: Update, context):
 
     if data == "payout_unmark_paid_yes":
         user_id = getattr(getattr(query, "from_user", None), "id", None)
-        if user_id not in PAYOUT_EDITORS:
-            await query.answer("Только Матвей", show_alert=True)
+        if user_id not in get_payout_editor_ids():
+            await query.answer("Только редактор выплат", show_alert=True)
             return PAYOUT_SCREEN
-        await run_blocking(unmark_payout_paid, period_key, PAYOUT_WORKER)
+        await run_blocking(unmark_payout_paid, period_key, worker)
         return await show_payout_overview_screen(query, context, period_key=period_key, notice="↩️ Отметка снята.")
 
     if data == "payout_service_add":
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         if not get_payout_screen_access(query, settlement):
             await query.answer("Месяц закрыт для редактирования.", show_alert=True)
             return PAYOUT_SCREEN
         return await start_payout_service_add_flow(query, context)
 
     if data == "payout_travel_add":
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         if not get_payout_screen_access(query, settlement):
             await query.answer("Месяц закрыт для редактирования.", show_alert=True)
             return PAYOUT_SCREEN
         return await start_payout_travel_add_flow(query, context)
 
     if data == "payout_task_add":
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         if not get_payout_screen_access(query, settlement):
             await query.answer("Месяц закрыт для редактирования.", show_alert=True)
             return PAYOUT_SCREEN
@@ -12586,7 +12835,7 @@ async def payout_handler(update: Update, context):
             "payout_task_del_yes:",
         )
     ):
-        settlement = await run_blocking(compute_kirill_settlement, period_key)
+        settlement = await run_blocking(compute_payout_settlement, period_key, worker=worker)
         if not get_payout_screen_access(query, settlement):
             await query.answer("Месяц закрыт для редактирования.", show_alert=True)
             return PAYOUT_SCREEN
@@ -12619,7 +12868,7 @@ async def payout_handler(update: Update, context):
         return await show_payout_travel_edit_card(query, context, int(data.split(":")[1]))
     if data.startswith("payout_travel_edit_amount:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_travel_entry(period_key, row_num)
+        entry = await get_payout_travel_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
         payout["editing_travel_row"] = row_num
@@ -12638,7 +12887,7 @@ async def payout_handler(update: Update, context):
         return PAYOUT_TRAVEL_EDIT_AMOUNT
     if data.startswith("payout_travel_edit_date:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_travel_entry(period_key, row_num)
+        entry = await get_payout_travel_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
         payout["editing_travel_row"] = row_num
@@ -12657,7 +12906,7 @@ async def payout_handler(update: Update, context):
         return PAYOUT_TRAVEL_EDIT_DATE
     if data.startswith("payout_travel_del:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_travel_entry(period_key, row_num)
+        entry = await get_payout_travel_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
         await show_text_screen(
@@ -12674,7 +12923,7 @@ async def payout_handler(update: Update, context):
         return PAYOUT_SCREEN
     if data.startswith("payout_travel_del_yes:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_travel_entry(period_key, row_num)
+        entry = await get_payout_travel_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="travels_entries", notice="❌ Запись проезда не найдена.")
         await run_blocking(delete_travel_row, row_num)
@@ -12684,7 +12933,7 @@ async def payout_handler(update: Update, context):
         return await show_payout_salary_task_edit_card(query, context, int(data.split(":")[1]))
     if data.startswith("payout_task_edit_description:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_salary_task_entry(period_key, row_num)
+        entry = await get_payout_salary_task_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
         payout["editing_task_row"] = row_num
@@ -12702,7 +12951,7 @@ async def payout_handler(update: Update, context):
         return PAYOUT_TASK_EDIT_DESCRIPTION
     if data.startswith("payout_task_edit_amount:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_salary_task_entry(period_key, row_num)
+        entry = await get_payout_salary_task_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
         payout["editing_task_row"] = row_num
@@ -12720,7 +12969,7 @@ async def payout_handler(update: Update, context):
         return PAYOUT_TASK_EDIT_AMOUNT
     if data.startswith("payout_task_edit_date:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_salary_task_entry(period_key, row_num)
+        entry = await get_payout_salary_task_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
         payout["editing_task_row"] = row_num
@@ -12739,7 +12988,7 @@ async def payout_handler(update: Update, context):
         return PAYOUT_TASK_EDIT_DATE
     if data.startswith("payout_task_del:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_salary_task_entry(period_key, row_num)
+        entry = await get_payout_salary_task_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
         description = str(entry.get("Описание", "")).strip() or "Без описания"
@@ -12758,7 +13007,7 @@ async def payout_handler(update: Update, context):
         return PAYOUT_SCREEN
     if data.startswith("payout_task_del_yes:"):
         row_num = int(data.split(":")[1])
-        entry = await get_payout_salary_task_entry(period_key, row_num)
+        entry = await get_payout_salary_task_entry(period_key, row_num, worker)
         if not entry:
             return await show_payout_screen(query, context, screen="tasks_entries", notice="❌ Допзадача не найдена.")
         await run_blocking(delete_salary_task_row, row_num)
@@ -12778,7 +13027,7 @@ async def payout_correction_amount_back_handler(update: Update, context):
 
 async def payout_correction_amount_handler(update: Update, context):
     if not is_payout_editor(update):
-        await update.message.reply_text("⛔ Только Матвей может менять итог.")
+        await update.message.reply_text("⛔ Только редактор выплат может менять итог.")
         return PAYOUT_CORRECTION_AMOUNT
     raw_value = update.message.text.strip()
     normalized = raw_value.replace(" ", "")
@@ -12815,11 +13064,12 @@ async def payout_correction_note_back_handler(update: Update, context):
         return PAYOUT_CORRECTION_NOTE
 
     period_key = payout.get("period") or get_default_payout_period_key()
+    worker = get_selected_payout_worker(context)
     amount = payout.pop("correction_draft", 0)
     await run_blocking(
         upsert_payout,
         period_key,
-        PAYOUT_WORKER,
+        worker,
         {
             "correction": amount,
             "correction_note": "",
@@ -12830,16 +13080,17 @@ async def payout_correction_note_back_handler(update: Update, context):
 
 async def payout_correction_note_handler(update: Update, context):
     if not is_payout_editor(update):
-        await update.message.reply_text("⛔ Только Матвей может менять итог.")
+        await update.message.reply_text("⛔ Только редактор выплат может менять итог.")
         return PAYOUT_CORRECTION_NOTE
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
+    worker = get_selected_payout_worker(context)
     amount = payout.pop("correction_draft", 0)
     note = update.message.text.strip()
     await run_blocking(
         upsert_payout,
         period_key,
-        PAYOUT_WORKER,
+        worker,
         {
             "correction": amount,
             "correction_note": note,
@@ -12868,7 +13119,7 @@ async def payout_travel_edit_amount_handler(update: Update, context):
     travel_edit = context.user_data.get("travel_edit", {})
     if travel_edit.get("mode") == "general":
         if not is_payout_editor(update):
-            await update.message.reply_text("⛔ Только Матвей может менять проезд.")
+            await update.message.reply_text("⛔ Только редактор выплат может менять проезд.")
             return PAYOUT_TRAVEL_EDIT_AMOUNT
         try:
             amount = int(update.message.text.strip())
@@ -12899,7 +13150,7 @@ async def payout_travel_edit_amount_handler(update: Update, context):
         )
 
     if not is_payout_editor(update):
-        await update.message.reply_text("⛔ Только Матвей может менять проезд.")
+        await update.message.reply_text("⛔ Только редактор выплат может менять проезд.")
         return PAYOUT_TRAVEL_EDIT_AMOUNT
     try:
         amount = int(update.message.text.strip())
@@ -12917,7 +13168,7 @@ async def payout_travel_edit_amount_handler(update: Update, context):
     row_num = payout.get("editing_travel_row")
     period_key = payout.get("period") or get_default_payout_period_key()
     return_screen = payout.get("screen", "travels_entries")
-    entry = await get_payout_travel_entry(period_key, row_num)
+    entry = await get_payout_travel_entry(period_key, row_num, get_selected_payout_worker(context))
     if not entry:
         return await render_payout_screen_target(
             update.message,
@@ -12950,7 +13201,7 @@ async def payout_travel_edit_date_handler(update: Update, context):
     travel_edit = context.user_data.get("travel_edit", {})
     if travel_edit.get("mode") == "general":
         if not is_payout_editor(update):
-            await update.message.reply_text("⛔ Только Матвей может менять проезд.")
+            await update.message.reply_text("⛔ Только редактор выплат может менять проезд.")
             return PAYOUT_TRAVEL_EDIT_DATE
         parsed, error = validate_manual_date_input(update.message.text)
         row_num = travel_edit.get("row_num")
@@ -12981,7 +13232,7 @@ async def payout_travel_edit_date_handler(update: Update, context):
         )
 
     if not is_payout_editor(update):
-        await update.message.reply_text("⛔ Только Матвей может менять проезд.")
+        await update.message.reply_text("⛔ Только редактор выплат может менять проезд.")
         return PAYOUT_TRAVEL_EDIT_DATE
     parsed, error = validate_manual_date_input(update.message.text)
     row_num = get_payout_context(context).get("editing_travel_row")
@@ -12998,7 +13249,7 @@ async def payout_travel_edit_date_handler(update: Update, context):
         await update.message.reply_text(period_error, reply_markup=back_markup(f"payout_travel_edit:{row_num}"))
         return PAYOUT_TRAVEL_EDIT_DATE
 
-    entry = await get_payout_travel_entry(period_key, row_num)
+    entry = await get_payout_travel_entry(period_key, row_num, get_selected_payout_worker(context))
     if not entry:
         return await render_payout_screen_target(
             update.message,
@@ -13028,7 +13279,7 @@ async def payout_task_edit_description_back_handler(update: Update, context):
 
 async def payout_task_edit_description_handler(update: Update, context):
     if not is_payout_editor(update):
-        await update.message.reply_text("⛔ Только Матвей может менять допзадачи.")
+        await update.message.reply_text("⛔ Только редактор выплат может менять допзадачи.")
         return PAYOUT_TASK_EDIT_DESCRIPTION
     description = str(update.message.text or "").strip()
     row_num = get_payout_context(context).get("editing_task_row")
@@ -13042,7 +13293,7 @@ async def payout_task_edit_description_handler(update: Update, context):
     payout = get_payout_context(context)
     period_key = payout.get("period") or get_default_payout_period_key()
     return_screen = payout.get("screen", "tasks_entries")
-    entry = await get_payout_salary_task_entry(period_key, row_num)
+    entry = await get_payout_salary_task_entry(period_key, row_num, get_selected_payout_worker(context))
     if not entry:
         return await render_payout_screen_target(
             update.message,
@@ -13081,7 +13332,7 @@ async def payout_task_edit_amount_back_handler(update: Update, context):
 
 async def payout_task_edit_amount_handler(update: Update, context):
     if not is_payout_editor(update):
-        await update.message.reply_text("⛔ Только Матвей может менять допзадачи.")
+        await update.message.reply_text("⛔ Только редактор выплат может менять допзадачи.")
         return PAYOUT_TASK_EDIT_AMOUNT
     try:
         amount = normalize_number_text(update.message.text)
@@ -13097,7 +13348,7 @@ async def payout_task_edit_amount_handler(update: Update, context):
     row_num = payout.get("editing_task_row")
     period_key = payout.get("period") or get_default_payout_period_key()
     return_screen = payout.get("screen", "tasks_entries")
-    entry = await get_payout_salary_task_entry(period_key, row_num)
+    entry = await get_payout_salary_task_entry(period_key, row_num, get_selected_payout_worker(context))
     if not entry:
         return await render_payout_screen_target(
             update.message,
@@ -13136,7 +13387,7 @@ async def payout_task_edit_date_back_handler(update: Update, context):
 
 async def payout_task_edit_date_handler(update: Update, context):
     if not is_payout_editor(update):
-        await update.message.reply_text("⛔ Только Матвей может менять допзадачи.")
+        await update.message.reply_text("⛔ Только редактор выплат может менять допзадачи.")
         return PAYOUT_TASK_EDIT_DATE
     parsed, error = validate_manual_date_input(update.message.text)
     row_num = get_payout_context(context).get("editing_task_row")
@@ -13153,7 +13404,7 @@ async def payout_task_edit_date_handler(update: Update, context):
         await update.message.reply_text(period_error, reply_markup=back_markup(f"payout_task_edit:{row_num}"))
         return PAYOUT_TASK_EDIT_DATE
 
-    entry = await get_payout_salary_task_entry(period_key, row_num)
+    entry = await get_payout_salary_task_entry(period_key, row_num, get_selected_payout_worker(context))
     if not entry:
         return await render_payout_screen_target(
             update.message,
@@ -13184,15 +13435,18 @@ async def payout_task_edit_date_handler(update: Update, context):
 
 
 async def show_reports_section_menu(query, context):
-    salary_label = get_default_salary_button_label()
     keyboard = [
         [InlineKeyboardButton("📅 Отчёт за день", callback_data="report_day")],
         [InlineKeyboardButton("📆 Отчёт за период", callback_data="report_period")],
         [InlineKeyboardButton("➕ Задача / доплата", callback_data="report_salary_task")],
     ]
     user_id = getattr(getattr(query, "from_user", None), "id", None)
-    if user_id in PAYOUT_VIEWERS:
-        keyboard.insert(2, [InlineKeyboardButton(salary_label, callback_data="report_salary_kirill")])
+    if user_id in get_payout_viewer_ids():
+        payout_buttons = [
+            [InlineKeyboardButton(get_salary_button_label(worker), callback_data=f"report_salary_worker:{worker}")]
+            for worker in get_paid_workers()
+        ]
+        keyboard[2:2] = payout_buttons
     keyboard.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
     await show_text_screen(query, context, "📊 Отчёты\n\nВыберите отчёт:", reply_markup=InlineKeyboardMarkup(keyboard))
     return REPORT_MENU_SECTION
@@ -13789,7 +14043,13 @@ async def report_section_handler(update: Update, context):
         return await report_day(update, context)
     if d == "report_period":
         return await report_period_menu(update, context)
-    if d in {"report_salary_kirill", "payout_open"}:
+    if d.startswith("report_salary_worker:"):
+        if not is_payout_viewer(update):
+            await deny_callback_access(query)
+            return REPORT_MENU_SECTION
+        worker = d.split(":", 1)[1]
+        return await show_salary_report_screen(query, context, worker)
+    if d == "payout_open":
         if not is_payout_viewer(update):
             await deny_callback_access(query)
             return REPORT_MENU_SECTION
@@ -13814,7 +14074,7 @@ async def salary_task_worker_handler(update: Update, context):
         return await show_reports_section_menu(query, context)
     if data.startswith("salary_task_worker_"):
         try:
-            worker = PAID_WORKERS[int(data.rsplit("_", 1)[1])]
+            worker = get_paid_workers()[int(data.rsplit("_", 1)[1])]
         except (ValueError, IndexError):
             return await show_salary_task_worker_menu(query, context)
         salary_task = get_salary_task_context(context)
@@ -13836,9 +14096,13 @@ async def salary_task_date_handler(update: Update, context):
         if salary_task.get("return_mode") == "payout":
             screen = salary_task.get("return_screen", "overview")
             period_key = salary_task.get("return_period")
+            payout_worker = salary_task.get("return_worker", "")
+            if payout_worker:
+                get_payout_context(context)["worker"] = payout_worker
             clear_salary_task_context(context)
             return await show_payout_screen(query, context, screen=screen, period_key=period_key)
-        if len(PAID_WORKERS) == 1 and salary_task.get("who") == PAID_WORKERS[0]:
+        paid_workers = get_paid_workers()
+        if len(paid_workers) == 1 and salary_task.get("who") == paid_workers[0]:
             clear_salary_task_context(context)
             return await show_reports_section_menu(query, context)
         salary_task.pop("date", None)
@@ -14299,7 +14563,7 @@ async def service_who(update: Update, context):
         }
     else:
         context.user_data["svc"] = {}
-    kb = [[InlineKeyboardButton(w, callback_data=f"sw_{w}")] for w in WORKERS]
+    kb = [[InlineKeyboardButton(w, callback_data=f"sw_{w}")] for w in get_worker_names()]
     kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_service_menu")])
     kb.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
     await query.edit_message_text(
@@ -14333,6 +14597,9 @@ async def service_date_handler(update: Update, context):
 
     if query.data == "back_service_who":
         if svc.get("return_mode") == "payout" and svc.get("locked_who"):
+            payout_worker = svc.get("return_worker", "")
+            if payout_worker:
+                get_payout_context(context)["worker"] = payout_worker
             return await show_payout_screen(
                 query,
                 context,
@@ -14591,7 +14858,7 @@ async def delete_confirm_handler(update: Update, context):
         return await show_fix_entry_salary_menu(query, context)
     if query.data.startswith("fix_entry_salary_toggle_"):
         try:
-            worker = PAID_WORKERS[int(query.data.rsplit("_", 1)[1])]
+            worker = get_paid_workers()[int(query.data.rsplit("_", 1)[1])]
         except (ValueError, IndexError):
             return await show_fix_entry_salary_menu(query, context)
         selected = normalize_salary_workers(delete_data.get("salary_workers_draft", []))
@@ -15448,6 +15715,9 @@ async def service_confirm_handler(update: Update, context):
     if query.data == "svc_cancel":
         if context.user_data.get("svc", {}).get("return_mode") == "payout":
             payout = get_payout_context(context)
+            payout_worker = context.user_data["svc"].get("return_worker", "")
+            if payout_worker:
+                payout["worker"] = payout_worker
             return_screen = context.user_data["svc"].get("return_screen", "overview")
             section = get_payout_screen_section(return_screen)
             if section in {"services", "purchases"}:
@@ -15520,6 +15790,9 @@ async def service_confirm_handler(update: Update, context):
             logger.exception("Failed to refresh group service-today post after service save")
         if svc.get("return_mode") == "payout":
             payout = get_payout_context(context)
+            payout_worker = svc.get("return_worker", "")
+            if payout_worker:
+                payout["worker"] = payout_worker
             return_screen = svc.get("return_screen", "overview")
             section = get_payout_screen_section(return_screen)
             if section in {"services", "purchases"}:
@@ -15551,6 +15824,9 @@ async def service_confirm_handler(update: Update, context):
 
     if svc.get("return_mode") == "payout":
         payout = get_payout_context(context)
+        payout_worker = svc.get("return_worker", "")
+        if payout_worker:
+            payout["worker"] = payout_worker
         return_screen = svc.get("return_screen", "overview")
         section = get_payout_screen_section(return_screen)
         if section in {"services", "purchases"}:
@@ -15573,10 +15849,11 @@ def build_group_report_saved_markup(save_result):
     service_row = str(save_result.get("service_row", "")).strip()
     keyboard = []
     row = []
-    for idx, worker in enumerate(WORKERS):
+    worker_names = get_worker_names()
+    for idx, worker in enumerate(worker_names):
         prefix = "✅" if worker == current_worker else "👤"
         row.append(InlineKeyboardButton(f"{prefix} {worker}", callback_data=f"grp_report_worker_{idx}_{log_row}"))
-        if len(row) == 2 or idx == len(WORKERS) - 1:
+        if len(row) == 2 or idx == len(worker_names) - 1:
             keyboard.append(row)
             row = []
     if service_row:
@@ -16549,7 +16826,7 @@ async def group_report_callback_handler(update: Update, context):
         if action.startswith("worker_"):
             try:
                 worker_index = int(action.replace("worker_", "", 1))
-                worker = WORKERS[worker_index]
+                worker = get_worker_names()[worker_index]
             except (ValueError, IndexError):
                 await query.edit_message_text("⚪ Не удалось определить сотрудника.")
                 if query.message:
@@ -16786,7 +17063,7 @@ async def travel_who(update: Update, context):
         title = "По кому показать историю?"
     if mode == "add":
         context.user_data.pop("travel_date", None)
-    kb = [[InlineKeyboardButton(w, callback_data=f"tw_{w}")] for w in WORKERS]
+    kb = [[InlineKeyboardButton(w, callback_data=f"tw_{w}")] for w in get_worker_names()]
     kb.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_travel_menu")])
     kb.append([InlineKeyboardButton("🏠 В меню", callback_data="back_main")])
     await query.edit_message_text(
@@ -16816,6 +17093,7 @@ async def travel_menu_handler(update: Update, context):
         context.user_data.pop("travel_return_mode", None)
         context.user_data.pop("travel_return_period", None)
         context.user_data.pop("travel_return_screen", None)
+        context.user_data.pop("travel_return_worker", None)
         return await travel_who(update, context)
     if data == "travel_history_person":
         context.user_data["travel_mode"] = "history"
@@ -16826,6 +17104,7 @@ async def travel_menu_handler(update: Update, context):
         context.user_data.pop("travel_return_mode", None)
         context.user_data.pop("travel_return_period", None)
         context.user_data.pop("travel_return_screen", None)
+        context.user_data.pop("travel_return_worker", None)
         return await travel_who(update, context)
     if data == "travel_history_all":
         context.user_data["travel_mode"] = "history"
@@ -16835,10 +17114,11 @@ async def travel_menu_handler(update: Update, context):
         context.user_data.pop("travel_return_mode", None)
         context.user_data.pop("travel_return_period", None)
         context.user_data.pop("travel_return_screen", None)
+        context.user_data.pop("travel_return_worker", None)
         return await show_travel_history_period_menu(query, context, "all")
     if data == "travel_edit":
         if not is_payout_editor(update):
-            await query.answer("⛔ Только Матвей может менять проезд.", show_alert=True)
+            await query.answer("⛔ Только редактор выплат может менять проезд.", show_alert=True)
             return TRAVEL_MENU
         context.user_data["travel_mode"] = "edit"
         context.user_data.pop("travel_edit", None)
@@ -16848,6 +17128,7 @@ async def travel_menu_handler(update: Update, context):
         context.user_data.pop("travel_return_mode", None)
         context.user_data.pop("travel_return_period", None)
         context.user_data.pop("travel_return_screen", None)
+        context.user_data.pop("travel_return_worker", None)
         return await travel_who(update, context)
     return TRAVEL_MENU
 
@@ -16886,7 +17167,7 @@ async def travel_history_period_handler(update: Update, context):
 
     if mode == "edit":
         if not is_payout_editor(update):
-            await query.answer("⛔ Только Матвей может менять проезд.", show_alert=True)
+            await query.answer("⛔ Только редактор выплат может менять проезд.", show_alert=True)
             return TRAVEL_HISTORY_PERIOD
         if data == "tr_edit_back_dates":
             return await show_travel_edit_date_screen(query, context, back_callback="back_travel_history_period")
@@ -17007,6 +17288,9 @@ async def travel_date_handler(update: Update, context):
         return await show_service_section_menu(query, context)
     if d == "back_travel_who":
         if context.user_data.get("travel_return_mode") == "payout":
+            payout_worker = context.user_data.get("travel_return_worker", "")
+            if payout_worker:
+                get_payout_context(context)["worker"] = payout_worker
             return await show_payout_screen(
                 query,
                 context,
@@ -17109,6 +17393,9 @@ async def travel_action_handler(update: Update, context):
         return await show_service_section_menu(query, context)
     if d == "back_travel_who":
         if payout_return_mode:
+            payout_worker = context.user_data.get("travel_return_worker", "")
+            if payout_worker:
+                get_payout_context(context)["worker"] = payout_worker
             return await show_payout_screen(query, context, screen=payout_return_screen, period_key=payout_return_period)
         return await travel_who(update, context)
     if d == "back_travel_date":
@@ -17128,6 +17415,9 @@ async def travel_action_handler(update: Update, context):
 
         label = f"✅ Записано: {trip_count} поездок — {format_money(amount)}"
         if payout_return_mode:
+            payout_worker = context.user_data.get("travel_return_worker", "")
+            if payout_worker:
+                get_payout_context(context)["worker"] = payout_worker
             get_payout_context(context)["travels_date"] = date_str
             return await show_payout_screen(
                 query,
@@ -17194,6 +17484,9 @@ async def travel_custom_handler(update: Update, context):
     try:
         await run_blocking(add_travel_row, date_str, who, amount)
         if payout_return_mode:
+            payout_worker = context.user_data.get("travel_return_worker", "")
+            if payout_worker:
+                get_payout_context(context)["worker"] = payout_worker
             get_payout_context(context)["travels_date"] = date_str
             return await render_payout_screen_target(
                 update.message,
@@ -17243,6 +17536,9 @@ async def travel_trips_custom_handler(update: Update, context):
     try:
         await run_blocking(add_travel_row, date_str, who, amount)
         if payout_return_mode:
+            payout_worker = context.user_data.get("travel_return_worker", "")
+            if payout_worker:
+                get_payout_context(context)["worker"] = payout_worker
             get_payout_context(context)["travels_date"] = date_str
             return await render_payout_screen_target(
                 update.message,
@@ -17337,7 +17633,7 @@ async def report_day(update: Update, context):
                     text += f"  🧰 Допзадачи: {format_money_spaced(task_sum)}\n"
 
                 w_total = svc_sum + purch_sum + trv_sum + task_sum
-                if w in PAID_WORKERS:
+                if w in set(get_paid_workers()):
                     text += f"  💰 Итого {w}: {format_money_spaced(w_total)}\n"
                 else:
                     if purch_sum or trv_sum or task_sum:
@@ -17406,12 +17702,18 @@ def get_default_salary_period_code():
     return "rp_month_prev" if now_local().date().day <= 7 else "rp_month_current"
 
 
-def get_default_salary_button_label():
+def get_default_payout_worker_name():
+    paid_workers = get_paid_workers()
+    return paid_workers[0] if paid_workers else ""
+
+
+def get_salary_button_label(worker):
     config = get_report_period_config(get_default_salary_period_code())
+    worker_name = str(worker or "").strip() or "Сотрудник"
     if not config:
-        return "💼 Кирилл"
+        return f"💼 {worker_name}"
     month_name = str(config["title"]).split(" ", 1)[0]
-    return f"💼 Кирилл · {month_name}"
+    return f"💼 {worker_name} · {month_name}"
 
 
 def is_date_in_report_range(date_str, start_date, end_date):
@@ -17423,8 +17725,9 @@ def is_date_in_report_range(date_str, start_date, end_date):
 
 
 def order_workers(workers):
-    known = [worker for worker in WORKERS if worker in workers]
-    extras = sorted(worker for worker in workers if worker not in WORKERS)
+    known_workers = get_worker_names()
+    known = [worker for worker in known_workers if worker in workers]
+    extras = sorted(worker for worker in workers if worker not in known_workers)
     return known + extras
 
 
@@ -17442,7 +17745,8 @@ def filter_services_for_salary_worker(services, worker):
 
 
 def get_service_worker_amount(service, worker):
-    paid_workers = [item for item in get_service_salary_workers(service) if item in PAID_WORKERS]
+    paid_worker_names = set(get_paid_workers())
+    paid_workers = [item for item in get_service_salary_workers(service) if item in paid_worker_names]
     if worker not in paid_workers:
         return 0.0
 
@@ -17601,7 +17905,7 @@ def build_period_report_text(title, services, travels, salary_tasks=None):
         if salary_task_sum:
             lines.append(f"🧰 Допзадачи: {format_money_spaced(salary_task_sum)}")
 
-        if worker in PAID_WORKERS:
+        if worker in set(get_paid_workers()):
             lines.append(f"✅ К выплате: {format_money_spaced(worker_total)}")
         else:
             lines.append(f"💸 Расходы: {format_money_spaced(purchase_sum + travel_sum + salary_task_sum)}")
@@ -17703,7 +18007,10 @@ def format_short_date_label(date_str):
     return parsed.strftime("%d.%m")
 
 
-def compute_kirill_settlement(period_key, sources=None, worker=PAYOUT_WORKER):
+def compute_payout_settlement(period_key, sources=None, worker=None):
+    worker = str(worker or get_default_payout_worker_name()).strip()
+    if not worker:
+        raise RuntimeError("No paid workers configured")
     sources = sources or build_payout_sources()
     services = sources.get("services", [])
     travels = sources.get("travels", [])
@@ -17821,6 +18128,10 @@ def compute_kirill_settlement(period_key, sources=None, worker=PAYOUT_WORKER):
     }
 
 
+def compute_kirill_settlement(period_key, sources=None, worker=None):
+    return compute_payout_settlement(period_key, sources=sources, worker=worker)
+
+
 def get_payout_screen_section(screen):
     screen = str(screen or "")
     for section in ("services", "purchases", "travels", "tasks"):
@@ -17835,7 +18146,7 @@ def get_payout_section_title(section):
         "purchases": "🛒 Закупки",
         "travels": "🚌 Проезд",
         "tasks": "🧰 Допзадачи",
-    }.get(section, "💼 Кирилл")
+    }.get(section, "💼 Выплата")
 
 
 def get_payout_section_records(settlement, section):
@@ -17936,7 +18247,7 @@ def build_payout_salary_task_entry_compact_text(entry):
 
 def build_payout_date_menu_text(section, settlement):
     title = get_payout_section_title(section)
-    lines = [f"<b>{title} — {escape_html(settlement['period_label'])}</b>", ""]
+    lines = [f"<b>{title} · {escape_html(settlement['worker'])} — {escape_html(settlement['period_label'])}</b>", ""]
     groups = build_payout_date_groups(settlement, section)
     if not groups:
         empty_text = {
@@ -17979,7 +18290,7 @@ def build_payout_date_menu_text(section, settlement):
 def build_payout_point_menu_text(section, settlement, date_str):
     title = get_payout_section_title(section)
     lines = [
-        f"<b>{title} — {escape_html(settlement['period_label'])}</b>",
+        f"<b>{title} · {escape_html(settlement['worker'])} — {escape_html(settlement['period_label'])}</b>",
         "",
         f"📅 {escape_html(date_str)}",
         "",
@@ -18000,7 +18311,7 @@ def build_payout_point_menu_text(section, settlement, date_str):
 def build_payout_entries_menu_text(section, settlement, date_str, point=None):
     title = get_payout_section_title(section)
     lines = [
-        f"<b>{title} — {escape_html(settlement['period_label'])}</b>",
+        f"<b>{title} · {escape_html(settlement['worker'])} — {escape_html(settlement['period_label'])}</b>",
         "",
         f"📅 {escape_html(date_str)}",
     ]
@@ -18151,14 +18462,14 @@ def build_payout_entries_menu_markup(section, settlement, can_edit, date_str, po
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_payout_month_menu_text():
-    return "<b>💼 Кирилл — итоги и выплата</b>\n\nВыберите месяц:"
+def build_payout_month_menu_text(worker):
+    return f"<b>💼 {escape_html(worker)} — итоги и выплата</b>\n\nВыберите месяц:"
 
 
-def build_payout_month_menu_markup(period_keys, sources):
+def build_payout_month_menu_markup(period_keys, sources, worker):
     keyboard = []
     for period_key in period_keys:
-        settlement = compute_kirill_settlement(period_key, sources=sources)
+        settlement = compute_payout_settlement(period_key, sources=sources, worker=worker)
         label = (
             f"{get_payout_status_icon(settlement['status'])} "
             f"{format_period_label(period_key)} · {format_money_spaced(get_payout_display_total(settlement))}"
@@ -18247,7 +18558,7 @@ def build_payout_overview_markup(can_edit, can_manage_payment, settlement):
 
 
 def build_payout_services_text(settlement):
-    lines = [f"<b>🔧 Обслуживания — {escape_html(settlement['period_label'])}</b>", ""]
+    lines = [f"<b>🔧 Обслуживания · {escape_html(settlement['worker'])} — {escape_html(settlement['period_label'])}</b>", ""]
     if not settlement["services"]:
         lines.append("⚪ За выбранный месяц обслуживаний в выплату не найдено.")
         return "\n".join(lines)
@@ -18302,7 +18613,7 @@ def build_payout_services_markup(settlement, can_edit):
 
 
 def build_payout_purchases_text(settlement):
-    lines = [f"<b>🛒 Закупки — {escape_html(settlement['period_label'])}</b>", ""]
+    lines = [f"<b>🛒 Закупки · {escape_html(settlement['worker'])} — {escape_html(settlement['period_label'])}</b>", ""]
     if not settlement["purchases"]:
         lines.append("⚪ За выбранный месяц закупок нет.")
         return "\n".join(lines)
@@ -18340,7 +18651,7 @@ def build_payout_purchases_markup(settlement, can_edit):
 
 
 def build_payout_travels_text(settlement):
-    lines = [f"<b>🚌 Проезд — {escape_html(settlement['period_label'])}</b>", ""]
+    lines = [f"<b>🚌 Проезд · {escape_html(settlement['worker'])} — {escape_html(settlement['period_label'])}</b>", ""]
     if not settlement["travels"]:
         lines.append("⚪ За выбранный месяц записей проезда нет.")
         return "\n".join(lines)
@@ -18377,7 +18688,7 @@ def build_payout_travels_markup(settlement, can_edit):
 
 
 def build_payout_salary_tasks_text(settlement):
-    lines = [f"<b>🧰 Допзадачи — {escape_html(settlement['period_label'])}</b>", ""]
+    lines = [f"<b>🧰 Допзадачи · {escape_html(settlement['worker'])} — {escape_html(settlement['period_label'])}</b>", ""]
     if not settlement["salary_tasks"]:
         lines.append("⚪ За выбранный месяц допзадач нет.")
         return "\n".join(lines)
@@ -18407,11 +18718,11 @@ def build_payout_salary_tasks_markup(can_edit):
 
 
 async def show_salary_report_screen(query, context, worker):
-    if worker != PAYOUT_WORKER:
+    if worker not in get_paid_workers():
         await show_text_screen(
             query,
             context,
-            f"❌ Для {worker} единый экран пока не настроен.",
+            f"❌ Сотрудник {worker} не настроен для расчёта выплат.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⬅️ К отчётам", callback_data="back_reports_menu")],
                 [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
@@ -18419,7 +18730,7 @@ async def show_salary_report_screen(query, context, worker):
         )
         return REPORT_MENU_SECTION
     user_id = getattr(getattr(query, "from_user", None), "id", None)
-    if user_id not in PAYOUT_VIEWERS:
+    if user_id not in get_payout_viewer_ids():
         await show_text_screen(
             query,
             context,
@@ -18430,6 +18741,8 @@ async def show_salary_report_screen(query, context, worker):
             ]),
         )
         return REPORT_MENU_SECTION
+    clear_payout_context(context)
+    get_payout_context(context)["worker"] = worker
     return await show_payout_overview_screen(query, context)
 
 
