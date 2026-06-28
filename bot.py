@@ -13286,16 +13286,16 @@ async def cmd_ids(update: Update, context):
         return
 
     lines = [
-        "🪪 Идентификаторы",
+        "🪪 <b>Идентификаторы</b>",
         "",
-        f"👤 user_id: `{user.id}`",
-        f"💬 chat_id: `{chat.id}`",
-        f"🧩 тип чата: `{chat.type}`",
+        f"👤 user_id: <code>{user.id}</code>",
+        f"💬 chat_id: <code>{chat.id}</code>",
+        f"🧩 тип чата: <code>{escape_html(chat.type)}</code>",
     ]
 
     chat_title = getattr(chat, "title", None)
     if chat_title:
-        lines.append(f"🏷 чат: {escape_markdown(chat_title, version=2)}")
+        lines.append(f"🏷 чат: {escape_html(chat_title)}")
 
     lines.extend(
         [
@@ -13311,13 +13311,13 @@ async def cmd_ids(update: Update, context):
         lines.extend(
             [
                 "",
-                "Для `.env`:",
-                f"`ALLOWED_USER_IDS={user.id}`",
-                f"`ALLOWED_GROUP_CHAT_IDS={chat.id}`",
+                "Для <code>.env</code>:",
+                f"<code>ALLOWED_USER_IDS={user.id}</code>",
+                f"<code>ALLOWED_GROUP_CHAT_IDS={chat.id}</code>",
             ]
         )
 
-    await message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+    await message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def cmd_shortages(update: Update, context):
     if not is_allowed_user(update):
