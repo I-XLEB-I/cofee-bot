@@ -17115,12 +17115,10 @@ async def group_report_callback_handler(update: Update, context):
             save_group_report_entry,
             draft,
             "group report draft save",
+            application=context.application,
         )
         drafts.pop(draft_id, None)
-        try:
-            await refresh_group_service_today_posts(context.application, force=True)
-        except Exception:
-            logger.exception("Failed to refresh group service-today post after draft save")
+        await request_group_service_today_refresh(context.application)
         text = build_group_report_saved_text(draft, save_result)
         if draft.get("draft_mode") == "service_duplicate_warning":
             text = text.replace(
