@@ -12722,8 +12722,10 @@ async def payout_handler(update: Update, context):
             return PAYOUT_SCREEN
         payout["screen"] = "overview"
         text = (
-            f"<b>✏️ Корректировка — {escape_html(settlement['period_label'])}</b>\n\n"
-            f"Текущая: {format_money_spaced(settlement['correction'])}\n\n"
+            f"<b>✏️ Ручная корректировка — {escape_html(settlement['period_label'])}</b>\n\n"
+            "Это ручной плюс или минус к итоговой выплате за месяц.\n"
+            "Например: аванс, штраф, доплата, округление.\n\n"
+            f"Текущая сумма: {format_money_spaced(settlement['correction'])}\n\n"
             "Введите сумму, например <code>-500</code> или <code>300</code>."
         )
         await show_text_screen(
@@ -13042,7 +13044,11 @@ async def payout_correction_amount_handler(update: Update, context):
     payout = get_payout_context(context)
     payout["correction_draft"] = amount
     await update.message.reply_text(
-        "📝 Комментарий к корректировке.\n\nМожно оставить пустым или нажать «Пропустить».",
+        (
+            "📝 Комментарий к ручной корректировке.\n\n"
+            "Можно коротко указать причину: аванс, штраф, доплата, округление.\n"
+            "Можно оставить пустым или нажать «Пропустить»."
+        ),
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Пропустить", callback_data="payout_correction_skip")],
@@ -13075,7 +13081,12 @@ async def payout_correction_note_back_handler(update: Update, context):
             "correction_note": "",
         },
     )
-    return await show_payout_overview_screen(query, context, period_key=period_key, notice="✅ Корректировка сохранена.")
+    return await show_payout_overview_screen(
+        query,
+        context,
+        period_key=period_key,
+        notice="✅ Ручная корректировка сохранена.",
+    )
 
 
 async def payout_correction_note_handler(update: Update, context):
@@ -13101,7 +13112,7 @@ async def payout_correction_note_handler(update: Update, context):
         context,
         screen="overview",
         period_key=period_key,
-        notice="✅ Корректировка сохранена.",
+        notice="✅ Ручная корректировка сохранена.",
     )
 
 
@@ -18007,6 +18018,25 @@ def format_short_date_label(date_str):
     return parsed.strftime("%d.%m")
 
 
+def get_unique_sorted_date_keys(items):
+    date_keys = {
+        str(item.get("Дата", "")).strip()
+        for item in items
+        if str(item.get("Дата", "")).strip()
+    }
+    return sorted(date_keys, key=lambda value: parse_date(value) or datetime.min)
+
+
+def build_compact_date_summary(items, limit=8):
+    date_labels = [format_short_date_label(value) for value in get_unique_sorted_date_keys(items)]
+    if not date_labels:
+        return ""
+    if len(date_labels) <= limit:
+        return ", ".join(date_labels)
+    hidden_count = len(date_labels) - limit
+    return f"{', '.join(date_labels[:limit])} ... +{hidden_count} дн."
+
+
 def compute_payout_settlement(period_key, sources=None, worker=None):
     worker = str(worker or get_default_payout_worker_name()).strip()
     if not worker:
@@ -18481,6 +18511,7 @@ def build_payout_month_menu_markup(period_keys, sources, worker):
 
 
 def build_payout_overview_text(settlement, notice=None):
+    service_dates_summary = build_compact_date_summary(settlement.get("services", []))
     lines = [f"<b>💼 {escape_html(settlement['worker'])} — итоги и выплата</b>"]
     if notice:
         lines.extend([escape_html(notice), ""])
@@ -18505,6 +18536,12 @@ def build_payout_overview_text(settlement, notice=None):
                 f"🔧 Обслуживания: {settlement['display_service_count']} × "
                 f"{format_money_spaced(SERVICE_PRICE)} = {format_money_spaced(settlement['display_service_sum'])}"
             ),
+        ]
+    )
+    if service_dates_summary:
+        lines.append(f"📅 Даты обслуживаний: {escape_html(service_dates_summary)}")
+    lines.extend(
+        [
             f"🛒 Закупки: {format_money_spaced(settlement['display_purchase_sum'])}",
             (
                 f"🚌 Проезд: {format_money_spaced(settlement['display_travel_sum'])} "
@@ -18517,7 +18554,9 @@ def build_payout_overview_text(settlement, notice=None):
             f"🧰 Допзадачи: {format_money_spaced(settlement['display_salary_task_sum'])}"
             f" ({settlement['display_salary_task_count']})"
         )
-    lines.append(f"✏️ Корректировка: {format_money_spaced(settlement['correction'])}")
+    lines.append(
+        f"✏️ Ручная корректировка (плюс/минус к итогу): {format_money_spaced(settlement['correction'])}"
+    )
     if settlement.get("correction_note"):
         lines.append(f"📝 {escape_html(settlement['correction_note'])}")
     lines.extend(
@@ -18545,7 +18584,7 @@ def build_payout_overview_markup(can_edit, can_manage_payment, settlement):
         [InlineKeyboardButton("🧰 Допзадачи", callback_data="payout_screen:tasks")],
     ]
     if can_edit:
-        keyboard.append([InlineKeyboardButton("✏️ Корректировка", callback_data="payout_correction")])
+        keyboard.append([InlineKeyboardButton("✏️ Ручная корректировка", callback_data="payout_correction")])
     if settlement["status"] == PAYOUT_STATUS_PAID:
         if can_manage_payment:
             keyboard.append([InlineKeyboardButton("↩️ Снять отметку", callback_data="payout_unmark_paid")])
