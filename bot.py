@@ -18879,7 +18879,6 @@ async def delete_bot_message(application, chat_id, message_id):
 
 async def cleanup_expired_service_today_posts(application, state, current_dt):
     posts = get_service_today_post_state(state)
-    changed = False
 
     for chat_key, payload in list(posts.items()):
         date_str = payload.get("date", "")
@@ -18887,7 +18886,7 @@ async def cleanup_expired_service_today_posts(application, state, current_dt):
         dt = parse_date(date_str)
         if not dt:
             posts.pop(chat_key, None)
-            changed = True
+            save_reminder_state(state, application)
             continue
 
         post_date = dt.date()
@@ -18904,15 +18903,11 @@ async def cleanup_expired_service_today_posts(application, state, current_dt):
         except Exception:
             logger.exception("Failed to delete expired service-today post in chat %s", chat_id)
         posts.pop(chat_key, None)
-        changed = True
-
-    if changed:
         save_reminder_state(state, application)
 
 
 async def cleanup_expired_group_reminders(application, state, current_dt):
     reminders = get_group_reminder_message_state(state)
-    changed = False
 
     for message_key, payload in list(reminders.items()):
         date_str = payload.get("date", "")
@@ -18921,7 +18916,7 @@ async def cleanup_expired_group_reminders(application, state, current_dt):
         dt = parse_date(date_str)
         if not dt or not chat_id:
             reminders.pop(message_key, None)
-            changed = True
+            save_reminder_state(state, application)
             continue
 
         reminder_date = dt.date()
@@ -18937,9 +18932,6 @@ async def cleanup_expired_group_reminders(application, state, current_dt):
         except Exception:
             logger.exception("Failed to delete reminder message %s in chat %s", message_key, chat_id)
         reminders.pop(message_key, None)
-        changed = True
-
-    if changed:
         save_reminder_state(state, application)
 
 
@@ -18958,7 +18950,6 @@ async def refresh_group_service_today_posts(application, force=False):
 
     state = load_reminder_state(application)
     posts = get_service_today_post_state(state)
-    changed = False
 
     for chat_id in sorted(ALLOWED_GROUP_CHAT_IDS):
         chat_key = str(chat_id)
@@ -18978,7 +18969,9 @@ async def refresh_group_service_today_posts(application, force=False):
                     "message_id": sent.message_id,
                     "hash": text_hash,
                 }
-                changed = True
+                # Persist immediately so a deploy/restart right after send
+                # doesn't lose the current message_id and create a duplicate.
+                save_reminder_state(state, application)
             except Exception:
                 logger.exception("Failed to send service-today post to chat %s", chat_id)
             continue
@@ -18994,12 +18987,12 @@ async def refresh_group_service_today_posts(application, force=False):
                 parse_mode="HTML",
             )
             posts[chat_key]["hash"] = text_hash
-            changed = True
+            save_reminder_state(state, application)
         except BadRequest as e:
             err = str(e)
             if "message is not modified" in err.lower():
                 posts[chat_key]["hash"] = text_hash
-                changed = True
+                save_reminder_state(state, application)
                 continue
             if "message to edit not found" not in err.lower():
                 logger.warning("Failed to edit service-today post in chat %s: %s", chat_id, e)
@@ -19014,21 +19007,17 @@ async def refresh_group_service_today_posts(application, force=False):
                     "message_id": sent.message_id,
                     "hash": text_hash,
                 }
-                changed = True
+                save_reminder_state(state, application)
             except Exception:
                 logger.exception("Failed to re-send service-today post to chat %s", chat_id)
         except Exception:
             logger.exception("Failed to refresh service-today post in chat %s", chat_id)
-
-    if changed:
-        save_reminder_state(state, application)
 
 
 async def maybe_send_group_reminder(application, reminder_key, text):
     state = load_reminder_state(application)
     sent = state.setdefault("sent", {})
     reminders = get_group_reminder_message_state(state)
-    changed = False
 
     for chat_id in sorted(ALLOWED_GROUP_CHAT_IDS):
         chat_key = f"{chat_id}:{reminder_key}"
@@ -19042,12 +19031,9 @@ async def maybe_send_group_reminder(application, reminder_key, text):
                 "message_id": sent_message.message_id,
                 "date": today(),
             }
-            changed = True
+            save_reminder_state(state, application)
         except Exception:
             logger.exception("Failed to send reminder %s to chat %s", reminder_key, chat_id)
-
-    if changed:
-        save_reminder_state(state, application)
 
 
 async def process_group_reminders(application):
