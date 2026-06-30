@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from html import escape as escape_html
@@ -73,6 +74,15 @@ SERVICE_TODAY_GROUP_POST_HOUR = int(os.getenv("SERVICE_TODAY_GROUP_POST_HOUR", "
 SERVICE_TODAY_GROUP_DELETE_HOUR = int(os.getenv("SERVICE_TODAY_GROUP_DELETE_HOUR", "2"))
 HOME_REVISION_REMINDER_HOUR = int(os.getenv("HOME_REVISION_REMINDER_HOUR", "12"))
 MONTH_CLOSE_REVISION_REMINDER_HOUR = int(os.getenv("MONTH_CLOSE_REVISION_REMINDER_HOUR", "12"))
+GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS = float(os.getenv("GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS", "2.0"))
+GROUP_REPORT_SAVE_RETRY_MAX_ATTEMPTS = int(os.getenv("GROUP_REPORT_SAVE_RETRY_MAX_ATTEMPTS", "6"))
+GROUP_REPORT_SAVE_RETRY_INITIAL_DELAY_SECONDS = float(
+    os.getenv("GROUP_REPORT_SAVE_RETRY_INITIAL_DELAY_SECONDS", "3.0")
+)
+GROUP_REPORT_SAVE_RETRY_MAX_DELAY_SECONDS = float(
+    os.getenv("GROUP_REPORT_SAVE_RETRY_MAX_DELAY_SECONDS", "30.0")
+)
+GROUP_REPORT_REFRESH_DEBOUNCE_SECONDS = float(os.getenv("GROUP_REPORT_REFRESH_DEBOUNCE_SECONDS", "12.0"))
 
 if PHOTO_CHAT_ID_RAW:
     try:
@@ -428,6 +438,9 @@ REPAIR_STATUS_ICONS = {
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 GROUP_REPORT_SAVE_LOCK = asyncio.Lock()
+GROUP_REPORT_WRITE_THROTTLE_LOCK = asyncio.Lock()
+GROUP_REPORT_LAST_WRITE_TS_KEY = "_group_report_last_write_ts"
+GROUP_REPORT_REFRESH_TASK_KEY = "_group_report_refresh_task"
 
 
 async def run_blocking(func, *args, **kwargs):
@@ -16308,11 +16321,46 @@ async def send_revision_message_saved_message(application, draft, save_result):
     )
 
 
-async def run_group_sheet_write_with_retry(save_callable, draft, operation_label):
-    delay_seconds = 1.0
-    max_attempts = 3
+async def wait_for_group_report_sheet_slot(application):
+    if GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS <= 0:
+        return
+    async with GROUP_REPORT_WRITE_THROTTLE_LOCK:
+        now_ts = time.monotonic()
+        last_ts = float(application.bot_data.get(GROUP_REPORT_LAST_WRITE_TS_KEY, 0.0) or 0.0)
+        wait_seconds = GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS - (now_ts - last_ts)
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds)
+        application.bot_data[GROUP_REPORT_LAST_WRITE_TS_KEY] = time.monotonic()
+
+
+async def request_group_service_today_refresh(application):
+    existing_task = application.bot_data.get(GROUP_REPORT_REFRESH_TASK_KEY)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+
+    async def _delayed_refresh():
+        try:
+            await asyncio.sleep(GROUP_REPORT_REFRESH_DEBOUNCE_SECONDS)
+            await refresh_group_service_today_posts(application, force=True)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Failed to refresh group service-today post after debounced save")
+        finally:
+            current_task = application.bot_data.get(GROUP_REPORT_REFRESH_TASK_KEY)
+            if current_task is asyncio.current_task():
+                application.bot_data.pop(GROUP_REPORT_REFRESH_TASK_KEY, None)
+
+    application.bot_data[GROUP_REPORT_REFRESH_TASK_KEY] = asyncio.create_task(_delayed_refresh())
+
+
+async def run_group_sheet_write_with_retry(save_callable, draft, operation_label, application=None):
+    delay_seconds = max(GROUP_REPORT_SAVE_RETRY_INITIAL_DELAY_SECONDS, 0.0)
+    max_attempts = max(1, GROUP_REPORT_SAVE_RETRY_MAX_ATTEMPTS)
     for attempt in range(1, max_attempts + 1):
         try:
+            if application is not None:
+                await wait_for_group_report_sheet_slot(application)
             return await run_blocking(save_callable, draft)
         except APIError as error:
             if not is_google_sheets_busy_error(error) or attempt >= max_attempts:
@@ -16327,7 +16375,10 @@ async def run_group_sheet_write_with_retry(save_callable, draft, operation_label
                 draft.get("who", ""),
             )
             await asyncio.sleep(delay_seconds)
-            delay_seconds *= 2
+            delay_seconds = min(
+                max(delay_seconds * 2, GROUP_REPORT_SAVE_RETRY_INITIAL_DELAY_SECONDS),
+                GROUP_REPORT_SAVE_RETRY_MAX_DELAY_SECONDS,
+            )
 
 
 async def process_group_report_message(message, application, photo_ids=None):
@@ -16391,6 +16442,7 @@ async def process_group_report_message(message, application, photo_ids=None):
                     save_revision_restock_entry,
                     draft,
                     "revision restock save",
+                    application=application,
                 )
             await send_revision_restock_saved_message(application, draft, save_result)
         except APIError as error:
@@ -16479,6 +16531,7 @@ async def process_group_report_message(message, application, photo_ids=None):
                     save_revision_message_entry,
                     draft,
                     "revision snapshot save",
+                    application=application,
                 )
             await send_revision_message_saved_message(application, draft, save_result)
         except APIError as error:
@@ -16567,6 +16620,7 @@ async def process_group_report_message(message, application, photo_ids=None):
                     save_group_travel_entry,
                     draft,
                     "group travel save",
+                    application=application,
                 )
             await send_group_travel_saved_message(application, draft, log_row)
         except APIError as error:
@@ -16686,6 +16740,7 @@ async def process_group_report_message(message, application, photo_ids=None):
                 save_group_report_entry,
                 draft,
                 "group report save",
+                application=application,
             )
     except APIError as error:
         if is_google_sheets_busy_error(error):
@@ -16722,10 +16777,7 @@ async def process_group_report_message(message, application, photo_ids=None):
         )
         return
 
-    try:
-        await refresh_group_service_today_posts(application, force=True)
-    except Exception:
-        logger.exception("Failed to refresh group service-today post after group report save")
+    await request_group_service_today_refresh(application)
 
     last_error = None
     for attempt in range(4):
@@ -19138,6 +19190,13 @@ async def on_app_startup(application):
 
 
 async def on_app_shutdown(application):
+    refresh_task = application.bot_data.pop(GROUP_REPORT_REFRESH_TASK_KEY, None)
+    if refresh_task:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
     task = application.bot_data.pop("reminder_loop_task", None)
     if task:
         task.cancel()
