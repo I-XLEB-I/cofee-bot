@@ -2781,15 +2781,24 @@ def resolve_runtime_path(path_value):
 
 
 REMINDER_STATE_CACHE_KEY = "_reminder_state"
+REMINDER_STATE_MTIME_CACHE_KEY = "_reminder_state_mtime"
 
 
-def load_reminder_state(application=None):
-    if application is not None:
+def load_reminder_state(application=None, force_reload=False):
+    path = resolve_runtime_path(REMINDER_STATE_FILE)
+    path_mtime = None
+    try:
+        if path.exists():
+            path_mtime = path.stat().st_mtime_ns
+    except OSError:
+        path_mtime = None
+
+    if application is not None and not force_reload:
         cached_state = application.bot_data.get(REMINDER_STATE_CACHE_KEY)
-        if isinstance(cached_state, dict):
+        cached_mtime = application.bot_data.get(REMINDER_STATE_MTIME_CACHE_KEY)
+        if isinstance(cached_state, dict) and cached_mtime == path_mtime:
             return cached_state
 
-    path = resolve_runtime_path(REMINDER_STATE_FILE)
     if not path.exists():
         state = {}
     else:
@@ -2804,6 +2813,7 @@ def load_reminder_state(application=None):
 
     if application is not None:
         application.bot_data[REMINDER_STATE_CACHE_KEY] = state
+        application.bot_data[REMINDER_STATE_MTIME_CACHE_KEY] = path_mtime
 
     return state
 
@@ -2811,9 +2821,6 @@ def load_reminder_state(application=None):
 def save_reminder_state(state, application=None):
     if not isinstance(state, dict):
         state = {}
-
-    if application is not None:
-        application.bot_data[REMINDER_STATE_CACHE_KEY] = state
 
     path = resolve_runtime_path(REMINDER_STATE_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2823,6 +2830,37 @@ def save_reminder_state(state, application=None):
         tmp_path.replace(path)
     except OSError:
         logger.exception("Failed to save reminder state to %s", path)
+        if application is not None:
+            application.bot_data[REMINDER_STATE_CACHE_KEY] = state
+            application.bot_data[REMINDER_STATE_MTIME_CACHE_KEY] = None
+        return
+
+    if application is not None:
+        try:
+            path_mtime = path.stat().st_mtime_ns if path.exists() else None
+        except OSError:
+            path_mtime = None
+        application.bot_data[REMINDER_STATE_CACHE_KEY] = state
+        application.bot_data[REMINDER_STATE_MTIME_CACHE_KEY] = path_mtime
+
+
+async def edit_group_service_today_post(application, chat_id, message_id, text):
+    await application.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        parse_mode="HTML",
+    )
+
+
+def get_current_service_today_payload(application, chat_id):
+    state = load_reminder_state(application, force_reload=True)
+    posts = get_service_today_post_state(state)
+    return state, posts, posts.get(str(chat_id), {})
+
+
+def is_current_service_today_payload(payload, date_str):
+    return payload.get("date") == date_str and payload.get("message_id")
 
 
 MONTH_NAMES_RU = [
@@ -18948,14 +18986,11 @@ async def refresh_group_service_today_posts(application, force=False):
     text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
     date_str = format_date(current_dt)
 
-    state = load_reminder_state(application)
-    posts = get_service_today_post_state(state)
-
     for chat_id in sorted(ALLOWED_GROUP_CHAT_IDS):
+        state, posts, payload = get_current_service_today_payload(application, chat_id)
         chat_key = str(chat_id)
-        payload = posts.get(chat_key, {})
         message_id = payload.get("message_id")
-        is_current = payload.get("date") == date_str and message_id
+        is_current = is_current_service_today_payload(payload, date_str)
 
         if not is_current:
             try:
@@ -18980,12 +19015,7 @@ async def refresh_group_service_today_posts(application, force=False):
             continue
 
         try:
-            await application.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                parse_mode="HTML",
-            )
+            await edit_group_service_today_post(application, chat_id, message_id, text)
             posts[chat_key]["hash"] = text_hash
             save_reminder_state(state, application)
         except BadRequest as e:
@@ -18996,6 +19026,28 @@ async def refresh_group_service_today_posts(application, force=False):
                 continue
             if "message to edit not found" not in err.lower():
                 logger.warning("Failed to edit service-today post in chat %s: %s", chat_id, e)
+            else:
+                latest_state, latest_posts, latest_payload = get_current_service_today_payload(application, chat_id)
+                latest_message_id = latest_payload.get("message_id")
+                latest_is_current = is_current_service_today_payload(latest_payload, date_str)
+                if latest_is_current and latest_message_id != message_id:
+                    try:
+                        await edit_group_service_today_post(application, chat_id, latest_message_id, text)
+                        latest_posts[chat_key]["hash"] = text_hash
+                        save_reminder_state(latest_state, application)
+                        continue
+                    except BadRequest as latest_error:
+                        latest_err = str(latest_error).lower()
+                        if "message is not modified" in latest_err:
+                            latest_posts[chat_key]["hash"] = text_hash
+                            save_reminder_state(latest_state, application)
+                            continue
+                        if "message to edit not found" not in latest_err:
+                            logger.warning(
+                                "Failed to edit refreshed service-today post in chat %s: %s",
+                                chat_id,
+                                latest_error,
+                            )
             try:
                 sent = await application.bot.send_message(
                     chat_id=chat_id,
@@ -19015,11 +19067,10 @@ async def refresh_group_service_today_posts(application, force=False):
 
 
 async def maybe_send_group_reminder(application, reminder_key, text):
-    state = load_reminder_state(application)
-    sent = state.setdefault("sent", {})
-    reminders = get_group_reminder_message_state(state)
-
     for chat_id in sorted(ALLOWED_GROUP_CHAT_IDS):
+        state = load_reminder_state(application, force_reload=True)
+        sent = state.setdefault("sent", {})
+        reminders = get_group_reminder_message_state(state)
         chat_key = f"{chat_id}:{reminder_key}"
         if chat_key in sent:
             continue
@@ -19043,7 +19094,7 @@ async def process_group_reminders(application):
     current_date = now_local().date()
     current_dt = now_local()
     period_key = build_period_key(current_date.year, current_date.month)
-    state = load_reminder_state(application)
+    state = load_reminder_state(application, force_reload=True)
 
     await cleanup_expired_service_today_posts(application, state, current_dt)
     await cleanup_expired_group_reminders(application, state, current_dt)
