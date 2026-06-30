@@ -74,6 +74,7 @@ SERVICE_TODAY_GROUP_POST_HOUR = int(os.getenv("SERVICE_TODAY_GROUP_POST_HOUR", "
 SERVICE_TODAY_GROUP_DELETE_HOUR = int(os.getenv("SERVICE_TODAY_GROUP_DELETE_HOUR", "2"))
 HOME_REVISION_REMINDER_HOUR = int(os.getenv("HOME_REVISION_REMINDER_HOUR", "12"))
 MONTH_CLOSE_REVISION_REMINDER_HOUR = int(os.getenv("MONTH_CLOSE_REVISION_REMINDER_HOUR", "12"))
+REVISION_CURRENT_MONTH_OPEN_DAY = int(os.getenv("REVISION_CURRENT_MONTH_OPEN_DAY", "22"))
 GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS = float(os.getenv("GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS", "2.0"))
 GROUP_REPORT_SAVE_RETRY_MAX_ATTEMPTS = int(os.getenv("GROUP_REPORT_SAVE_RETRY_MAX_ATTEMPTS", "6"))
 GROUP_REPORT_SAVE_RETRY_INITIAL_DELAY_SECONDS = float(
@@ -2921,6 +2922,20 @@ def current_period_key():
 
 def recent_completed_period_keys(count=6):
     return [shift_period(current_period_key(), -(offset + 1)) for offset in range(count)]
+
+
+def is_current_revision_period_available(date_value=None):
+    current_date = date_value or now_local().date()
+    open_day = max(1, min(31, REVISION_CURRENT_MONTH_OPEN_DAY))
+    return current_date.day >= open_day
+
+
+def get_revision_period_keys(show_all=False):
+    total_count = 8 if show_all else 2
+    if is_current_revision_period_available():
+        completed_count = max(total_count - 1, 0)
+        return [current_period_key(), *recent_completed_period_keys(completed_count)]
+    return recent_completed_period_keys(total_count)
 
 
 def month_last_day(date_value):
@@ -8507,13 +8522,17 @@ def get_revision_context(context):
 
 
 def build_revision_period_markup(show_all=False, action=None):
-    periods = recent_completed_period_keys(8 if show_all else 2)
+    periods = get_revision_period_keys(show_all=show_all)
     keyboard = []
     row = []
+    current_period = current_period_key() if is_current_revision_period_available() else None
     for i, period in enumerate(periods):
+        label = format_period_label(period)
+        if period == current_period:
+            label += " · текущий"
         row.append(
             InlineKeyboardButton(
-                format_period_label(period),
+                label,
                 callback_data=f"rev_period_{period}",
             )
         )
@@ -8526,6 +8545,30 @@ def build_revision_period_markup(show_all=False, action=None):
         keyboard.append([InlineKeyboardButton("📅 Выбрать другой месяц", callback_data="rev_period_more")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_menu")])
     return InlineKeyboardMarkup(keyboard)
+
+
+def build_revision_period_menu_text(action=None):
+    current_open = is_current_revision_period_available()
+    titles = {
+        "fill": "📦 Ревизия\n\nВыберите месяц ревизии:",
+        "import": "📥 Импорт ревизии\n\nЗа какой месяц импортировать данные?",
+        "edit": "✏️ Ревизия\n\nКакой месяц изменить?",
+        "view": "📋 Ревизия\n\nКакой месяц посмотреть?",
+        "procurement": "🛒 Закупка по ревизии\n\nЗа какой месяц показать закупку?",
+        "compare": "📊 Ревизия\n\nКакой месяц сравнить с прошлым?",
+    }
+    if not current_open:
+        return {
+            "fill": "📦 Ревизия\n\nВыберите завершённый месяц:",
+            "import": "📥 Импорт ревизии\n\nЗа какой завершённый месяц импортировать данные?",
+            "edit": "✏️ Ревизия\n\nКакой завершённый месяц изменить?",
+            "view": "📋 Ревизия\n\nКакой завершённый месяц посмотреть?",
+            "procurement": "🛒 Закупка по ревизии\n\nЗа какой завершённый месяц показать закупку?",
+            "compare": "📊 Ревизия\n\nКакой завершённый месяц сравнить с прошлым?",
+        }.get(action, "📦 Выберите месяц:")
+
+    text = titles.get(action, "📦 Выберите месяц:")
+    return f"{text}\n\nТекущий месяц доступен с {REVISION_CURRENT_MONTH_OPEN_DAY} числа."
 
 
 def build_revision_location_markup(back_callback, action=None):
@@ -8664,18 +8707,10 @@ async def start_current_home_revision_check(update: Update, context):
 async def show_revision_period_menu(query, context):
     revision = get_revision_context(context)
     action = revision.get("action")
-    titles = {
-        "fill": "📦 Ревизия\n\nВыберите завершённый месяц:",
-        "import": "📥 Импорт ревизии\n\nЗа какой завершённый месяц импортировать данные?",
-        "edit": "✏️ Ревизия\n\nКакой завершённый месяц изменить?",
-        "view": "📋 Ревизия\n\nКакой завершённый месяц посмотреть?",
-        "procurement": "🛒 Закупка по ревизии\n\nЗа какой завершённый месяц показать закупку?",
-        "compare": "📊 Ревизия\n\nКакой завершённый месяц сравнить с прошлым?",
-    }
     await show_text_screen(
         query,
         context,
-        titles.get(action, "📦 Выберите месяц:"),
+        build_revision_period_menu_text(action),
         reply_markup=build_revision_period_markup(
             show_all=revision.get("show_all_periods", False),
             action=action,
