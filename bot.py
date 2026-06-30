@@ -8808,7 +8808,7 @@ async def show_revision_view_location_menu(query, context):
         query,
         context,
         "📍 Выберите точку:",
-        reply_markup=build_revision_location_markup("back_revision_period"),
+        reply_markup=build_revision_location_markup("back_revision_view_mode"),
     )
     return REVISION_VIEW_LOCATION
 
@@ -8821,7 +8821,7 @@ async def show_revision_view_item_menu(query, context):
         if len(row) == 2 or i == len(REVISION_ITEMS) - 1:
             keyboard.append(row)
             row = []
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_period")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_revision_view_mode")])
     await show_text_screen(query, context, "🧾 Выберите товар:", reply_markup=InlineKeyboardMarkup(keyboard))
     return REVISION_VIEW_ITEM
 
@@ -8831,7 +8831,7 @@ async def show_revision_compare_location_menu(query, context):
         query,
         context,
         "📊 Выберите точку для сравнения:",
-        reply_markup=build_revision_location_markup("back_revision_period"),
+        reply_markup=build_revision_location_markup("back_revision_view_mode"),
     )
     return REVISION_COMPARE_LOCATION
 
@@ -9133,6 +9133,8 @@ async def revision_location_handler(update: Update, context):
         return await start_current_home_revision_check(update, context)
     if query.data == "rev_home_view":
         return await show_current_home_revision_view(query, context)
+    if not query.data.startswith("revloc_"):
+        return REVISION_LOCATION
 
     location = query.data.replace("revloc_", "")
     revision["location"] = location
@@ -9466,6 +9468,8 @@ async def revision_view_location_handler(update: Update, context):
     await query.answer()
     revision = get_revision_context(context)
 
+    if query.data == "back_revision_period":
+        return await show_revision_period_menu(query, context)
     if query.data == "back_revision_view_mode":
         return await show_revision_view_mode_menu(query, context)
     if query.data == "back_revision_view_locations":
@@ -9473,6 +9477,8 @@ async def revision_view_location_handler(update: Update, context):
     if query.data == "rev_view_to_procurement":
         revision["action"] = "procurement"
         return await show_revision_procurement_screen(query, context, view="summary")
+    if not query.data.startswith("revloc_"):
+        return REVISION_VIEW_LOCATION
 
     location = query.data.replace("revloc_", "")
     await show_loading_state(query, context, "Загружаю ревизию точки...")
@@ -9501,6 +9507,8 @@ async def revision_view_item_handler(update: Update, context):
     await query.answer()
     revision = get_revision_context(context)
 
+    if query.data == "back_revision_period":
+        return await show_revision_period_menu(query, context)
     if query.data == "back_revision_view_mode":
         return await show_revision_view_mode_menu(query, context)
     if query.data == "back_revision_view_items":
@@ -9508,6 +9516,8 @@ async def revision_view_item_handler(update: Update, context):
     if query.data == "rev_view_to_procurement":
         revision["action"] = "procurement"
         return await show_revision_procurement_screen(query, context, view="summary")
+    if not query.data.startswith("revviewitem_"):
+        return REVISION_VIEW_ITEM
 
     item_name = query.data.replace("revviewitem_", "")
     await show_loading_state(query, context, "Загружаю ревизию по товару...")
@@ -9533,8 +9543,12 @@ async def revision_compare_location_handler(update: Update, context):
 
     if query.data == "back_revision_period":
         return await show_revision_period_menu(query, context)
+    if query.data == "back_revision_view_mode":
+        return await show_revision_view_mode_menu(query, context)
     if query.data == "back_revision_compare_locations":
         return await show_revision_compare_location_menu(query, context)
+    if not query.data.startswith("revloc_"):
+        return REVISION_COMPARE_LOCATION
 
     location = query.data.replace("revloc_", "")
     await show_loading_state(query, context, "Сравниваю ревизии...")
