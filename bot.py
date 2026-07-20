@@ -2447,7 +2447,7 @@ def restore_group_report_revision(record):
 def build_group_report_saved_text(draft, save_result=None):
     save_result = save_result or {}
     lines = [
-        "✅ Отчёт сохранён",
+        "✅ Отчёт обновлён" if save_result.get("updated_from_edit") else "✅ Отчёт сохранён",
         "",
         f"📍 {draft['point']}",
         f"📅 {draft['date']}",
@@ -2736,6 +2736,120 @@ def save_group_report_entry(draft):
         "who": draft.get("who", ""),
         "revision": revision_meta,
         "warnings": save_warnings,
+    }
+
+
+def update_group_report_entry_from_edit(draft, record):
+    service_entry = find_group_report_service_entry(record)
+    if not service_entry:
+        raise ValueError("saved service row not found for edited group message")
+
+    payload = build_group_report_payload(draft)
+    salary_workers = get_service_salary_workers_from_entry(service_entry)
+    payload["salary_workers"] = salary_workers
+    payload["service_sum"] = calculate_service_sum_for_workers(salary_workers)
+    service_row = service_entry["__row"]
+    run_group_sheet_write_blocking_with_retry(
+        lambda: update_service_row(service_row, payload),
+        "edited group report service row update",
+        draft=draft,
+    )
+
+    photo_rows = parse_logged_row_numbers(record.get("Photo_Rows", ""))
+    if photo_rows:
+        photos_by_row = {
+            photo["__row"]: photo
+            for photo in get_all_photos_with_rows()
+            if photo.get("__row") in photo_rows
+        }
+        for row_num in photo_rows:
+            photo = photos_by_row.get(row_num)
+            if not photo:
+                continue
+            run_group_sheet_write_blocking_with_retry(
+                lambda row=row_num, item=photo: update_photo_row(
+                    row,
+                    draft["date"],
+                    draft["point"],
+                    draft["who"],
+                    item.get("File_ID", ""),
+                ),
+                "edited group report photo update",
+                draft=draft,
+            )
+
+    revision_meta = None
+    revision = draft.get("revision")
+    existing_revision = find_group_report_revision_entry(record)
+    if revision and existing_revision:
+        values = build_revision_values_from_record(existing_revision)
+        values.update(revision.get("values", {}))
+        revision_payload = {
+            "period": revision["period"],
+            "location": revision["location"],
+            "who": draft.get("who", ""),
+            "filled_at": today(),
+            "values": values,
+        }
+        run_group_sheet_write_blocking_with_retry(
+            lambda: update_revision_row(existing_revision["__row"], revision_payload),
+            "edited group report revision update",
+            draft=draft,
+        )
+        revision_meta = {
+            "row": existing_revision["__row"],
+            "period": revision["period"],
+            "location": revision["location"],
+            "mode": record.get("Revision_Mode", "") or "updated",
+            "backup": record.get("Revision_Backup", ""),
+        }
+    elif revision:
+        revision_meta = run_group_sheet_write_blocking_with_retry(
+            lambda: save_group_report_revision(draft),
+            "edited group report revision save",
+            draft=draft,
+        )
+    elif existing_revision:
+        revision_meta = {
+            "row": existing_revision["__row"],
+            "period": record.get("Revision_Period", ""),
+            "location": record.get("Revision_Location", ""),
+            "mode": record.get("Revision_Mode", ""),
+            "backup": record.get("Revision_Backup", ""),
+        }
+
+    updated_log = {
+        "chat_id": draft["chat_id"],
+        "source_key": draft["source_key"],
+        "source_message_id": draft["source_message_id"],
+        "media_group_id": draft.get("media_group_id", ""),
+        "who": draft["who"],
+        "point": draft["point"],
+        "date": draft["date"],
+        "fingerprint": draft.get("fingerprint", ""),
+        "service_row": service_row,
+        "photo_rows": serialize_row_numbers(photo_rows),
+        "revision_row": (revision_meta or {}).get("row", ""),
+        "revision_period": (revision_meta or {}).get("period", ""),
+        "revision_location": (revision_meta or {}).get("location", ""),
+        "revision_mode": (revision_meta or {}).get("mode", ""),
+        "revision_backup": (revision_meta or {}).get("backup", ""),
+        "status": "saved",
+        "created_at": record.get("Создано", "") or format_group_report_created_at(),
+    }
+    run_group_sheet_write_blocking_with_retry(
+        lambda: update_group_report_log(record["__row"], updated_log),
+        "edited group report log update",
+        draft=draft,
+    )
+    return {
+        "log_row": record["__row"],
+        "service_row": service_row,
+        "photo_rows": photo_rows,
+        "who": draft.get("who", ""),
+        "revision": revision_meta,
+        "warnings": [],
+        "updated_from_edit": True,
     }
 
 
@@ -6884,20 +6998,16 @@ RICH_SANDBOX_DEMOS = {
 
 ## 🔴 Нужно сегодня
 
-| Точка | Давность | Причина |
-|:---|:---:|:---|
-| Сити | 3 дня | Нет стаканов |
-| Макси | 2 дня | Мало воды |
-| Южный | 2 дня | Плановый визит |
+- **Сити** · 3 дня — нет стаканов
+- **Макси** · 2 дня — мало воды
+- **Южный** · 2 дня — плановый визит
 
 ---
 
 ## 🟡 На контроле
 
-| Точка | Последний визит |
-|:---|:---:|
-| Гагарина | вчера ✓ |
-| Гиппо | вчера ✓ |
+- **Гагарина** · вчера ✓
+- **Гиппо** · вчера ✓
 
 <details><summary>✅ Уже обслужены сегодня · 2</summary>
 
@@ -6928,12 +7038,13 @@ RICH_SANDBOX_DEMOS = {
 
 ## Состояние сети
 
-| Точка | Вода | Статус | Кто |
-|:---|---:|:---:|:---|
-| Беломорский | 4 бут | 🟢 | Матвей |
-| Гагарина | 1 бут | 🟡 | Кирилл |
-| Сити | 0 бут | 🔴 | Матвей |
-| Макси | 3 бут | 🟢 | Кирилл |
+🟢 **Беломорский** · 4 бут · Матвей
+
+🟡 **Гагарина** · 1 бут · Кирилл
+
+🔴 **Сити** · 0 бут · Матвей
+
+🟢 **Макси** · 3 бут · Кирилл
 
 <details open><summary>⚠️ Требуют внимания · 2</summary>
 
@@ -6948,7 +7059,7 @@ RICH_SANDBOX_DEMOS = {
 
 </details>
 
-<footer>Компактная таблица вместо выравнивания пробелами</footer>""",
+<footer>Компактные строки без громоздкой таблицы</footer>""",
         "plain": """<b>📋 Сводка по точкам</b>
 
 ⚠️ <b>ПРОБЛЕМЫ (2)</b>
@@ -6966,17 +7077,13 @@ RICH_SANDBOX_DEMOS = {
 
 ## 🔴 Срочно заказать
 
-| Товар | На точках | Дома | Нужно |
-|:---|---:|---:|---:|
-| Стаканы | 2 туб | 0 | **8 туб** |
-| Молоко | 18 л | 6 л | **24 л** |
+- **Стаканы — 8 туб**<br>На точках 2 туб · дома нет
+- **Молоко — 24 л**<br>На точках 18 л · дома 6 л
 
 ## 🟡 Скоро закончится
 
-| Товар | Остаток сети | Рекомендация |
-|:---|---:|:---|
-| Сахар | 340 шт | заказать 500 |
-| Сиропы | 5 бут | заказать 6 |
+- **Сахар — заказать 500 шт**<br>Остаток сети 340 шт
+- **Сиропы — заказать 6 бут**<br>Остаток сети 5 бут
 
 <details><summary>📍 Где возникла нехватка</summary>
 
@@ -7012,24 +7119,23 @@ RICH_SANDBOX_DEMOS = {
 
 ## 📋 Основное
 
-| Поле | Значение |
-|:---|:---|
-| Аппарат | Necta Kikko |
-| Серийный номер | NK-24851 |
-| Статус | 🟡 В ремонте |
-| Гарантия | Нет |
+**Necta Kikko** · NK-24851
+
+🟡 В ремонте · гарантия: нет
+
+---
 
 ## 🧩 Поломка
 
 Не запускается кофемолка. При старте слышен щелчок, затем появляется ошибка.
 
+---
+
 ## 📅 Сроки и сервис
 
-| Поломка | Отправлен | План |
-|:---:|:---:|:---:|
-| 14.07 | 15.07 | 22.07 |
+**14.07** поломка → **15.07** отправлен → **22.07** план
 
-Сервис: **КофеСервис Москва** · +7 999 123-45-67
+**КофеСервис Москва**<br>+7 999 123-45-67
 
 <details><summary>💰 Расходы · 7 500 ₽</summary>
 
@@ -7071,25 +7177,18 @@ RICH_SANDBOX_DEMOS = {
 
 ## 🔴 Не оплачено
 
-| Точка | Сумма | До |
-|:---|---:|:---:|
-| Сити | 45 000 ₽ | 20.07 |
-| Южный | 38 000 ₽ | 22.07 |
+- **Сити — 45 000 ₽** · до 20.07
+- **Южный — 38 000 ₽** · до 22.07
 
 ## ✅ Оплачено
 
-| Точка | Сумма | Дата |
-|:---|---:|:---:|
-| Беломорский | 42 000 ₽ | 05.07 |
-| Гагарина | 36 000 ₽ | 08.07 |
-| Макси | 51 000 ₽ | 10.07 |
+- **Беломорский — 42 000 ₽** · 05.07
+- **Гагарина — 36 000 ₽** · 08.07
+- **Макси — 51 000 ₽** · 10.07
 
 ---
 
-| Итого | Сумма |
-|:---|---:|
-| Оплачено | **129 000 ₽** |
-| Осталось | **83 000 ₽** |
+Оплачено: **129 000 ₽**<br>Осталось: **83 000 ₽**
 
 <footer>Оплачено 3 из 5 договоров · 60%</footer>""",
         "plain": """<b>🏠 Аренда — июль 2026</b>
@@ -17258,6 +17357,7 @@ async def process_group_report_message(message, application, photo_ids=None):
         draft["warnings"] = list(draft.get("warnings", [])) + revision_warnings
     draft["fingerprint"] = build_group_report_fingerprint(draft)
 
+    save_result = None
     try:
         async with GROUP_REPORT_SAVE_LOCK:
             existing, duplicate = await run_blocking(
@@ -17268,21 +17368,32 @@ async def process_group_report_message(message, application, photo_ids=None):
             )
             if existing and existing.get("Статус") in {"saved", "ignored", "deleted"}:
                 status = existing.get("Статус")
-                if status == "saved":
+                is_edited_message = bool(getattr(message, "edit_date", None))
+                fingerprint_changed = str(existing.get("Fingerprint", "")) != str(draft.get("fingerprint", ""))
+                if status == "saved" and is_edited_message and fingerprint_changed:
+                    save_result = await run_group_sheet_write_with_retry(
+                        lambda current_draft: update_group_report_entry_from_edit(current_draft, existing),
+                        draft,
+                        "edited group report update",
+                        application=application,
+                    )
+                    existing = None
+                elif status == "saved":
                     text = "⚪ Этот отчёт уже сохранён."
                 elif status == "deleted":
                     text = "⚪ Этот отчёт уже был отмечен как «не учитывать»."
                 else:
                     text = "⚪ Этот отчёт уже обработан."
-                await send_group_report_feedback_message(
-                    application,
-                    draft["chat_id"],
-                    draft["source_message_id"],
-                    text,
-                )
-                return
+                if existing is not None:
+                    await send_group_report_feedback_message(
+                        application,
+                        draft["chat_id"],
+                        draft["source_message_id"],
+                        text,
+                    )
+                    return
 
-            if duplicate:
+            if save_result is None and duplicate:
                 await send_group_report_feedback_message(
                     application,
                     draft["chat_id"],
@@ -17291,33 +17402,35 @@ async def process_group_report_message(message, application, photo_ids=None):
                 )
                 return
 
-            semantic_duplicates = await run_blocking(
-                find_service_semantic_duplicates,
-                build_group_report_payload(draft),
-                None,
-            )
-            if semantic_duplicates:
-                cleanup_expired_group_report_drafts(application.bot_data)
-                draft_id = next_group_report_draft_id(application.bot_data)
-                draft_copy = dict(draft)
-                draft_copy["created_at_ts"] = datetime.now().timestamp()
-                draft_copy["draft_mode"] = "service_duplicate_warning"
-                get_group_report_drafts(application.bot_data)[draft_id] = draft_copy
-                await send_group_report_feedback_message(
-                    application,
-                    draft["chat_id"],
-                    draft["source_message_id"],
-                    build_group_report_duplicate_warning_text(draft, semantic_duplicates),
-                    reply_markup=build_group_report_duplicate_draft_markup(draft_id),
+            if save_result is None:
+                semantic_duplicates = await run_blocking(
+                    find_service_semantic_duplicates,
+                    build_group_report_payload(draft),
+                    None,
                 )
-                return
+                if semantic_duplicates:
+                    cleanup_expired_group_report_drafts(application.bot_data)
+                    draft_id = next_group_report_draft_id(application.bot_data)
+                    draft_copy = dict(draft)
+                    draft_copy["created_at_ts"] = datetime.now().timestamp()
+                    draft_copy["draft_mode"] = "service_duplicate_warning"
+                    get_group_report_drafts(application.bot_data)[draft_id] = draft_copy
+                    await send_group_report_feedback_message(
+                        application,
+                        draft["chat_id"],
+                        draft["source_message_id"],
+                        build_group_report_duplicate_warning_text(draft, semantic_duplicates),
+                        reply_markup=build_group_report_duplicate_draft_markup(draft_id),
+                    )
+                    return
 
-            save_result = await run_group_sheet_write_with_retry(
-                save_group_report_entry,
-                draft,
-                "group report save",
-                application=application,
-            )
+            if save_result is None:
+                save_result = await run_group_sheet_write_with_retry(
+                    save_group_report_entry,
+                    draft,
+                    "group report save",
+                    application=application,
+                )
     except APIError as error:
         if is_google_sheets_busy_error(error):
             logger.exception(
