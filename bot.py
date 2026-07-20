@@ -84,6 +84,7 @@ GROUP_REPORT_SAVE_RETRY_MAX_DELAY_SECONDS = float(
     os.getenv("GROUP_REPORT_SAVE_RETRY_MAX_DELAY_SECONDS", "30.0")
 )
 GROUP_REPORT_REFRESH_DEBOUNCE_SECONDS = float(os.getenv("GROUP_REPORT_REFRESH_DEBOUNCE_SECONDS", "12.0"))
+RICH_SANDBOX_ENABLED = os.getenv("RICH_SANDBOX_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 if PHOTO_CHAT_ID_RAW:
     try:
@@ -6874,6 +6875,340 @@ def back_markup(callback_data, text="⬅️ Назад"):
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=callback_data)]])
 
 
+RICH_SANDBOX_DEMOS = {
+    "service": {
+        "title": "🔔 Обслуживание сегодня",
+        "rich": """# 🔔 Обслуживание — 20 июля
+
+<mark>3 точки требуют визита сегодня</mark>
+
+## 🔴 Нужно сегодня
+
+| Точка | Давность | Причина |
+|:---|:---:|:---|
+| Сити | 3 дня | Нет стаканов |
+| Макси | 2 дня | Мало воды |
+| Южный | 2 дня | Плановый визит |
+
+---
+
+## 🟡 На контроле
+
+| Точка | Последний визит |
+|:---|:---:|
+| Гагарина | вчера ✓ |
+| Гиппо | вчера ✓ |
+
+<details><summary>✅ Уже обслужены сегодня · 2</summary>
+
+- Беломорский — Матвей
+- Бел2 — Кирилл
+
+</details>
+
+<footer>Демонстрационные данные · рабочая логика не изменена</footer>""",
+        "plain": """<b>🔔 Обслуживание — 20 июля</b>
+
+🔴 <b>Нужно сегодня (3)</b>
+Сити — 3 дня · нет стаканов
+Макси — 2 дня · мало воды
+Южный — 2 дня · плановый визит
+
+🟡 <b>На контроле (2)</b>
+Гагарина — вчера ✓
+Гиппо — вчера ✓
+
+✅ <b>Уже обслужены сегодня (2)</b>
+Беломорский — Матвей
+Бел2 — Кирилл""",
+    },
+    "points": {
+        "title": "📋 Сводка по точкам",
+        "rich": """# 📋 Сводка по точкам
+
+## Состояние сети
+
+| Точка | Вода | Статус | Кто |
+|:---|---:|:---:|:---|
+| Беломорский | 4 бут | 🟢 | Матвей |
+| Гагарина | 1 бут | 🟡 | Кирилл |
+| Сити | 0 бут | 🔴 | Матвей |
+| Макси | 3 бут | 🟢 | Кирилл |
+
+<details open><summary>⚠️ Требуют внимания · 2</summary>
+
+- **Сити** — нет стаканов, воды нет
+- **Гагарина** — осталась 1 бутылка воды
+
+</details>
+
+<details><summary>🟢 Точки без замечаний · 5</summary>
+
+Беломорский, Гиппо, Южный, Макси и Бел2
+
+</details>
+
+<footer>Компактная таблица вместо выравнивания пробелами</footer>""",
+        "plain": """<b>📋 Сводка по точкам</b>
+
+⚠️ <b>ПРОБЛЕМЫ (2)</b>
+Сити — 0 бут · нет стаканов
+Гагарина — 1 бут · мало воды
+
+🟢 <b>НОРМА (5)</b>
+Беломорский — 4 бут · Матвей
+Макси — 3 бут · Кирилл
+Гиппо, Южный и Бел2 — без замечаний""",
+    },
+    "procurement": {
+        "title": "🛒 Закупка и остатки",
+        "rich": """# 🛒 Закупка — июль 2026
+
+## 🔴 Срочно заказать
+
+| Товар | На точках | Дома | Нужно |
+|:---|---:|---:|---:|
+| Стаканы | 2 туб | 0 | **8 туб** |
+| Молоко | 18 л | 6 л | **24 л** |
+
+## 🟡 Скоро закончится
+
+| Товар | Остаток сети | Рекомендация |
+|:---|---:|:---|
+| Сахар | 340 шт | заказать 500 |
+| Сиропы | 5 бут | заказать 6 |
+
+<details><summary>📍 Где возникла нехватка</summary>
+
+- **Сити:** стаканы, сахар
+- **Южный:** молоко
+- **Макси:** сиропы
+
+</details>
+
+<blockquote>Приоритет: сначала стаканы и молоко.</blockquote>
+
+<footer>Демо на основе структуры текущего отчёта по закупке</footer>""",
+        "plain": """<b>🛒 Закупка — июль 2026</b>
+
+🔴 <b>СРОЧНО</b>
+Стаканы ........ 8 туб
+Молоко ......... 24 л
+
+🟡 <b>Скоро заказать</b>
+Сахар .......... 500 шт
+Сиропы ......... 6 бут
+
+📍 <b>На точках</b>
+Сити — стаканы, сахар
+Южный — молоко
+Макси — сиропы""",
+    },
+    "repair": {
+        "title": "🛠 Карточка ремонта",
+        "rich": """# 🛠 R-024 · Сити
+
+<mark>Аппарат находится в ремонте 6 дней</mark>
+
+## 📋 Основное
+
+| Поле | Значение |
+|:---|:---|
+| Аппарат | Necta Kikko |
+| Серийный номер | NK-24851 |
+| Статус | 🟡 В ремонте |
+| Гарантия | Нет |
+
+## 🧩 Поломка
+
+Не запускается кофемолка. При старте слышен щелчок, затем появляется ошибка.
+
+## 📅 Сроки и сервис
+
+| Поломка | Отправлен | План |
+|:---:|:---:|:---:|
+| 14.07 | 15.07 | 22.07 |
+
+Сервис: **КофеСервис Москва** · +7 999 123-45-67
+
+<details><summary>💰 Расходы · 7 500 ₽</summary>
+
+- ✅ Диагностика — 1 500 ₽
+- ⏳ Запчасти — 6 000 ₽
+
+</details>
+
+<details><summary>📎 Документы · 2</summary>
+
+- Акт приёма — 15.07
+- Счёт на запчасти — 18.07
+
+</details>
+
+<footer>В следующем этапе сюда можно встроить фото аппарата и документы</footer>""",
+        "plain": """<b>🛠 R-024 · Сити</b>
+
+<b>📋 Основное</b>
+Аппарат     Necta Kikko
+Серийник   NK-24851
+Статус     🟡 В ремонте
+Гарантия   Нет
+
+<b>🧩 Поломка</b>
+Не запускается кофемолка.
+
+<b>📅 Сроки</b>
+Поломка 14.07 · отправлен 15.07 · план 22.07
+
+<b>💰 Расходы</b>
+Диагностика — 1 500 ₽
+Запчасти — 6 000 ₽
+Итого — 7 500 ₽""",
+    },
+    "rent": {
+        "title": "🏠 Аренда",
+        "rich": """# 🏠 Аренда — июль 2026
+
+## 🔴 Не оплачено
+
+| Точка | Сумма | До |
+|:---|---:|:---:|
+| Сити | 45 000 ₽ | 20.07 |
+| Южный | 38 000 ₽ | 22.07 |
+
+## ✅ Оплачено
+
+| Точка | Сумма | Дата |
+|:---|---:|:---:|
+| Беломорский | 42 000 ₽ | 05.07 |
+| Гагарина | 36 000 ₽ | 08.07 |
+| Макси | 51 000 ₽ | 10.07 |
+
+---
+
+| Итого | Сумма |
+|:---|---:|
+| Оплачено | **129 000 ₽** |
+| Осталось | **83 000 ₽** |
+
+<footer>Оплачено 3 из 5 договоров · 60%</footer>""",
+        "plain": """<b>🏠 Аренда — июль 2026</b>
+
+🔴 Не оплачено
+Сити ........ 45 000 ₽
+Южный ....... 38 000 ₽
+
+✅ Оплачено
+Беломорский . 42 000 ₽ · 05.07
+Гагарина .... 36 000 ₽ · 08.07
+Макси ....... 51 000 ₽ · 10.07
+
+Итого
+Оплачено .... 129 000 ₽
+Осталось .... 83 000 ₽
+
+██████████░░░░░░ 60%""",
+    },
+}
+
+
+def build_rich_sandbox_menu_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔔 Обслуживание сегодня", callback_data="rich_demo:service")],
+        [InlineKeyboardButton("📋 Сводка по точкам", callback_data="rich_demo:points")],
+        [InlineKeyboardButton("🛒 Закупка и остатки", callback_data="rich_demo:procurement")],
+        [InlineKeyboardButton("🛠 Карточка ремонта", callback_data="rich_demo:repair")],
+        [InlineKeyboardButton("🏠 Аренда", callback_data="rich_demo:rent")],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data="back_main")],
+    ])
+
+
+def build_rich_sandbox_preview_markup(demo_key, rich_view=True):
+    toggle_text = "📄 Показать обычный вид" if rich_view else "✨ Показать Rich-вид"
+    toggle_prefix = "rich_plain" if rich_view else "rich_demo"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_text, callback_data=f"{toggle_prefix}:{demo_key}")],
+        [InlineKeyboardButton("⬅️ Все примеры", callback_data="rich_sandbox")],
+        [InlineKeyboardButton("🏠 В главное меню", callback_data="back_main")],
+    ])
+
+
+async def edit_rich_message(query, context, markdown, reply_markup=None):
+    message = getattr(query, "message", None)
+    if not message:
+        raise BadRequest("Rich Sandbox requires a callback message")
+
+    api_kwargs = {
+        "chat_id": message.chat_id,
+        "message_id": message.message_id,
+        "rich_message": {
+            "markdown": markdown,
+            "skip_entity_detection": True,
+        },
+    }
+    if reply_markup is not None:
+        api_kwargs["reply_markup"] = reply_markup.to_dict()
+
+    return await context.bot.do_api_request(
+        endpoint="editMessageText",
+        api_kwargs=api_kwargs,
+    )
+
+
+async def show_rich_sandbox_menu(query, context):
+    rich_text = """# 🧪 Rich Sandbox
+
+Здесь можно сравнить экспериментальное оформление с текущим видом сообщений.
+
+- Все данные в примерах вымышлены.
+- Google Sheets не читаются и не изменяются.
+- Рабочие разделы бота продолжают использовать прежние сообщения.
+
+<footer>Выберите экран для просмотра</footer>"""
+    fallback_text = (
+        "<b>🧪 Rich Sandbox</b>\n\n"
+        "Здесь можно сравнить экспериментальное оформление с текущим видом сообщений.\n\n"
+        "Все данные вымышлены, рабочие разделы и Google Sheets не затрагиваются."
+    )
+    markup = build_rich_sandbox_menu_markup()
+    try:
+        await edit_rich_message(query, context, rich_text, markup)
+    except Exception as exc:
+        logger.warning("Rich Sandbox menu fell back to HTML: %s", exc)
+        await show_text_screen(query, context, fallback_text, reply_markup=markup, parse_mode="HTML")
+    return MAIN_MENU
+
+
+async def show_rich_sandbox_demo(query, context, demo_key, rich_view=True):
+    demo = RICH_SANDBOX_DEMOS.get(demo_key)
+    if not demo:
+        return await show_rich_sandbox_menu(query, context)
+
+    markup = build_rich_sandbox_preview_markup(demo_key, rich_view=rich_view)
+    if not rich_view:
+        await show_text_screen(
+            query,
+            context,
+            demo["plain"],
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+        return MAIN_MENU
+
+    try:
+        await edit_rich_message(query, context, demo["rich"], markup)
+    except Exception as exc:
+        logger.warning("Rich Sandbox demo %s fell back to HTML: %s", demo_key, exc)
+        await show_text_screen(
+            query,
+            context,
+            f"<b>Rich-режим пока недоступен.</b> Показываю обычную версию.\n\n{demo['plain']}",
+            reply_markup=build_rich_sandbox_preview_markup(demo_key, rich_view=False),
+            parse_mode="HTML",
+        )
+    return MAIN_MENU
+
+
 async def safe_delete_callback_message(query):
     try:
         await query.delete_message()
@@ -9910,6 +10245,8 @@ async def start(update: Update, context):
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
     ]
+    if RICH_SANDBOX_ENABLED:
+        keyboard.append([InlineKeyboardButton("🧪 Rich Sandbox", callback_data="rich_sandbox")])
     text = "<b>☕ Кофе-бот</b>\n\nВыберите действие:"
     if update.callback_query:
         await show_text_screen(
@@ -14215,6 +14552,12 @@ async def main_menu_handler(update: Update, context):
     d = query.data
     if d == "back_main":
         return await start(update, context)
+    elif d == "rich_sandbox":
+        return await show_rich_sandbox_menu(query, context)
+    elif d.startswith("rich_demo:"):
+        return await show_rich_sandbox_demo(query, context, d.split(":", 1)[1], rich_view=True)
+    elif d.startswith("rich_plain:"):
+        return await show_rich_sandbox_demo(query, context, d.split(":", 1)[1], rich_view=False)
     elif d == "info":
         return await info_menu(update, context)
     elif d == "service":
