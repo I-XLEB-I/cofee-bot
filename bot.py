@@ -3544,6 +3544,10 @@ def resolve_revision_restock_item_name(value):
 
 
 def parse_import_number(value):
+    normalized = normalize_text_key(value)
+    if normalized in {"нет", "нету", "отсутствует", "отсутствуют"}:
+        return "0"
+
     match = re.search(r"-?\d+(?:[.,]\d+)?", str(value))
     if not match:
         return None
