@@ -1807,6 +1807,97 @@ def extract_service_report_water(text):
     return ""
 
 
+SERVICE_REPORT_PURCHASE_ITEM_ALIASES = {
+    "бак воды": "Вода 19л",
+    "бака воды": "Вода 19л",
+    "баков воды": "Вода 19л",
+    "вода 19л": "Вода 19л",
+    "вода": "Вода 19л",
+    "воды": "Вода 19л",
+    "влажные салфетки": "Влажные салфетки",
+    "салфетки влажные": "Влажные салфетки",
+    "влажные салф": "Влажные салфетки",
+    "мусорные пакеты": "Мусорные пакеты",
+    "мус пакеты": "Мусорные пакеты",
+    "мус.пакеты": "Мусорные пакеты",
+}
+
+
+def resolve_service_report_purchase_item(text):
+    normalized = normalize_text_key(text)
+    if not normalized:
+        return None
+
+    alias_items = sorted(
+        SERVICE_REPORT_PURCHASE_ITEM_ALIASES.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    for alias, item_name in alias_items:
+        if contains_normalized_alias(normalized, alias):
+            return item_name
+    return None
+
+
+def extract_service_report_purchases(text):
+    purchase_items = []
+    warnings = []
+
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        normalized_line = normalize_text_key(line)
+        if not normalized_line:
+            continue
+        if not any(trigger in normalized_line for trigger in ("куп", "покуп", "закуп")):
+            continue
+
+        item_name = resolve_service_report_purchase_item(line)
+        if not item_name:
+            continue
+
+        amount_match = re.search(
+            r"(\d+(?:[.,]\d+)?)\s*(?:₽|р\b|руб(?:\.|лей|ля)?)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if not amount_match:
+            warnings.append(f"не понял сумму закупки в строке: {line}")
+            continue
+
+        amount = parse_numeric_value(amount_match.group(1))
+        if amount is None:
+            warnings.append(f"не понял сумму закупки в строке: {line}")
+            continue
+
+        qty = "1"
+        qty_match = re.search(
+            r"(\d+(?:[.,]\d+)?)\s*(?:бак(?:а|ов)?|бут(?:ыл(?:ка|ки|ок))?|шт|пач(?:ка|ки|ек)|упак(?:овка|овки)?)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if qty_match:
+            try:
+                qty = normalize_number_text(qty_match.group(1))
+            except ValueError:
+                qty = "1"
+
+        purchase_items.append({
+            "name": item_name,
+            "qty": qty,
+            "sum": amount,
+            "is_custom": item_name not in PURCHASE_ITEMS,
+        })
+
+    if not purchase_items:
+        return "", 0, warnings
+
+    purchases, purchase_sum = build_purchase_summary(purchase_items)
+    return purchases, purchase_sum, warnings
+
+
 def extract_supply_names_from_text(text):
     normalized = normalize_text_key(text)
     found = []
@@ -1970,12 +2061,13 @@ def parse_service_report_message_text(text, has_photo=False):
     point = extract_service_report_point(raw_text)
     date, date_error = extract_service_report_date(raw_text)
     water = extract_service_report_water(raw_text)
+    purchases, purchase_sum, purchase_warnings = extract_service_report_purchases(raw_text)
     shortage_items = extract_service_report_shortage_items(raw_text)
 
     if not point or not date:
         return None
 
-    if not has_photo and not water and not shortage_items:
+    if not has_photo and not water and not shortage_items and not purchase_sum:
         return None
 
     warnings = []
@@ -1983,11 +2075,14 @@ def parse_service_report_message_text(text, has_photo=False):
         warnings.append(date_error)
     if not water:
         warnings.append("не нашёл воду, запись сохранится без воды")
+    warnings.extend(purchase_warnings)
 
     return {
         "point": point,
         "date": date,
         "water": water,
+        "purchases": purchases,
+        "purchase_sum": purchase_sum,
         "shortage_items": shortage_items,
         "warnings": warnings,
         "source_text": raw_text,
@@ -2010,6 +2105,13 @@ def build_group_report_preview_text(draft):
         lines.extend(f"• {item}" for item in shortage_items)
     else:
         lines.append("✅ Всё в наличии")
+
+    purchases = str(draft.get("purchases", "")).strip()
+    purchase_sum = parse_numeric_value(draft.get("purchase_sum", 0))
+    if purchases:
+        lines.append(f"🛒 Закупки: {purchases}")
+    if purchase_sum:
+        lines.append(f"💸 Сумма закупок: {format_money(purchase_sum)}")
 
     photo_count = len(draft.get("photo_ids", []))
     if photo_count:
@@ -2098,8 +2200,8 @@ def build_group_report_payload(draft):
         "water": draft.get("water", ""),
         "shortage": ", ".join(shortage_items),
         "shortage_qty": "",
-        "purchases": "",
-        "purchase_sum": 0,
+        "purchases": draft.get("purchases", ""),
+        "purchase_sum": draft.get("purchase_sum", 0),
         "service_sum": service_sum,
         "salary_workers": salary_workers,
     }
@@ -2359,6 +2461,13 @@ def build_group_report_saved_text(draft, save_result=None):
     else:
         lines.append("✅ Всё в наличии")
 
+    purchases = str(draft.get("purchases", "")).strip()
+    purchase_sum = parse_numeric_value(draft.get("purchase_sum", 0))
+    if purchases:
+        lines.append(f"🛒 Закупки: {purchases}")
+    if purchase_sum:
+        lines.append(f"💸 Сумма закупок: {format_money(purchase_sum)}")
+
     photo_count = len(draft.get("photo_ids", []))
     if photo_count:
         lines.append(f"📸 Фото: {photo_count}")
@@ -2528,17 +2637,58 @@ def build_revision_restock_saved_markup(save_result):
     ])
 
 
+def run_group_sheet_write_blocking_with_retry(write_callable, operation_label, draft=None):
+    delay_seconds = max(GROUP_REPORT_SAVE_RETRY_INITIAL_DELAY_SECONDS, 0.0)
+    max_attempts = max(1, GROUP_REPORT_SAVE_RETRY_MAX_ATTEMPTS)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return write_callable()
+        except APIError as error:
+            if not is_google_sheets_busy_error(error) or attempt >= max_attempts:
+                raise
+
+            logger.warning(
+                "Google Sheets busy during %s, retrying blocking attempt %s/%s: point=%s date=%s who=%s",
+                operation_label,
+                attempt + 1,
+                max_attempts,
+                (draft or {}).get("point", ""),
+                (draft or {}).get("date", ""),
+                (draft or {}).get("who", ""),
+            )
+            time.sleep(delay_seconds)
+            delay_seconds = min(
+                max(delay_seconds * 2, GROUP_REPORT_SAVE_RETRY_INITIAL_DELAY_SECONDS),
+                GROUP_REPORT_SAVE_RETRY_MAX_DELAY_SECONDS,
+            )
+
+
 def save_group_report_entry(draft):
     payload = build_group_report_payload(draft)
-    service_row = add_service_row(payload)
+    service_row = run_group_sheet_write_blocking_with_retry(
+        lambda: add_service_row(payload),
+        "group report service row save",
+        draft=draft,
+    )
     auto_close_repair_for_point(draft.get("point"))
     photo_rows = []
     for file_id in draft.get("photo_ids", []):
-        photo_rows.append(add_photo_row(draft["date"], draft["point"], draft["who"], file_id))
+        photo_rows.append(
+            run_group_sheet_write_blocking_with_retry(
+                lambda fid=file_id: add_photo_row(draft["date"], draft["point"], draft["who"], fid),
+                "group report photo save",
+                draft=draft,
+            )
+        )
     revision_meta = None
     save_warnings = []
     try:
-        revision_meta = save_group_report_revision(draft)
+        revision_meta = run_group_sheet_write_blocking_with_retry(
+            lambda: save_group_report_revision(draft),
+            "group report revision auto-save",
+            draft=draft,
+        )
     except Exception:
         logger.exception(
             "Failed to auto-save revision from group message: point=%s date=%s who=%s",
@@ -2554,26 +2704,29 @@ def save_group_report_entry(draft):
         draft["date"],
     )
 
-    log_row = append_group_report_log(
-        {
-            "chat_id": draft["chat_id"],
-            "source_key": draft["source_key"],
-            "source_message_id": draft["source_message_id"],
-            "media_group_id": draft.get("media_group_id", ""),
-            "who": draft["who"],
-            "point": draft["point"],
-            "date": draft["date"],
-            "fingerprint": draft.get("fingerprint", ""),
-            "service_row": service_row,
-            "photo_rows": serialize_row_numbers(photo_rows),
-            "revision_row": (revision_meta or {}).get("row", ""),
-            "revision_period": (revision_meta or {}).get("period", ""),
-            "revision_location": (revision_meta or {}).get("location", ""),
-            "revision_mode": (revision_meta or {}).get("mode", ""),
-            "revision_backup": (revision_meta or {}).get("backup", ""),
-            "status": "saved",
-            "created_at": format_group_report_created_at(),
-        }
+    log_payload = {
+        "chat_id": draft["chat_id"],
+        "source_key": draft["source_key"],
+        "source_message_id": draft["source_message_id"],
+        "media_group_id": draft.get("media_group_id", ""),
+        "who": draft["who"],
+        "point": draft["point"],
+        "date": draft["date"],
+        "fingerprint": draft.get("fingerprint", ""),
+        "service_row": service_row,
+        "photo_rows": serialize_row_numbers(photo_rows),
+        "revision_row": (revision_meta or {}).get("row", ""),
+        "revision_period": (revision_meta or {}).get("period", ""),
+        "revision_location": (revision_meta or {}).get("location", ""),
+        "revision_mode": (revision_meta or {}).get("mode", ""),
+        "revision_backup": (revision_meta or {}).get("backup", ""),
+        "status": "saved",
+        "created_at": format_group_report_created_at(),
+    }
+    log_row = run_group_sheet_write_blocking_with_retry(
+        lambda: append_group_report_log(log_payload),
+        "group report log save",
+        draft=draft,
     )
     return {
         "log_row": log_row,
@@ -2602,7 +2755,11 @@ def save_revision_restock_entry(draft):
         "values": values,
     }
     if existing:
-        update_revision_row(existing["__row"], payload)
+        run_group_sheet_write_blocking_with_retry(
+            lambda: update_revision_row(existing["__row"], payload),
+            "revision restock update",
+            draft=draft,
+        )
         revision_meta = {
             "row": existing["__row"],
             "period": draft["period"],
@@ -2611,7 +2768,11 @@ def save_revision_restock_entry(draft):
             "backup": build_group_report_revision_backup(existing),
         }
     else:
-        row_num = add_revision_row(payload)
+        row_num = run_group_sheet_write_blocking_with_retry(
+            lambda: add_revision_row(payload),
+            "revision restock create",
+            draft=draft,
+        )
         revision_meta = {
             "row": row_num,
             "period": draft["period"],
@@ -2620,26 +2781,29 @@ def save_revision_restock_entry(draft):
             "backup": "",
         }
 
-    log_row = append_group_report_log(
-        {
-            "chat_id": draft["chat_id"],
-            "source_key": draft["source_key"],
-            "source_message_id": draft["source_message_id"],
-            "media_group_id": draft.get("media_group_id", ""),
-            "who": draft.get("who", ""),
-            "point": draft["point"],
-            "date": draft["date"],
-            "fingerprint": draft.get("fingerprint", ""),
-            "service_row": "",
-            "photo_rows": "",
-            "revision_row": revision_meta.get("row", ""),
-            "revision_period": revision_meta.get("period", ""),
-            "revision_location": revision_meta.get("location", ""),
-            "revision_mode": revision_meta.get("mode", ""),
-            "revision_backup": revision_meta.get("backup", ""),
-            "status": "saved",
-            "created_at": format_group_report_created_at(),
-        }
+    log_payload = {
+        "chat_id": draft["chat_id"],
+        "source_key": draft["source_key"],
+        "source_message_id": draft["source_message_id"],
+        "media_group_id": draft.get("media_group_id", ""),
+        "who": draft.get("who", ""),
+        "point": draft["point"],
+        "date": draft["date"],
+        "fingerprint": draft.get("fingerprint", ""),
+        "service_row": "",
+        "photo_rows": "",
+        "revision_row": revision_meta.get("row", ""),
+        "revision_period": revision_meta.get("period", ""),
+        "revision_location": revision_meta.get("location", ""),
+        "revision_mode": revision_meta.get("mode", ""),
+        "revision_backup": revision_meta.get("backup", ""),
+        "status": "saved",
+        "created_at": format_group_report_created_at(),
+    }
+    log_row = run_group_sheet_write_blocking_with_retry(
+        lambda: append_group_report_log(log_payload),
+        "revision restock log save",
+        draft=draft,
     )
     return {
         "log_row": log_row,
@@ -2665,7 +2829,11 @@ def save_revision_message_entry(draft):
         "values": values,
     }
     if existing:
-        update_revision_row(existing["__row"], payload)
+        run_group_sheet_write_blocking_with_retry(
+            lambda: update_revision_row(existing["__row"], payload),
+            "revision snapshot update",
+            draft=draft,
+        )
         revision_meta = {
             "row": existing["__row"],
             "period": draft["period"],
@@ -2674,7 +2842,11 @@ def save_revision_message_entry(draft):
             "backup": build_group_report_revision_backup(existing),
         }
     else:
-        row_num = add_revision_row(payload)
+        row_num = run_group_sheet_write_blocking_with_retry(
+            lambda: add_revision_row(payload),
+            "revision snapshot create",
+            draft=draft,
+        )
         revision_meta = {
             "row": row_num,
             "period": draft["period"],
@@ -2683,26 +2855,29 @@ def save_revision_message_entry(draft):
             "backup": "",
         }
 
-    log_row = append_group_report_log(
-        {
-            "chat_id": draft["chat_id"],
-            "source_key": draft["source_key"],
-            "source_message_id": draft["source_message_id"],
-            "media_group_id": draft.get("media_group_id", ""),
-            "who": draft.get("who", ""),
-            "point": draft["point"],
-            "date": draft["date"],
-            "fingerprint": draft.get("fingerprint", ""),
-            "service_row": "",
-            "photo_rows": "",
-            "revision_row": revision_meta.get("row", ""),
-            "revision_period": revision_meta.get("period", ""),
-            "revision_location": revision_meta.get("location", ""),
-            "revision_mode": revision_meta.get("mode", ""),
-            "revision_backup": revision_meta.get("backup", ""),
-            "status": "saved",
-            "created_at": format_group_report_created_at(),
-        }
+    log_payload = {
+        "chat_id": draft["chat_id"],
+        "source_key": draft["source_key"],
+        "source_message_id": draft["source_message_id"],
+        "media_group_id": draft.get("media_group_id", ""),
+        "who": draft.get("who", ""),
+        "point": draft["point"],
+        "date": draft["date"],
+        "fingerprint": draft.get("fingerprint", ""),
+        "service_row": "",
+        "photo_rows": "",
+        "revision_row": revision_meta.get("row", ""),
+        "revision_period": revision_meta.get("period", ""),
+        "revision_location": revision_meta.get("location", ""),
+        "revision_mode": revision_meta.get("mode", ""),
+        "revision_backup": revision_meta.get("backup", ""),
+        "status": "saved",
+        "created_at": format_group_report_created_at(),
+    }
+    log_row = run_group_sheet_write_blocking_with_retry(
+        lambda: append_group_report_log(log_payload),
+        "revision snapshot log save",
+        draft=draft,
     )
     return {
         "log_row": log_row,
@@ -2716,28 +2891,37 @@ def save_revision_message_entry(draft):
 def save_group_travel_entry(draft):
     row_numbers = []
     for amount in draft.get("travel_amounts", []):
-        row_numbers.append(add_travel_row(draft["date"], draft["who"], amount))
+        row_numbers.append(
+            run_group_sheet_write_blocking_with_retry(
+                lambda value=amount: add_travel_row(draft["date"], draft["who"], value),
+                "group travel row save",
+                draft=draft,
+            )
+        )
 
-    log_row = append_group_report_log(
-        {
-            "chat_id": draft["chat_id"],
-            "source_key": draft["source_key"],
-            "source_message_id": draft["source_message_id"],
-            "media_group_id": draft.get("media_group_id", ""),
-            "who": draft["who"],
-            "point": "__travel__",
-            "date": draft["date"],
-            "fingerprint": draft.get("fingerprint", ""),
-            "service_row": serialize_row_numbers(row_numbers),
-            "photo_rows": "",
-            "revision_row": "",
-            "revision_period": "",
-            "revision_location": "",
-            "revision_mode": "",
-            "revision_backup": "",
-            "status": "saved",
-            "created_at": format_group_report_created_at(),
-        }
+    log_payload = {
+        "chat_id": draft["chat_id"],
+        "source_key": draft["source_key"],
+        "source_message_id": draft["source_message_id"],
+        "media_group_id": draft.get("media_group_id", ""),
+        "who": draft["who"],
+        "point": "__travel__",
+        "date": draft["date"],
+        "fingerprint": draft.get("fingerprint", ""),
+        "service_row": serialize_row_numbers(row_numbers),
+        "photo_rows": "",
+        "revision_row": "",
+        "revision_period": "",
+        "revision_location": "",
+        "revision_mode": "",
+        "revision_backup": "",
+        "status": "saved",
+        "created_at": format_group_report_created_at(),
+    }
+    log_row = run_group_sheet_write_blocking_with_retry(
+        lambda: append_group_report_log(log_payload),
+        "group travel log save",
+        draft=draft,
     )
     return log_row
 
