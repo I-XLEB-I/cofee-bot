@@ -2818,6 +2818,15 @@ def update_group_report_entry_from_edit(draft, record):
             "backup": record.get("Revision_Backup", ""),
         }
 
+    if revision_meta:
+        logger.info(
+            "revision saved from edited service report: point=%s period=%s row=%s mode=%s",
+            revision_meta.get("location", ""),
+            revision_meta.get("period", ""),
+            revision_meta.get("row", ""),
+            revision_meta.get("mode", ""),
+        )
+
     updated_log = {
         "chat_id": draft["chat_id"],
         "source_key": draft["source_key"],
@@ -2846,6 +2855,90 @@ def update_group_report_entry_from_edit(draft, record):
         "log_row": record["__row"],
         "service_row": service_row,
         "photo_rows": photo_rows,
+        "who": draft.get("who", ""),
+        "revision": revision_meta,
+        "warnings": [],
+        "updated_from_edit": True,
+    }
+
+
+def update_revision_message_entry_from_edit(draft, record):
+    existing = find_group_report_revision_entry(record)
+    if not existing:
+        existing = find_revision_record(draft["period"], draft["point"], True)
+
+    values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
+    for item_name, value in draft.get("values", {}).items():
+        values[item_name] = value
+
+    payload = {
+        "period": draft["period"],
+        "location": draft["point"],
+        "who": draft.get("who", ""),
+        "filled_at": today(),
+        "values": values,
+    }
+    if existing:
+        run_group_sheet_write_blocking_with_retry(
+            lambda: update_revision_row(existing["__row"], payload),
+            "edited revision snapshot update",
+            draft=draft,
+        )
+        revision_meta = {
+            "row": existing["__row"],
+            "period": draft["period"],
+            "location": draft["point"],
+            "mode": record.get("Revision_Mode", "") or "updated",
+            "backup": record.get("Revision_Backup", "") or build_group_report_revision_backup(existing),
+        }
+    else:
+        row_num = run_group_sheet_write_blocking_with_retry(
+            lambda: add_revision_row(payload),
+            "edited revision snapshot create",
+            draft=draft,
+        )
+        revision_meta = {
+            "row": row_num,
+            "period": draft["period"],
+            "location": draft["point"],
+            "mode": "created",
+            "backup": "",
+        }
+
+    updated_log = {
+        "chat_id": draft["chat_id"],
+        "source_key": draft["source_key"],
+        "source_message_id": draft["source_message_id"],
+        "media_group_id": draft.get("media_group_id", ""),
+        "who": draft.get("who", ""),
+        "point": draft["point"],
+        "date": draft["date"],
+        "fingerprint": draft.get("fingerprint", ""),
+        "service_row": record.get("Service_Row", ""),
+        "photo_rows": record.get("Photo_Rows", ""),
+        "revision_row": revision_meta["row"],
+        "revision_period": revision_meta["period"],
+        "revision_location": revision_meta["location"],
+        "revision_mode": revision_meta["mode"],
+        "revision_backup": revision_meta["backup"],
+        "status": "saved",
+        "created_at": record.get("Создано", "") or format_group_report_created_at(),
+    }
+    run_group_sheet_write_blocking_with_retry(
+        lambda: update_group_report_log(record["__row"], updated_log),
+        "edited revision snapshot log update",
+        draft=draft,
+    )
+    logger.info(
+        "revision saved from edited snapshot: point=%s period=%s row=%s mode=%s",
+        revision_meta["location"],
+        revision_meta["period"],
+        revision_meta["row"],
+        revision_meta["mode"],
+    )
+    return {
+        "log_row": record["__row"],
+        "service_row": record.get("Service_Row", ""),
         "who": draft.get("who", ""),
         "revision": revision_meta,
         "warnings": [],
@@ -17162,6 +17255,7 @@ async def process_group_report_message(message, application, photo_ids=None):
         draft["fingerprint"] = build_revision_message_fingerprint(draft)
 
         try:
+            save_result = None
             async with GROUP_REPORT_SAVE_LOCK:
                 existing, duplicate = await run_blocking(
                     find_group_report_duplicate,
@@ -17171,21 +17265,32 @@ async def process_group_report_message(message, application, photo_ids=None):
                 )
                 if existing and existing.get("Статус") in {"saved", "ignored", "deleted"}:
                     status = existing.get("Статус")
-                    if status == "saved":
+                    is_edited_message = bool(getattr(message, "edit_date", None))
+                    fingerprint_changed = str(existing.get("Fingerprint", "")) != str(draft.get("fingerprint", ""))
+                    if status == "saved" and is_edited_message and fingerprint_changed:
+                        save_result = await run_group_sheet_write_with_retry(
+                            lambda current_draft: update_revision_message_entry_from_edit(current_draft, existing),
+                            draft,
+                            "edited revision snapshot save",
+                            application=application,
+                        )
+                        existing = None
+                    elif status == "saved":
                         text = "⚪ Эта ревизия уже сохранена."
                     elif status == "deleted":
                         text = "⚪ Эта ревизия уже была отмечена как «не учитывать»."
                     else:
                         text = "⚪ Эта ревизия уже обработана."
-                    await send_group_report_feedback_message(
-                        application,
-                        draft["chat_id"],
-                        draft["source_message_id"],
-                        text,
-                    )
-                    return
+                    if existing is not None:
+                        await send_group_report_feedback_message(
+                            application,
+                            draft["chat_id"],
+                            draft["source_message_id"],
+                            text,
+                        )
+                        return
 
-                if duplicate:
+                if save_result is None and duplicate:
                     await send_group_report_feedback_message(
                         application,
                         draft["chat_id"],
@@ -17194,12 +17299,13 @@ async def process_group_report_message(message, application, photo_ids=None):
                     )
                     return
 
-                save_result = await run_group_sheet_write_with_retry(
-                    save_revision_message_entry,
-                    draft,
-                    "revision snapshot save",
-                    application=application,
-                )
+                if save_result is None:
+                    save_result = await run_group_sheet_write_with_retry(
+                        save_revision_message_entry,
+                        draft,
+                        "revision snapshot save",
+                        application=application,
+                    )
             await send_revision_message_saved_message(application, draft, save_result)
         except APIError as error:
             if is_google_sheets_busy_error(error):
