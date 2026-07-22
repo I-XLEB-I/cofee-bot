@@ -9,41 +9,32 @@ Telegram-бот для учёта обслуживания кофейных то
 Важно:
 - backup-файл не трогать
 - основной рабочий код сейчас живёт в одном файле `bot.py`
-- бот уже развернут на сервере и используется в реальной работе
+- бот уже развернут в Railway и используется в реальной работе
 
 ---
 
 ## Инфраструктура
 
-Бот запущен на сервере:
-`185.119.58.78`
+Бот запущен в Railway и работает через polling.
 
-Запуск:
-- systemd service: `coffee-bot`
-- бот работает через polling
-- балансировщик не нужен
+Важно:
+- отдельный сервер `185.119.58.78` больше не используется
+- актуальный код хранится в GitHub
+- Railway подключён к GitHub и автоматически разворачивает свежую версию после push
+- ручной деплой через `scp`, `ssh` и `systemctl` больше не используется
 
 Часовой пояс:
 - `Europe/Moscow`
 
-Обновление делается вручную.
-
-На Mac:
+Обновление:
 ```bash
-scp /Users/mark/coffee-bot/bot.py root@185.119.58.78:/opt/coffee-bot/bot.py
-ssh root@185.119.58.78
+git push origin main
 ```
 
-На сервере:
-```bash
-systemctl restart coffee-bot
-systemctl status coffee-bot --no-pager
-```
+После push Railway автоматически запускает новый деплой.
 
 Логи:
-```bash
-journalctl -u coffee-bot -n 80 --no-pager
-```
+- смотреть в интерфейсе Railway в логах активного deployment/service
 
 ---
 
@@ -326,7 +317,7 @@ journalctl -u coffee-bot -n 80 --no-pager
 3. фразу:
    `backup-файл не трогать`
 4. напоминание:
-   `бот уже работает на сервере через systemd`
+   `бот работает в Railway; изменения пушить в GitHub, после push Railway обновляется автоматически`
 
 ---
 
@@ -339,13 +330,11 @@ python3 -m py_compile /Users/mark/coffee-bot/bot.py
 
 2. Деплой:
 ```bash
-scp /Users/mark/coffee-bot/bot.py root@185.119.58.78:/opt/coffee-bot/bot.py
-ssh root@185.119.58.78
-systemctl restart coffee-bot
-systemctl status coffee-bot --no-pager
+git push origin main
 ```
 
+После push дождаться успешного автоматического deployment в Railway.
+
 3. Если что-то не работает:
-```bash
-journalctl -u coffee-bot -n 80 --no-pager
-```
+- проверить статус и логи deployment в Railway
+- при необходимости откатить deployment через Railway или вернуть рабочий коммит в GitHub

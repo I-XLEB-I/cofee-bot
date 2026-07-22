@@ -7454,7 +7454,7 @@ def remember_cleanup_message(context, message):
 # Process-local Task registries: must NOT live in application.bot_data, because
 # PicklePersistence deep-copies bot_data and asyncio.Task objects are unpicklable.
 # Past incident: every periodic persistence dump crashed the bot with
-# TypeError: cannot pickle '_asyncio.Task' object → systemd restart → pending
+# TypeError: cannot pickle '_asyncio.Task' object → process restart → pending
 # cleanup tasks died before firing → "saved" notifications never auto-deleted.
 _SINGLE_CLEANUP_TASKS = {}
 _CARD_CLEANUP_TASKS = {}
