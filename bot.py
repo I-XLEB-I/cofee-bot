@@ -438,6 +438,10 @@ REPAIR_STATUS_ICONS = {
  PAYOUT_TASK_EDIT_DATE) = range(100)
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+# HTTPX logs full Telegram Bot API URLs at INFO level, including the bot token.
+# Keep transport failures visible without persisting credentials in Railway logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 GROUP_REPORT_SAVE_LOCK = asyncio.Lock()
 GROUP_REPORT_WRITE_THROTTLE_LOCK = asyncio.Lock()
