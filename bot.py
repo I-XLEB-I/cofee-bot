@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+import urllib.request
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from html import escape as escape_html
@@ -85,6 +86,10 @@ GROUP_REPORT_SAVE_RETRY_MAX_DELAY_SECONDS = float(
 )
 GROUP_REPORT_REFRESH_DEBOUNCE_SECONDS = float(os.getenv("GROUP_REPORT_REFRESH_DEBOUNCE_SECONDS", "12.0"))
 RICH_SANDBOX_ENABLED = os.getenv("RICH_SANDBOX_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+OPERATIONS_API_URL = os.getenv("OPERATIONS_API_URL", "").strip().rstrip("/")
+OPERATIONS_API_TOKEN = os.getenv("OPERATIONS_API_TOKEN", "").strip()
+OPERATIONS_API_TIMEOUT_SECONDS = float(os.getenv("OPERATIONS_API_TIMEOUT_SECONDS", "5.0"))
+OPERATIONS_CACHE_TTL_SECONDS = float(os.getenv("OPERATIONS_CACHE_TTL_SECONDS", "60.0"))
 
 if PHOTO_CHAT_ID_RAW:
     try:
@@ -184,6 +189,14 @@ REVISION_LOCATIONS = POINTS + ["Дома", "Гараж"]
 POINT_SHORT_LABELS = {
     "Беломорский": "Беломор",
 }
+ACTIVE_OPERATIONAL_POINTS = (
+    "Беломорский",
+    "Гагарина",
+    "Гиппо",
+    "Макси",
+    "Сити",
+    "Южный",
+)
 
 _BOOK_CACHE = {
     "book": None,
@@ -191,6 +204,11 @@ _BOOK_CACHE = {
     "worksheets": {},
 }
 _ENSURED_WORKSHEET_GROUPS = set()
+_OPERATIONS_CACHE = {
+    "payload": None,
+    "expires_at": 0.0,
+}
+_OPERATIONS_FETCH_LOCK = asyncio.Lock()
 
 SUPPLIES = [
     "Стаканы", "Кофе", "Шоколад", "Раф", "Молоко", "Сиропы",
@@ -7047,6 +7065,228 @@ def analyze_today_service_groups(records, repair_points=None):
     return groups
 
 
+def operations_api_configured():
+    return bool(OPERATIONS_API_URL and OPERATIONS_API_TOKEN)
+
+
+def _request_operations_digest():
+    if not operations_api_configured():
+        return None
+    if not OPERATIONS_API_URL.startswith("https://"):
+        raise RuntimeError("OPERATIONS_API_URL must use HTTPS")
+
+    request = urllib.request.Request(
+        OPERATIONS_API_URL,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {OPERATIONS_API_TOKEN}",
+            "User-Agent": "coffee-service-bot/1.0",
+        },
+    )
+    with urllib.request.urlopen(
+        request,
+        timeout=OPERATIONS_API_TIMEOUT_SECONDS,
+    ) as response:
+        if response.status != 200:
+            raise RuntimeError(f"operations API returned HTTP {response.status}")
+        raw = response.read(262_145)
+        if len(raw) > 262_144:
+            raise RuntimeError("operations API response is too large")
+    return json.loads(raw.decode("utf-8"))
+
+
+def _non_negative_int(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized >= 0 else None
+
+
+def normalize_operations_digest(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("points"), list):
+        raise ValueError("operations API response has no points list")
+
+    rows_by_name = {}
+    for raw_row in payload["points"]:
+        if not isinstance(raw_row, dict):
+            continue
+        point_name = str(raw_row.get("point_name") or "").strip()
+        if point_name not in ACTIVE_OPERATIONAL_POINTS:
+            continue
+        state = str(raw_row.get("operational_state") or "no_data").strip().lower()
+        if state not in {"online", "offline", "no_data", "closed"}:
+            state = "no_data"
+        raw_warnings = raw_row.get("warnings")
+        warnings = []
+        if isinstance(raw_warnings, list):
+            for warning in raw_warnings:
+                if isinstance(warning, dict):
+                    token = str(warning.get("kind") or "").strip().lower()
+                else:
+                    token = str(warning or "").strip().lower()
+                if token:
+                    warnings.append(token)
+        rows_by_name[point_name] = {
+            "point_code": str(raw_row.get("point_code") or "").strip(),
+            "point_name": point_name,
+            "operational_state": state,
+            "warnings": warnings,
+            "yesterday_sales_count": _non_negative_int(
+                raw_row.get("yesterday_sales_count")
+            ),
+            "today_sales_count": _non_negative_int(
+                raw_row.get("today_sales_count")
+            ),
+            "last_successful_payment_at": (
+                str(raw_row.get("last_successful_payment_at") or "").strip() or None
+            ),
+        }
+
+    points = []
+    for point_name in ACTIVE_OPERATIONAL_POINTS:
+        points.append(
+            rows_by_name.get(point_name)
+            or {
+                "point_code": "",
+                "point_name": point_name,
+                "operational_state": "no_data",
+                "warnings": ["missing_point"],
+                "yesterday_sales_count": None,
+                "today_sales_count": None,
+                "last_successful_payment_at": None,
+            }
+        )
+    return {
+        "available": True,
+        "observed_at": str(payload.get("observed_at") or "").strip() or None,
+        "incomplete_data": bool(payload.get("incomplete_data")) or len(rows_by_name) < len(
+            ACTIVE_OPERATIONAL_POINTS
+        ),
+        "points": points,
+    }
+
+
+async def get_operations_digest():
+    if not operations_api_configured():
+        return None
+
+    current_monotonic = time.monotonic()
+    cached = _OPERATIONS_CACHE.get("payload")
+    if cached is not None and current_monotonic < _OPERATIONS_CACHE.get("expires_at", 0.0):
+        return cached
+
+    async with _OPERATIONS_FETCH_LOCK:
+        current_monotonic = time.monotonic()
+        cached = _OPERATIONS_CACHE.get("payload")
+        if cached is not None and current_monotonic < _OPERATIONS_CACHE.get(
+            "expires_at",
+            0.0,
+        ):
+            return cached
+
+        try:
+            payload = await run_blocking(_request_operations_digest)
+            normalized = normalize_operations_digest(payload)
+        except Exception as exc:
+            logger.warning(
+                "operations_digest_unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            return {
+                "available": False,
+                "observed_at": None,
+                "incomplete_data": True,
+                "points": [],
+            }
+
+        _OPERATIONS_CACHE["payload"] = normalized
+        _OPERATIONS_CACHE["expires_at"] = current_monotonic + max(
+            OPERATIONS_CACHE_TTL_SECONDS,
+            0.0,
+        )
+        return normalized
+
+
+def format_operations_timestamp(value, reference=None):
+    if not value:
+        return "нет данных"
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return "нет данных"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BOT_TIMEZONE)
+    parsed = parsed.astimezone(BOT_TIMEZONE)
+    reference = (reference or now_local()).astimezone(BOT_TIMEZONE)
+    day_delta = (reference.date() - parsed.date()).days
+    if day_delta == 0:
+        return f"сегодня {parsed:%H:%M}"
+    if day_delta == 1:
+        return f"вчера {parsed:%H:%M}"
+    return parsed.strftime("%d.%m %H:%M")
+
+
+def build_operations_notice(digest, reference=None):
+    if digest is None:
+        return ""
+    if not digest.get("available"):
+        return (
+            "<b>📡 Работа и продажи</b>\n"
+            "🟡 Онлайн-данные временно недоступны; "
+            "данные обслуживания сохранены."
+        )
+
+    lines = ["<b>📡 Работа и продажи</b>"]
+    for row in digest.get("points", []):
+        state = row.get("operational_state")
+        warnings = set(row.get("warnings") or [])
+        if state == "closed":
+            status = "⚪ закрыта по графику"
+        elif state == "offline":
+            status = "🔴 офлайн"
+        elif state == "no_data":
+            status = "⚪ нет данных"
+        elif "no_sales" in warnings:
+            status = "🟡 онлайн, давно без продаж"
+        else:
+            status = "🟢 онлайн"
+
+        point_name = POINT_SHORT_LABELS.get(
+            row.get("point_name"),
+            row.get("point_name") or "—",
+        )
+        yesterday = row.get("yesterday_sales_count")
+        today_count = row.get("today_sales_count")
+        yesterday_text = str(yesterday) if yesterday is not None else "—"
+        today_text = str(today_count) if today_count is not None else "—"
+        payment_text = format_operations_timestamp(
+            row.get("last_successful_payment_at"),
+            reference=reference,
+        )
+        lines.append(f"{status} · <b>{escape_html(point_name)}</b>")
+        lines.append(
+            "☕ вчера "
+            f"{escape_html(yesterday_text)} · сегодня {escape_html(today_text)}"
+            f" · посл. оплата {escape_html(payment_text)}"
+        )
+
+    if digest.get("incomplete_data"):
+        lines.append("<i>Часть онлайн-данных пока недоступна.</i>")
+    lines.append("<i>Продажи — Telemetron; связь и оплата — Vendista.</i>")
+    return "\n".join(lines)
+
+
+def append_operations_notice(service_text, digest, reference=None):
+    operations_text = build_operations_notice(digest, reference=reference)
+    if not operations_text:
+        return service_text
+    return f"{service_text}\n\n{operations_text}"
+
+
 def build_service_today_snapshot():
     records = get_all_services()
     repair_points = get_active_repair_point_map()
@@ -7058,6 +7298,14 @@ def build_service_today_snapshot():
         "groups": groups,
         "text": text,
     }
+
+
+async def build_combined_service_today_snapshot():
+    snapshot = await run_blocking(build_service_today_snapshot)
+    digest = await get_operations_digest()
+    snapshot["operations"] = digest
+    snapshot["text"] = append_operations_notice(snapshot["text"], digest)
+    return snapshot
 
 
 def get_point_latest_record_and_photo(point, records, photos):
@@ -15080,7 +15328,7 @@ async def service_today_notice(update: Update, context):
 
     try:
         await show_loading_state(query, context, "Загружаю данные по точкам...")
-        snapshot = await run_blocking(build_service_today_snapshot)
+        snapshot = await build_combined_service_today_snapshot()
         groups = snapshot["groups"]
         text = snapshot["text"]
     except Exception as e:
@@ -19822,7 +20070,7 @@ async def refresh_group_service_today_posts(application, force=False):
     if current_dt.hour < SERVICE_TODAY_GROUP_POST_HOUR:
         return
 
-    snapshot = await run_blocking(build_service_today_snapshot)
+    snapshot = await build_combined_service_today_snapshot()
     text = snapshot["text"]
     text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
     date_str = format_date(current_dt)
