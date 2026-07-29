@@ -1,5 +1,7 @@
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
 
 import bot
@@ -277,6 +279,44 @@ class OperationsSummaryTests(unittest.TestCase):
         )
 
         self.assertLessEqual(len(combined), 4096)
+
+    def test_notice_ends_with_current_day_telemetron_report_link(self):
+        rows = [
+            point_row(name) for name in bot.ACTIVE_OPERATIONAL_POINTS
+        ]
+
+        text = bot.build_operations_notice(
+            bot.normalize_operations_digest({"points": rows}),
+            reference=self.reference,
+        )
+
+        expected = (
+            "📊 "
+            f'<a href="{bot.TELEMETRON_TODAY_REPORT_URL}">'
+            "Продажи за сегодня в Telemetron</a>"
+        )
+        self.assertTrue(text.endswith(expected))
+        self.assertEqual(text.count(bot.TELEMETRON_TODAY_REPORT_URL), 1)
+
+
+class OperationsTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_edit_disables_link_preview(self):
+        edit_message_text = AsyncMock()
+        application = SimpleNamespace(
+            bot=SimpleNamespace(edit_message_text=edit_message_text)
+        )
+
+        await bot.edit_group_service_today_post(
+            application,
+            chat_id=-1001,
+            message_id=42,
+            text="<b>Сводка</b>",
+        )
+
+        kwargs = edit_message_text.await_args.kwargs
+        self.assertEqual(kwargs["parse_mode"], "HTML")
+        self.assertIs(kwargs["link_preview_options"], bot.NO_LINK_PREVIEW)
+        self.assertTrue(kwargs["link_preview_options"].is_disabled)
 
 
 if __name__ == "__main__":

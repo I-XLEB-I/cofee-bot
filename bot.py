@@ -19,6 +19,7 @@ from gspread.exceptions import APIError, WorksheetNotFound
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     ReplyKeyboardRemove,
     Update,
 )
@@ -90,6 +91,10 @@ OPERATIONS_API_URL = os.getenv("OPERATIONS_API_URL", "").strip().rstrip("/")
 OPERATIONS_API_TOKEN = os.getenv("OPERATIONS_API_TOKEN", "").strip()
 OPERATIONS_API_TIMEOUT_SECONDS = float(os.getenv("OPERATIONS_API_TIMEOUT_SECONDS", "5.0"))
 OPERATIONS_CACHE_TTL_SECONDS = float(os.getenv("OPERATIONS_CACHE_TTL_SECONDS", "60.0"))
+TELEMETRON_TODAY_REPORT_URL = (
+    "https://my.telemetron.net/reports/sales-by-machines"
+)
+NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 if PHOTO_CHAT_ID_RAW:
     try:
@@ -3278,6 +3283,7 @@ async def edit_group_service_today_post(application, chat_id, message_id, text):
         message_id=message_id,
         text=text,
         parse_mode="HTML",
+        link_preview_options=NO_LINK_PREVIEW,
     )
 
 
@@ -7431,6 +7437,11 @@ def build_operations_notice(digest, reference=None):
         )
     lines.append(
         "<i>Продажи и напитки — Telemetron; связь — Vendista.</i>"
+    )
+    lines.append(
+        "📊 "
+        f'<a href="{TELEMETRON_TODAY_REPORT_URL}">'
+        "Продажи за сегодня в Telemetron</a>"
     )
     return "\n".join(lines)
 
@@ -20242,6 +20253,7 @@ async def refresh_group_service_today_posts(application, force=False):
                     chat_id=chat_id,
                     text=text,
                     parse_mode="HTML",
+                    link_preview_options=NO_LINK_PREVIEW,
                 )
                 posts[chat_key] = {
                     "date": date_str,
@@ -20297,6 +20309,7 @@ async def refresh_group_service_today_posts(application, force=False):
                     chat_id=chat_id,
                     text=text,
                     parse_mode="HTML",
+                    link_preview_options=NO_LINK_PREVIEW,
                 )
                 posts[chat_key] = {
                     "date": date_str,
