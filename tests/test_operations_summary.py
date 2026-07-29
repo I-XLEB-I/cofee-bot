@@ -81,15 +81,19 @@ class OperationsSummaryTests(unittest.TestCase):
 
         self.assertIn("Беломор", text)
         self.assertIn("❔ нет данных: Гагарина", text)
-        self.assertIn("❔ <b>Гагарина</b> · нет данных о связи", text)
         self.assertIn("Часть оперативных данных пока недоступна", text)
 
-    def test_no_sales_warning_does_not_call_point_offline(self):
+    def test_no_sales_warning_is_not_rendered_as_an_error(self):
         payload = {
             "points": [
                 point_row(
                     name,
                     warnings=["no_sales"] if name == "Макси" else [],
+                    no_sales_since=(
+                        "2026-07-29T12:30:00+03:00"
+                        if name == "Макси"
+                        else "2026-07-29T13:30:00+03:00"
+                    ),
                 )
                 for name in bot.ACTIVE_OPERATIONAL_POINTS
             ]
@@ -100,14 +104,11 @@ class OperationsSummaryTests(unittest.TestCase):
             reference=self.reference,
         )
 
-        self.assertIn("🟡 <b>Макси</b> · требуется проверка", text)
-        self.assertIn("Продаж нет 2 ч.", text)
-        self.assertIn(
-            "Пауза в продажах — повод проверить точку, "
-            "а не подтверждённая ошибка.",
-            text,
-        )
-        self.assertNotIn("🔴 <b>Макси</b> · нет связи", text)
+        table = text.split("<pre>", 1)[1].split("</pre>", 1)[0]
+        maxi_line = next(line for line in table.splitlines() if "Макси" in line)
+        self.assertTrue(maxi_line.endswith("🟢"))
+        self.assertNotIn("требуется проверка", text)
+        self.assertNotIn("Продаж нет", text)
 
     def test_timestamp_uses_moscow_today_and_yesterday_labels(self):
         self.assertEqual(
@@ -185,7 +186,33 @@ class OperationsSummaryTests(unittest.TestCase):
         maxi_line = next(line for line in table.splitlines() if "Макси" in line)
         self.assertIn("  0", city_line)
         self.assertIn("  —", maxi_line)
-        self.assertLessEqual(max(len(line) for line in table.splitlines()), 36)
+        self.assertLessEqual(max(len(line) for line in table.splitlines()), 40)
+
+    def test_activity_colors_use_two_and_three_hour_boundaries(self):
+        cases = (
+            ("2026-07-29T12:01:00+03:00", "🟢"),
+            ("2026-07-29T12:00:00+03:00", "🟡"),
+            ("2026-07-29T11:01:00+03:00", "🟡"),
+            ("2026-07-29T11:00:00+03:00", "🔴"),
+        )
+
+        for no_sales_since, expected in cases:
+            with self.subTest(no_sales_since=no_sales_since):
+                row = point_row(
+                    "Гиппо",
+                    no_sales_since=no_sales_since,
+                )
+                self.assertEqual(
+                    bot.operations_activity_icon(row, self.reference),
+                    expected,
+                )
+        self.assertEqual(
+            bot.operations_activity_icon(
+                point_row("Макси", state="closed"),
+                self.reference,
+            ),
+            "⚪",
+        )
 
     def test_coffee_free_last_drink_is_only_a_hypothesis(self):
         rows = [
@@ -205,9 +232,9 @@ class OperationsSummaryTests(unittest.TestCase):
             reference=self.reference,
         )
 
-        self.assertIn("Горячий шоколад · без кофе", text)
+        self.assertIn("Горячий шоколад (без кофе)", text)
         self.assertIn(
-            "Возможна проблема с подачей кофе — нужна проверка.",
+            "Возможна проблема с подачей кофе.",
             text,
         )
         self.assertIn("не подтверждённая ошибка", text)
@@ -228,11 +255,8 @@ class OperationsSummaryTests(unittest.TestCase):
             reference=self.reference,
         )
 
-        self.assertIn("Моккачино · с кофе", text)
-        self.assertIn(
-            "отдельного признака сбоя подачи кофе нет",
-            text,
-        )
+        self.assertNotIn("Моккачино", text)
+        self.assertNotIn("сбоя подачи кофе нет", text)
         self.assertNotIn(
             "Возможна проблема с подачей кофе",
             text,

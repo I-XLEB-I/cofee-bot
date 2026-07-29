@@ -7278,18 +7278,28 @@ def format_operations_table_timestamp(value, reference=None):
     return parsed.strftime("%d.%m %H:%M")
 
 
-def format_operations_duration(value, reference=None):
+def operations_inactivity_minutes(value, reference=None):
     parsed = _operations_datetime(value)
     if parsed is None:
-        return "неизвестно сколько"
+        return None
     reference = (reference or now_local()).astimezone(BOT_TIMEZONE)
-    minutes = max(int((reference - parsed).total_seconds() // 60), 0)
-    hours, remaining_minutes = divmod(minutes, 60)
-    if hours and remaining_minutes:
-        return f"{hours} ч {remaining_minutes} мин"
-    if hours:
-        return f"{hours} ч"
-    return f"{minutes} мин"
+    return max(int((reference - parsed).total_seconds() // 60), 0)
+
+
+def operations_activity_icon(row, reference=None):
+    if row.get("operational_state") == "closed":
+        return "⚪"
+    minutes = operations_inactivity_minutes(
+        row.get("no_sales_since_at"),
+        reference=reference,
+    )
+    if minutes is None:
+        return "❔"
+    if minutes >= 180:
+        return "🔴"
+    if minutes >= 120:
+        return "🟡"
+    return "🟢"
 
 
 def _operations_connection_summary(points):
@@ -7339,14 +7349,12 @@ def _operations_connection_summary(points):
     return f"Связь: {summary}"
 
 
-def _operations_attention_rows(points, reference):
-    attention = []
+def _operations_coffee_hints(points, reference):
+    hints = []
     for row in points:
-        state = row.get("operational_state")
-        warnings = set(row.get("warnings") or [])
         if (
-            state not in {"offline", "no_data"}
-            and "no_sales" not in warnings
+            operations_activity_icon(row, reference) not in {"🟡", "🔴"}
+            or row.get("last_sale_contains_coffee") is not False
         ):
             continue
 
@@ -7354,57 +7362,14 @@ def _operations_attention_rows(points, reference):
             row.get("point_name"),
             row.get("point_name") or "—",
         )
-        lines = []
-        if state == "offline":
-            lines.append(f"🔴 <b>{escape_html(point_name)}</b> · нет связи")
-        elif state == "no_data":
-            lines.append(
-                f"❔ <b>{escape_html(point_name)}</b> · нет данных о связи"
-            )
-        else:
-            lines.append(
-                f"🟡 <b>{escape_html(point_name)}</b> · требуется проверка"
-            )
-
-        if "no_sales" in warnings:
-            duration = format_operations_duration(
-                row.get("no_sales_since_at"),
-                reference=reference,
-            )
-            lines.append(f"Продаж нет {escape_html(duration)}.")
-            sale_text = format_operations_table_timestamp(
-                row.get("last_sale_at"),
-                reference=reference,
-            )
-            product_name = row.get("last_sale_product_name")
-            contains_coffee = row.get("last_sale_contains_coffee")
-            sale_parts = [f"Последняя: {sale_text}"]
-            if product_name:
-                sale_parts.append(str(product_name))
-            if contains_coffee is True:
-                sale_parts.append("с кофе")
-            elif contains_coffee is False:
-                sale_parts.append("без кофе")
-            lines.append(escape_html(" · ".join(sale_parts)))
-
-            if contains_coffee is False:
-                lines.append(
-                    "⚠️ Последний напиток был без кофе. Возможна проблема "
-                    "с подачей кофе — нужна проверка."
-                )
-            elif contains_coffee is True:
-                lines.append(
-                    "☕ В последней продаже был кофе: отдельного признака "
-                    "сбоя подачи кофе нет."
-                )
-            else:
-                lines.append(
-                    "Состав последнего напитка пока не классифицирован."
-                )
-        elif state in {"offline", "no_data"}:
-            lines.append("Продажи отдельно не считаем подтверждением связи.")
-        attention.append("\n".join(lines))
-    return attention
+        product_name = row.get("last_sale_product_name") or "напиток без кофе"
+        hints.append(
+            "☕? "
+            f"<b>{escape_html(point_name)}</b>: последняя продажа — "
+            f"{escape_html(str(product_name))} (без кофе). "
+            "Возможна проблема с подачей кофе."
+        )
+    return hints
 
 
 def build_operations_notice(digest, reference=None):
@@ -7433,9 +7398,10 @@ def build_operations_notice(digest, reference=None):
             row.get("last_sale_at"),
             reference=reference,
         )
+        activity_icon = operations_activity_icon(row, reference)
         table_rows.append(
             f"{point_name:<10} {yesterday_text:>3}  "
-            f"{today_text:>3}  {sale_text}"
+            f"{today_text:>3}  {sale_text:<11} {activity_icon}"
         )
 
     observed = _operations_datetime(digest.get("observed_at"))
@@ -7445,25 +7411,19 @@ def build_operations_notice(digest, reference=None):
         f"<pre>{escape_html(chr(10).join(table_rows))}</pre>",
         "<blockquote>"
         f"{escape_html(_operations_connection_summary(points))}\n"
-        "Вч / Сег — продажи вчера и сегодня. "
-        "Последняя — безналичная продажа.\n"
+        "Вч / Сег — продажи. Последняя — безналичная.\n"
+        "Пауза: 🟢 &lt;2ч · 🟡 2–3ч · 🔴 3ч+ · ⚪ вне графика.\n"
         f"Обновлено: {escape_html(observed_text)} МСК."
         "</blockquote>",
     ]
 
-    attention = _operations_attention_rows(points, reference)
-    if attention:
-        lines.append(f"<b>⚠️ Проверить ({len(attention)})</b>")
+    coffee_hints = _operations_coffee_hints(points, reference)
+    if coffee_hints:
         lines.append(
             "<blockquote>"
-            + "\n\n".join(attention)
-            + "\n\n🟡 Пауза в продажах — повод проверить точку, "
-            "а не подтверждённая ошибка."
+            + "\n".join(coffee_hints)
+            + "\nЭто предположение, а не подтверждённая ошибка."
             + "</blockquote>"
-        )
-    else:
-        lines.append(
-            "✅ По связи и паузам продаж отклонений сейчас нет."
         )
     if digest.get("incomplete_data"):
         lines.append(
