@@ -7106,6 +7106,20 @@ def _non_negative_int(value):
     return normalized if normalized >= 0 else None
 
 
+def _operations_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(
+            str(value).strip().replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BOT_TIMEZONE)
+    return parsed.astimezone(BOT_TIMEZONE)
+
+
 def normalize_operations_digest(payload):
     if not isinstance(payload, dict) or not isinstance(payload.get("points"), list):
         raise ValueError("operations API response has no points list")
@@ -7130,6 +7144,17 @@ def normalize_operations_digest(payload):
                     token = str(warning or "").strip().lower()
                 if token:
                     warnings.append(token)
+        raw_product_name = str(
+            raw_row.get("last_sale_product_name") or ""
+        ).strip()
+        if raw_product_name.casefold() == "unknown product":
+            raw_product_name = ""
+        raw_contains_coffee = raw_row.get("last_sale_contains_coffee")
+        contains_coffee = (
+            raw_contains_coffee
+            if isinstance(raw_contains_coffee, bool)
+            else None
+        )
         rows_by_name[point_name] = {
             "point_code": str(raw_row.get("point_code") or "").strip(),
             "point_name": point_name,
@@ -7143,6 +7168,14 @@ def normalize_operations_digest(payload):
             ),
             "last_sale_at": (
                 str(raw_row.get("last_sale_at") or "").strip() or None
+            ),
+            "last_sale_product_name": raw_product_name[:160] or None,
+            "last_sale_contains_coffee": contains_coffee,
+            "last_sale_scope": (
+                str(raw_row.get("last_sale_scope") or "").strip() or None
+            ),
+            "no_sales_since_at": (
+                str(raw_row.get("no_sales_since_at") or "").strip() or None
             ),
             "last_successful_payment_at": (
                 str(raw_row.get("last_successful_payment_at") or "").strip() or None
@@ -7161,6 +7194,10 @@ def normalize_operations_digest(payload):
                 "yesterday_sales_count": None,
                 "today_sales_count": None,
                 "last_sale_at": None,
+                "last_sale_product_name": None,
+                "last_sale_contains_coffee": None,
+                "last_sale_scope": None,
+                "no_sales_since_at": None,
                 "last_successful_payment_at": None,
             }
         )
@@ -7216,15 +7253,9 @@ async def get_operations_digest():
 
 
 def format_operations_timestamp(value, reference=None):
-    if not value:
+    parsed = _operations_datetime(value)
+    if parsed is None:
         return "нет данных"
-    try:
-        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-    except ValueError:
-        return "нет данных"
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=BOT_TIMEZONE)
-    parsed = parsed.astimezone(BOT_TIMEZONE)
     reference = (reference or now_local()).astimezone(BOT_TIMEZONE)
     day_delta = (reference.date() - parsed.date()).days
     if day_delta == 0:
@@ -7234,31 +7265,162 @@ def format_operations_timestamp(value, reference=None):
     return parsed.strftime("%d.%m %H:%M")
 
 
+def format_operations_table_timestamp(value, reference=None):
+    parsed = _operations_datetime(value)
+    if parsed is None:
+        return "—"
+    reference = (reference or now_local()).astimezone(BOT_TIMEZONE)
+    day_delta = (reference.date() - parsed.date()).days
+    if day_delta == 0:
+        return parsed.strftime("%H:%M")
+    if day_delta == 1:
+        return parsed.strftime("вч %H:%M")
+    return parsed.strftime("%d.%m %H:%M")
+
+
+def format_operations_duration(value, reference=None):
+    parsed = _operations_datetime(value)
+    if parsed is None:
+        return "неизвестно сколько"
+    reference = (reference or now_local()).astimezone(BOT_TIMEZONE)
+    minutes = max(int((reference - parsed).total_seconds() // 60), 0)
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours and remaining_minutes:
+        return f"{hours} ч {remaining_minutes} мин"
+    if hours:
+        return f"{hours} ч"
+    return f"{minutes} мин"
+
+
+def _operations_connection_summary(points):
+    online = [
+        row for row in points if row.get("operational_state") == "online"
+    ]
+    closed = [
+        row for row in points if row.get("operational_state") == "closed"
+    ]
+    offline = [
+        row for row in points if row.get("operational_state") == "offline"
+    ]
+    no_data = [
+        row for row in points if row.get("operational_state") == "no_data"
+    ]
+    parts = []
+    if online:
+        parts.append(f"🟢 {len(online)}/{len(points)} на связи")
+    if closed:
+        names = ", ".join(
+            POINT_SHORT_LABELS.get(
+                row.get("point_name"),
+                row.get("point_name") or "—",
+            )
+            for row in closed
+        )
+        parts.append(f"⚪ вне графика: {names}")
+    if offline:
+        names = ", ".join(
+            POINT_SHORT_LABELS.get(
+                row.get("point_name"),
+                row.get("point_name") or "—",
+            )
+            for row in offline
+        )
+        parts.append(f"🔴 нет связи: {names}")
+    if no_data:
+        names = ", ".join(
+            POINT_SHORT_LABELS.get(
+                row.get("point_name"),
+                row.get("point_name") or "—",
+            )
+            for row in no_data
+        )
+        parts.append(f"❔ нет данных: {names}")
+    summary = " · ".join(parts) or "❔ состояние неизвестно"
+    return f"Связь: {summary}"
+
+
+def _operations_attention_rows(points, reference):
+    attention = []
+    for row in points:
+        state = row.get("operational_state")
+        warnings = set(row.get("warnings") or [])
+        if (
+            state not in {"offline", "no_data"}
+            and "no_sales" not in warnings
+        ):
+            continue
+
+        point_name = POINT_SHORT_LABELS.get(
+            row.get("point_name"),
+            row.get("point_name") or "—",
+        )
+        lines = []
+        if state == "offline":
+            lines.append(f"🔴 <b>{escape_html(point_name)}</b> · нет связи")
+        elif state == "no_data":
+            lines.append(
+                f"❔ <b>{escape_html(point_name)}</b> · нет данных о связи"
+            )
+        else:
+            lines.append(
+                f"🟡 <b>{escape_html(point_name)}</b> · требуется проверка"
+            )
+
+        if "no_sales" in warnings:
+            duration = format_operations_duration(
+                row.get("no_sales_since_at"),
+                reference=reference,
+            )
+            lines.append(f"Продаж нет {escape_html(duration)}.")
+            sale_text = format_operations_table_timestamp(
+                row.get("last_sale_at"),
+                reference=reference,
+            )
+            product_name = row.get("last_sale_product_name")
+            contains_coffee = row.get("last_sale_contains_coffee")
+            sale_parts = [f"Последняя: {sale_text}"]
+            if product_name:
+                sale_parts.append(str(product_name))
+            if contains_coffee is True:
+                sale_parts.append("с кофе")
+            elif contains_coffee is False:
+                sale_parts.append("без кофе")
+            lines.append(escape_html(" · ".join(sale_parts)))
+
+            if contains_coffee is False:
+                lines.append(
+                    "⚠️ Последний напиток был без кофе. Возможна проблема "
+                    "с подачей кофе — нужна проверка."
+                )
+            elif contains_coffee is True:
+                lines.append(
+                    "☕ В последней продаже был кофе: отдельного признака "
+                    "сбоя подачи кофе нет."
+                )
+            else:
+                lines.append(
+                    "Состав последнего напитка пока не классифицирован."
+                )
+        elif state in {"offline", "no_data"}:
+            lines.append("Продажи отдельно не считаем подтверждением связи.")
+        attention.append("\n".join(lines))
+    return attention
+
+
 def build_operations_notice(digest, reference=None):
     if digest is None:
         return ""
     if not digest.get("available"):
         return (
             "<b>📡 Работа и продажи</b>\n"
-            "🟡 Онлайн-данные временно недоступны; "
-            "данные обслуживания сохранены."
+            "<blockquote>❔ Оперативные данные временно недоступны. "
+            "Сводка обслуживания выше продолжает работать.</blockquote>"
         )
 
-    lines = ["<b>📡 Работа и продажи</b>"]
-    for row in digest.get("points", []):
-        state = row.get("operational_state")
-        warnings = set(row.get("warnings") or [])
-        if state == "closed":
-            status = "⚪ закрыта по графику"
-        elif state == "offline":
-            status = "🔴 офлайн"
-        elif state == "no_data":
-            status = "⚪ нет данных"
-        elif "no_sales" in warnings:
-            status = "🟡 онлайн, давно без продаж"
-        else:
-            status = "🟢 онлайн"
-
+    reference = (reference or now_local()).astimezone(BOT_TIMEZONE)
+    points = list(digest.get("points") or [])
+    table_rows = ["Точка       Вч  Сег  Последняя"]
+    for row in points:
         point_name = POINT_SHORT_LABELS.get(
             row.get("point_name"),
             row.get("point_name") or "—",
@@ -7267,20 +7429,49 @@ def build_operations_notice(digest, reference=None):
         today_count = row.get("today_sales_count")
         yesterday_text = str(yesterday) if yesterday is not None else "—"
         today_text = str(today_count) if today_count is not None else "—"
-        sale_text = format_operations_timestamp(
+        sale_text = format_operations_table_timestamp(
             row.get("last_sale_at"),
             reference=reference,
         )
-        lines.append(f"{status} · <b>{escape_html(point_name)}</b>")
-        lines.append(
-            "☕ вчера "
-            f"{escape_html(yesterday_text)} · сегодня {escape_html(today_text)}"
-            f" · посл. продажа {escape_html(sale_text)}"
+        table_rows.append(
+            f"{point_name:<10} {yesterday_text:>3}  "
+            f"{today_text:>3}  {sale_text}"
         )
 
+    observed = _operations_datetime(digest.get("observed_at"))
+    observed_text = (observed or reference).strftime("%H:%M")
+    lines = [
+        "<b>📡 Работа и продажи</b>",
+        f"<pre>{escape_html(chr(10).join(table_rows))}</pre>",
+        "<blockquote>"
+        f"{escape_html(_operations_connection_summary(points))}\n"
+        "Вч / Сег — продажи вчера и сегодня. "
+        "Последняя — безналичная продажа.\n"
+        f"Обновлено: {escape_html(observed_text)} МСК."
+        "</blockquote>",
+    ]
+
+    attention = _operations_attention_rows(points, reference)
+    if attention:
+        lines.append(f"<b>⚠️ Проверить ({len(attention)})</b>")
+        lines.append(
+            "<blockquote>"
+            + "\n\n".join(attention)
+            + "\n\n🟡 Пауза в продажах — повод проверить точку, "
+            "а не подтверждённая ошибка."
+            + "</blockquote>"
+        )
+    else:
+        lines.append(
+            "✅ По связи и паузам продаж отклонений сейчас нет."
+        )
     if digest.get("incomplete_data"):
-        lines.append("<i>Часть онлайн-данных пока недоступна.</i>")
-    lines.append("<i>Продажи — Telemetron; состояние связи — Vendista.</i>")
+        lines.append(
+            "<i>Часть оперативных данных пока недоступна.</i>"
+        )
+    lines.append(
+        "<i>Продажи и напитки — Telemetron; связь — Vendista.</i>"
+    )
     return "\n".join(lines)
 
 
