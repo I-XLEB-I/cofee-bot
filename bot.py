@@ -36,6 +36,13 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
+from owner_ai_client import (
+    OwnerAiAccessError,
+    OwnerAiClientConfig,
+    OwnerAiClientError,
+    query_owner_ai,
+)
+
 
 # ============ НАСТРОЙКИ ============
 def parse_env_id_set(name, default_values=None):
@@ -91,6 +98,9 @@ OPERATIONS_API_URL = os.getenv("OPERATIONS_API_URL", "").strip().rstrip("/")
 OPERATIONS_API_TOKEN = os.getenv("OPERATIONS_API_TOKEN", "").strip()
 OPERATIONS_API_TIMEOUT_SECONDS = float(os.getenv("OPERATIONS_API_TIMEOUT_SECONDS", "5.0"))
 OPERATIONS_CACHE_TTL_SECONDS = float(os.getenv("OPERATIONS_CACHE_TTL_SECONDS", "60.0"))
+OWNER_AI_INTERNAL_URL = os.getenv("OWNER_AI_INTERNAL_URL", "").strip()
+OWNER_AI_INTERNAL_TOKEN = os.getenv("OWNER_AI_INTERNAL_TOKEN", "").strip()
+OWNER_AI_TIMEOUT_SECONDS = float(os.getenv("OWNER_AI_TIMEOUT_SECONDS", "25.0"))
 TELEMETRON_TODAY_REPORT_URL = (
     "https://my.telemetron.net/reports/sales-by-machines"
 )
@@ -458,7 +468,8 @@ REPAIR_STATUS_ICONS = {
  PAYOUT_SCREEN, PAYOUT_CORRECTION_AMOUNT, PAYOUT_CORRECTION_NOTE,
  PAYOUT_TRAVEL_EDIT_AMOUNT, PAYOUT_TRAVEL_EDIT_DATE,
  PAYOUT_TASK_EDIT_DESCRIPTION, PAYOUT_TASK_EDIT_AMOUNT,
- PAYOUT_TASK_EDIT_DATE) = range(100)
+ PAYOUT_TASK_EDIT_DATE,
+ OWNER_AI_CHAT) = range(101)
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 # HTTPX logs full Telegram Bot API URLs at INFO level, including the bot token.
@@ -474,6 +485,27 @@ GROUP_REPORT_REFRESH_TASK_KEY = "_group_report_refresh_task"
 
 async def run_blocking(func, *args, **kwargs):
     return await asyncio.to_thread(func, *args, **kwargs)
+
+
+@lru_cache(maxsize=1)
+def get_owner_ai_client_config():
+    if not OWNER_AI_INTERNAL_URL and not OWNER_AI_INTERNAL_TOKEN:
+        return None
+    if not OWNER_AI_INTERNAL_URL or not OWNER_AI_INTERNAL_TOKEN:
+        raise RuntimeError(
+            "OWNER_AI_INTERNAL_URL and OWNER_AI_INTERNAL_TOKEN "
+            "must be configured together"
+        )
+    return OwnerAiClientConfig(
+        url=OWNER_AI_INTERNAL_URL,
+        token=OWNER_AI_INTERNAL_TOKEN,
+        timeout_seconds=OWNER_AI_TIMEOUT_SECONDS,
+        max_answer_chars=3_600,
+    )
+
+
+def owner_ai_api_configured():
+    return get_owner_ai_client_config() is not None
 
 
 async def global_error_handler(update: object, context):
@@ -10836,6 +10868,156 @@ async def revision_procurement_report_handler(update: Update, context):
     if query.data == "rev_proc_home":
         return await show_revision_procurement_screen(query, context, view="home")
     return REVISION_PROCUREMENT_REPORT
+
+
+# ============ ИИ-АНАЛИТИК ============
+OWNER_AI_HELP_TEXT = (
+    "<b>🤖 ИИ-аналитик</b>\n\n"
+    "Задайте вопрос обычным сообщением. ИИ работает только в режиме "
+    "чтения, а цифры получает из проверенных источников.\n\n"
+    "Примеры:\n"
+    "• Продажи по точкам сегодня\n"
+    "• Что продали последним на Макси?\n"
+    "• Сравни продажи Гагарина за эту и прошлую неделю\n"
+    "• Топ напитков Сити за июль\n\n"
+    "В рабочей группе используйте явную команду:\n"
+    "<code>/ai Продажи сегодня</code>\n\n"
+    "Доступные данные зависят от роли. Возвраты, изменение заявок, "
+    "выплаты и команды терминалам через ИИ запрещены."
+)
+
+
+def owner_ai_back_markup():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 В меню", callback_data="back_main")]]
+    )
+
+
+async def show_owner_ai_screen(query, context):
+    await show_text_screen(
+        query,
+        context,
+        OWNER_AI_HELP_TEXT,
+        reply_markup=owner_ai_back_markup(),
+        parse_mode="HTML",
+    )
+    return OWNER_AI_CHAT
+
+
+async def answer_owner_ai_message(message, context, question):
+    config = get_owner_ai_client_config()
+    if config is None:
+        await message.reply_text(
+            "⚪ ИИ-аналитик пока не подключён. "
+            "Обычные отчёты продолжают работать."
+        )
+        return
+    status = await message.reply_text("🤖 Собираю точные данные…")
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    try:
+        result = await run_blocking(
+            query_owner_ai,
+            config,
+            user_id=user_id,
+            question=question,
+        )
+    except OwnerAiAccessError as exc:
+        await status.edit_text(f"⛔ {exc}")
+        return
+    except OwnerAiClientError as exc:
+        logger.warning(
+            "owner_ai_query_failed user_id=%s error_type=%s",
+            user_id,
+            type(exc).__name__,
+        )
+        await status.edit_text(
+            "❌ ИИ-аналитик временно недоступен. "
+            "Обычные отчёты и кнопки работают как раньше."
+        )
+        return
+    except Exception as exc:
+        logger.error(
+            "owner_ai_query_unexpected user_id=%s error_type=%s",
+            user_id,
+            type(exc).__name__,
+        )
+        await status.edit_text(
+            "❌ Не удалось получить ответ. "
+            "Обычные отчёты и кнопки работают как раньше."
+        )
+        return
+
+    scope_label = "владелец" if result["scope"] == "owner" else "сотрудник"
+    await status.edit_text(
+        f"🤖 ИИ-аналитик · {scope_label}\n\n{result['answer']}",
+        link_preview_options=NO_LINK_PREVIEW,
+    )
+
+
+async def cmd_ai(update: Update, context):
+    if not is_allowed_user(update):
+        return await deny_private_access(update)
+    if not is_private_chat(update) and not is_allowed_group_chat(update):
+        await update.effective_message.reply_text(
+            "⛔ ИИ доступен только в личном чате или разрешённой рабочей группе."
+        )
+        return ConversationHandler.END
+    if not owner_ai_api_configured():
+        await update.effective_message.reply_text(
+            "⚪ ИИ-аналитик пока не подключён. "
+            "Обычные отчёты продолжают работать."
+        )
+        return ConversationHandler.END
+
+    question = " ".join(context.args or []).strip()
+    if not question:
+        await update.effective_message.reply_text(
+            OWNER_AI_HELP_TEXT,
+            reply_markup=(
+                owner_ai_back_markup() if is_private_chat(update) else None
+            ),
+            parse_mode="HTML",
+        )
+        return (
+            OWNER_AI_CHAT
+            if is_private_chat(update)
+            else ConversationHandler.END
+        )
+
+    await answer_owner_ai_message(
+        update.effective_message,
+        context,
+        question,
+    )
+    return (
+        OWNER_AI_CHAT
+        if is_private_chat(update)
+        else ConversationHandler.END
+    )
+
+
+async def owner_ai_message_handler(update: Update, context):
+    if not is_allowed_user(update) or not is_private_chat(update):
+        return await deny_private_access(update)
+    await answer_owner_ai_message(
+        update.effective_message,
+        context,
+        update.effective_message.text,
+    )
+    return OWNER_AI_CHAT
+
+
+async def owner_ai_callback_handler(update: Update, context):
+    query = update.callback_query
+    if not is_allowed_user(update):
+        await deny_callback_access(query)
+        return ConversationHandler.END
+    await query.answer()
+    if query.data == "back_main":
+        return await start(update, context)
+    return OWNER_AI_CHAT
+
+
 # ============ ГЛАВНОЕ МЕНЮ ============
 async def start(update: Update, context):
     if not is_allowed_user(update):
@@ -10847,6 +11029,10 @@ async def start(update: Update, context):
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
     ]
+    if owner_ai_api_configured():
+        keyboard.append(
+            [InlineKeyboardButton("🤖 ИИ-аналитик", callback_data="owner_ai")]
+        )
     if RICH_SANDBOX_ENABLED:
         keyboard.append([InlineKeyboardButton("🧪 Rich Sandbox", callback_data="rich_sandbox")])
     text = "<b>☕ Кофе-бот</b>\n\nВыберите действие:"
@@ -15179,6 +15365,8 @@ async def main_menu_handler(update: Update, context):
         return await show_rent_menu(query, context)
     elif d == "reports":
         return await show_reports_section_menu(query, context)
+    elif d == "owner_ai":
+        return await show_owner_ai_screen(query, context)
     elif d == "service_today":
         return await service_today_notice(update, context)
     elif d == "service_today_repair":
@@ -20418,6 +20606,11 @@ def main():
         raise RuntimeError("SPREADSHEET_ID is not set")
     if PHOTO_CHAT_ID is None:
         raise RuntimeError("PHOTO_CHAT_ID is not set")
+    owner_ai_config = get_owner_ai_client_config()
+    logger.info(
+        "Owner AI bridge configured: %s",
+        owner_ai_config is not None,
+    )
     persistence = PicklePersistence(filepath=resolve_runtime_path(PERSISTENCE_FILE))
     # TimeWeb's IPv4 route to Telegram's 149.154.166.0/24 flaps; default 5s
     # connect timeout in httpx isn't enough when both IPv4 and IPv6 moment
@@ -20437,6 +20630,7 @@ def main():
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            CommandHandler("ai", cmd_ai),
             CallbackQueryHandler(
                 group_report_edit_service_entry_handler,
                 pattern=r"^grp_report_edit_service_\d+$",
@@ -20654,9 +20848,17 @@ def main():
             ],
             REVISION_IMPORT_CONFIRM: [CallbackQueryHandler(revision_import_confirm_handler)],
             REVISION_PROCUREMENT_REPORT: [CallbackQueryHandler(revision_procurement_report_handler)],
+            OWNER_AI_CHAT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    owner_ai_message_handler,
+                ),
+                CallbackQueryHandler(owner_ai_callback_handler),
+            ],
         },
         fallbacks=[
             CommandHandler("start", start),
+            CommandHandler("ai", cmd_ai),
             CommandHandler("ids", cmd_ids),
             CommandHandler("service_duplicates", cmd_service_duplicates),
             CommandHandler("dupes", cmd_service_duplicates),
