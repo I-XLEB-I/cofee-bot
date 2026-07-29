@@ -7141,6 +7141,9 @@ def normalize_operations_digest(payload):
             "today_sales_count": _non_negative_int(
                 raw_row.get("today_sales_count")
             ),
+            "last_sale_at": (
+                str(raw_row.get("last_sale_at") or "").strip() or None
+            ),
             "last_successful_payment_at": (
                 str(raw_row.get("last_successful_payment_at") or "").strip() or None
             ),
@@ -7157,6 +7160,7 @@ def normalize_operations_digest(payload):
                 "warnings": ["missing_point"],
                 "yesterday_sales_count": None,
                 "today_sales_count": None,
+                "last_sale_at": None,
                 "last_successful_payment_at": None,
             }
         )
@@ -7263,20 +7267,20 @@ def build_operations_notice(digest, reference=None):
         today_count = row.get("today_sales_count")
         yesterday_text = str(yesterday) if yesterday is not None else "—"
         today_text = str(today_count) if today_count is not None else "—"
-        payment_text = format_operations_timestamp(
-            row.get("last_successful_payment_at"),
+        sale_text = format_operations_timestamp(
+            row.get("last_sale_at"),
             reference=reference,
         )
         lines.append(f"{status} · <b>{escape_html(point_name)}</b>")
         lines.append(
             "☕ вчера "
             f"{escape_html(yesterday_text)} · сегодня {escape_html(today_text)}"
-            f" · посл. оплата {escape_html(payment_text)}"
+            f" · посл. продажа {escape_html(sale_text)}"
         )
 
     if digest.get("incomplete_data"):
         lines.append("<i>Часть онлайн-данных пока недоступна.</i>")
-    lines.append("<i>Продажи — Telemetron; связь и оплата — Vendista.</i>")
+    lines.append("<i>Продажи — Telemetron; состояние связи — Vendista.</i>")
     return "\n".join(lines)
 
 

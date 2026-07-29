@@ -14,6 +14,7 @@ def point_row(
     warnings=None,
     yesterday=10,
     today=4,
+    last_sale="2026-07-29T13:40:00+03:00",
     last_payment="2026-07-29T13:45:00+03:00",
 ):
     return {
@@ -23,6 +24,7 @@ def point_row(
         "warnings": warnings or [],
         "yesterday_sales_count": yesterday,
         "today_sales_count": today,
+        "last_sale_at": last_sale,
         "last_successful_payment_at": last_payment,
     }
 
@@ -103,6 +105,26 @@ class OperationsSummaryTests(unittest.TestCase):
             ),
             "вчера 22:30",
         )
+
+    def test_notice_uses_actual_sale_time_not_payment_time(self):
+        payload = {
+            "points": [
+                point_row(
+                    name,
+                    last_sale="2026-07-29T12:10:00+03:00",
+                    last_payment="2026-07-29T13:55:00+03:00",
+                )
+                for name in bot.ACTIVE_OPERATIONAL_POINTS
+            ]
+        }
+
+        text = bot.build_operations_notice(
+            bot.normalize_operations_digest(payload),
+            reference=self.reference,
+        )
+
+        self.assertIn("посл. продажа сегодня 12:10", text)
+        self.assertNotIn("сегодня 13:55", text)
 
     def test_provider_failure_keeps_existing_service_text(self):
         service_text = "<b>Обслуживание</b>\nСуществующие данные"
