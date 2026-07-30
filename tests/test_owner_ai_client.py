@@ -52,6 +52,7 @@ class OwnerAiClientTests(unittest.TestCase):
             self.config,
             user_id=874403512,
             question="  Продажи   сегодня? ",
+            conversation_id="telegram:-100123:874403512",
             urlopen=urlopen,
         )
 
@@ -73,8 +74,18 @@ class OwnerAiClientTests(unittest.TestCase):
                 "version": "1",
                 "user_id": 874403512,
                 "question": "Продажи сегодня?",
+                "conversation_id": "telegram:-100123:874403512",
             },
         )
+
+    def test_invalid_conversation_id_is_rejected_locally(self):
+        with self.assertRaises(OwnerAiClientError):
+            query_owner_ai(
+                self.config,
+                user_id=123,
+                question="Продажи сегодня",
+                conversation_id="telegram:bad conversation",
+            )
 
     def test_forbidden_user_has_distinct_safe_error(self):
         def urlopen(_request, timeout=None):

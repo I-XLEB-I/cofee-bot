@@ -10914,12 +10914,17 @@ async def answer_owner_ai_message(message, context, question):
         return
     status = await message.reply_text("🤖 Собираю точные данные…")
     user_id = getattr(getattr(message, "from_user", None), "id", None)
+    chat_id = getattr(message, "chat_id", None)
+    if chat_id is None:
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+    conversation_id = f"telegram:{chat_id or user_id}:{user_id}"
     try:
         result = await run_blocking(
             query_owner_ai,
             config,
             user_id=user_id,
             question=question,
+            conversation_id=conversation_id,
         )
     except OwnerAiAccessError as exc:
         await status.edit_text(f"⛔ {exc}")
