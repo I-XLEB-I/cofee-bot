@@ -10918,6 +10918,19 @@ async def answer_owner_ai_message(message, context, question):
     if chat_id is None:
         chat_id = getattr(getattr(message, "chat", None), "id", None)
     conversation_id = f"telegram:{chat_id or user_id}:{user_id}"
+    maintenance_context = None
+    if owner_ai_question_needs_maintenance_context(question):
+        try:
+            maintenance_context = await run_blocking(
+                build_owner_ai_maintenance_context
+            )
+        except Exception as exc:
+            logger.warning(
+                "owner_ai_maintenance_context_unavailable "
+                "user_id=%s error_type=%s",
+                user_id,
+                type(exc).__name__,
+            )
     try:
         result = await run_blocking(
             query_owner_ai,
@@ -10925,6 +10938,7 @@ async def answer_owner_ai_message(message, context, question):
             user_id=user_id,
             question=question,
             conversation_id=conversation_id,
+            maintenance_context=maintenance_context,
         )
     except OwnerAiAccessError as exc:
         await status.edit_text(f"⛔ {exc}")
@@ -10957,6 +10971,46 @@ async def answer_owner_ai_message(message, context, question):
         f"🤖 ИИ-аналитик · {scope_label}\n\n{result['answer']}",
         link_preview_options=NO_LINK_PREVIEW,
     )
+
+
+def owner_ai_question_needs_maintenance_context(question):
+    normalized = str(question or "").casefold().replace("ё", "е")
+    return any(
+        marker in normalized
+        for marker in (
+            "почему",
+            "из-за чего",
+            "мало продаж",
+            "нет продаж",
+            "не было продаж",
+            "давно не было продаж",
+            "обслуж",
+        )
+    )
+
+
+def build_owner_ai_maintenance_context():
+    """Return bounded historical service dates for operational AI questions."""
+    dates_by_point = {point: set() for point in ACTIVE_OPERATIONAL_POINTS}
+    for record in get_all_services():
+        point = str(record.get("Точка") or "").strip()
+        if point not in dates_by_point:
+            continue
+        parsed = parse_date(record.get("Дата"))
+        if parsed is None:
+            continue
+        dates_by_point[point].add(parsed.date().isoformat())
+    return {
+        "points": [
+            {
+                "point_name": point,
+                "service_dates": sorted(dates_by_point[point], reverse=True)[
+                    :12
+                ],
+            }
+            for point in ACTIVE_OPERATIONAL_POINTS
+        ]
+    }
 
 
 async def cmd_ai(update: Update, context):
