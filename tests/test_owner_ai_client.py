@@ -53,6 +53,14 @@ class OwnerAiClientTests(unittest.TestCase):
             user_id=874403512,
             question="  Продажи   сегодня? ",
             conversation_id="telegram:-100123:874403512",
+            maintenance_context={
+                "points": [
+                    {
+                        "point_name": "Сити",
+                        "service_dates": ["2026-07-26", "2026-07-24"],
+                    }
+                ]
+            },
             urlopen=urlopen,
         )
 
@@ -75,6 +83,14 @@ class OwnerAiClientTests(unittest.TestCase):
                 "user_id": 874403512,
                 "question": "Продажи сегодня?",
                 "conversation_id": "telegram:-100123:874403512",
+                "maintenance_context": {
+                    "points": [
+                        {
+                            "point_name": "Сити",
+                            "service_dates": ["2026-07-26", "2026-07-24"],
+                        }
+                    ]
+                },
             },
         )
 

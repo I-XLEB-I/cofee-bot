@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -46,6 +47,7 @@ def query_owner_ai(
     user_id: int,
     question: str,
     conversation_id: str | None = None,
+    maintenance_context: Mapping[str, Any] | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
 ) -> dict[str, str]:
     """Call the versioned internal API and return its validated response."""
@@ -80,6 +82,10 @@ def query_owner_ai(
     }
     if normalized_conversation_id is not None:
         payload["conversation_id"] = normalized_conversation_id
+    if maintenance_context is not None:
+        payload["maintenance_context"] = _normalize_maintenance_context(
+            maintenance_context
+        )
     request_body = json.dumps(
         payload,
         ensure_ascii=False,
@@ -140,3 +146,40 @@ def query_owner_ai(
     if len(answer) > config.max_answer_chars:
         raise OwnerAiClientError("Owner AI answer is too long.")
     return {"scope": scope, "answer": answer}
+
+
+def _normalize_maintenance_context(
+    value: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Keep only bounded service dates; the backend validates them again."""
+    if not isinstance(value, Mapping):
+        raise OwnerAiClientError("Invalid maintenance context.")
+    raw_points = value.get("points")
+    if not isinstance(raw_points, Sequence) or isinstance(
+        raw_points,
+        (str, bytes, bytearray),
+    ):
+        raise OwnerAiClientError("Invalid maintenance context.")
+    points: list[dict[str, Any]] = []
+    for raw_point in raw_points[:12]:
+        if not isinstance(raw_point, Mapping):
+            raise OwnerAiClientError("Invalid maintenance context.")
+        point_name = str(raw_point.get("point_name") or "").strip()
+        raw_dates = raw_point.get("service_dates")
+        if not point_name or len(point_name) > 80:
+            raise OwnerAiClientError("Invalid maintenance context.")
+        if not isinstance(raw_dates, Sequence) or isinstance(
+            raw_dates,
+            (str, bytes, bytearray),
+        ):
+            raise OwnerAiClientError("Invalid maintenance context.")
+        dates = [str(item).strip() for item in raw_dates[:12]]
+        if any(len(item) != 10 for item in dates):
+            raise OwnerAiClientError("Invalid maintenance context.")
+        points.append(
+            {
+                "point_name": point_name,
+                "service_dates": dates,
+            }
+        )
+    return {"points": points}
