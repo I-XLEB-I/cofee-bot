@@ -45,6 +45,7 @@ def query_owner_ai(
     *,
     user_id: int,
     question: str,
+    conversation_id: str | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
 ) -> dict[str, str]:
     """Call the versioned internal API and return its validated response."""
@@ -55,13 +56,32 @@ def query_owner_ai(
         raise OwnerAiClientError("Question must not be empty.")
     if len(normalized) > config.max_question_chars:
         raise OwnerAiClientError("Question is too long.")
+    normalized_conversation_id = None
+    if conversation_id is not None:
+        normalized_conversation_id = str(conversation_id).strip()
+        if (
+            not normalized_conversation_id
+            or len(normalized_conversation_id) > 160
+            or not all(
+                character.isascii()
+                and (
+                    character.isalnum()
+                    or character in {":", "_", "-"}
+                )
+                for character in normalized_conversation_id
+            )
+        ):
+            raise OwnerAiClientError("Invalid conversation ID.")
 
+    payload = {
+        "version": "1",
+        "user_id": user_id,
+        "question": normalized,
+    }
+    if normalized_conversation_id is not None:
+        payload["conversation_id"] = normalized_conversation_id
     request_body = json.dumps(
-        {
-            "version": "1",
-            "user_id": user_id,
-            "question": normalized,
-        },
+        payload,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")

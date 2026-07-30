@@ -64,6 +64,42 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
         answer.assert_not_awaited()
         update.effective_message.reply_text.assert_awaited_once()
 
+    async def test_ai_request_uses_chat_scoped_conversation_id(self):
+        status = SimpleNamespace(edit_text=AsyncMock())
+        message = SimpleNamespace(
+            reply_text=AsyncMock(return_value=status),
+            from_user=SimpleNamespace(id=874403512),
+            chat_id=-100123,
+        )
+        config = SimpleNamespace()
+
+        with (
+            patch.object(bot, "get_owner_ai_client_config", return_value=config),
+            patch.object(
+                bot,
+                "run_blocking",
+                new=AsyncMock(
+                    return_value={
+                        "scope": "staff",
+                        "answer": "Вчера 2 продажи.",
+                    }
+                ),
+            ) as run,
+        ):
+            await bot.answer_owner_ai_message(
+                message,
+                SimpleNamespace(),
+                "А вчера?",
+            )
+
+        run.assert_awaited_once_with(
+            bot.query_owner_ai,
+            config,
+            user_id=874403512,
+            question="А вчера?",
+            conversation_id="telegram:-100123:874403512",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
