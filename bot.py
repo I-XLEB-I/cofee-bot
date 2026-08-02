@@ -27,6 +27,7 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
@@ -1628,6 +1629,15 @@ def update_revision_row(row_num, data):
     )
 
 
+def clear_revision_row(row_num):
+    """Clear a revision without shifting row references kept in the import log."""
+    sheet = get_or_create_worksheet("Ревизия", REVISION_HEADERS)
+    sheet.update(
+        f"A{row_num}:{chr(ord('A') + len(REVISION_HEADERS) - 1)}{row_num}",
+        [[""] * len(REVISION_HEADERS)],
+    )
+
+
 def delete_revision_row(row_num):
     get_or_create_worksheet("Ревизия", REVISION_HEADERS).delete_rows(row_num)
 
@@ -2335,6 +2345,140 @@ def build_group_report_revision_backup(record):
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+def build_group_report_revision_payload(period, location, draft, values):
+    return {
+        "period": period,
+        "location": location,
+        "who": draft.get("who", ""),
+        # An edited Telegram message still describes the original visit.  Do
+        # not silently move a July revision to today's date when it is fixed
+        # later.
+        "filled_at": draft.get("date", "") or today(),
+        "values": values,
+    }
+
+
+def restore_revision_source_after_relocation(record, source_record, draft):
+    """Undo the old point contribution before moving an edited revision.
+
+    Rows created by the source message are cleared instead of deleted because
+    the import log stores stable spreadsheet row numbers.
+    """
+    if not source_record:
+        return
+
+    mode = str(record.get("Revision_Mode", "")).strip() or "created"
+    if mode == "updated":
+        backup_raw = str(record.get("Revision_Backup", "")).strip()
+        if not backup_raw:
+            raise ValueError("revision backup is missing for point relocation")
+        snapshot = json.loads(backup_raw)
+        payload = {
+            "period": str(record.get("Revision_Period", "")).strip(),
+            "location": str(record.get("Revision_Location", "")).strip(),
+            "who": snapshot.get("who", ""),
+            "filled_at": snapshot.get("filled_at", ""),
+            "values": snapshot.get("values", {}),
+        }
+        run_group_sheet_write_blocking_with_retry(
+            lambda: update_revision_row(source_record["__row"], payload),
+            "edited revision source restore",
+            draft=draft,
+        )
+        return
+
+    run_group_sheet_write_blocking_with_retry(
+        lambda: clear_revision_row(source_record["__row"]),
+        "edited revision source clear",
+        draft=draft,
+    )
+
+
+def save_edited_revision_entry(draft, record, revision):
+    """Update a revision and safely relocate it when the point was edited."""
+    target_period = str(revision.get("period", "")).strip()
+    target_location = str(revision.get("location", "")).strip()
+    if not target_period or not target_location:
+        raise ValueError("edited revision target is incomplete")
+
+    source_period = str(record.get("Revision_Period", "")).strip()
+    source_location = str(record.get("Revision_Location", "")).strip()
+    source_record = find_group_report_revision_entry(record)
+    relocated = bool(
+        source_period
+        and source_location
+        and (source_period, source_location) != (target_period, target_location)
+    )
+
+    target_record = None
+    reuse_source_row = False
+    if relocated:
+        target_record = find_revision_record(target_period, target_location, True)
+        source_mode = str(record.get("Revision_Mode", "")).strip() or "created"
+        if source_record and source_mode == "created" and not target_record:
+            # The source message created its own row.  If the corrected point
+            # has no row yet, moving that row is both safe and lossless.
+            target_record = source_record
+            reuse_source_row = True
+        else:
+            restore_revision_source_after_relocation(record, source_record, draft)
+    else:
+        target_record = source_record or find_revision_record(
+            target_period,
+            target_location,
+            True,
+        )
+
+    values = (
+        build_revision_values_from_record(target_record)
+        if target_record
+        else {item: "" for item in REVISION_ITEMS}
+    )
+    for item_name, value in revision.get("values", {}).items():
+        values[item_name] = value
+
+    payload = build_group_report_revision_payload(
+        target_period,
+        target_location,
+        draft,
+        values,
+    )
+
+    if target_record:
+        target_backup = build_group_report_revision_backup(target_record)
+        run_group_sheet_write_blocking_with_retry(
+            lambda: update_revision_row(target_record["__row"], payload),
+            "edited revision target update",
+            draft=draft,
+        )
+        if relocated and not reuse_source_row:
+            mode = "updated"
+            backup = target_backup
+        else:
+            mode = str(record.get("Revision_Mode", "")).strip() or "updated"
+            backup = str(record.get("Revision_Backup", "")).strip()
+            if mode == "updated" and not backup:
+                backup = target_backup
+        row_num = target_record["__row"]
+    else:
+        row_num = run_group_sheet_write_blocking_with_retry(
+            lambda: add_revision_row(payload),
+            "edited revision target create",
+            draft=draft,
+        )
+        mode = "created"
+        backup = ""
+
+    return {
+        "row": row_num,
+        "period": target_period,
+        "location": target_location,
+        "mode": mode,
+        "backup": backup,
+        "relocated": relocated,
+    }
+
+
 def find_group_report_log_entry(chat_id, source_key):
     for record in reversed(get_group_report_logs_with_rows()):
         if str(record.get("Chat_ID", "")) == str(chat_id) and str(record.get("Source_Key", "")) == str(source_key):
@@ -2840,34 +2984,8 @@ def update_group_report_entry_from_edit(draft, record):
     revision_meta = None
     revision = draft.get("revision")
     existing_revision = find_group_report_revision_entry(record)
-    if revision and existing_revision:
-        values = build_revision_values_from_record(existing_revision)
-        values.update(revision.get("values", {}))
-        revision_payload = {
-            "period": revision["period"],
-            "location": revision["location"],
-            "who": draft.get("who", ""),
-            "filled_at": today(),
-            "values": values,
-        }
-        run_group_sheet_write_blocking_with_retry(
-            lambda: update_revision_row(existing_revision["__row"], revision_payload),
-            "edited group report revision update",
-            draft=draft,
-        )
-        revision_meta = {
-            "row": existing_revision["__row"],
-            "period": revision["period"],
-            "location": revision["location"],
-            "mode": record.get("Revision_Mode", "") or "updated",
-            "backup": record.get("Revision_Backup", ""),
-        }
-    elif revision:
-        revision_meta = run_group_sheet_write_blocking_with_retry(
-            lambda: save_group_report_revision(draft),
-            "edited group report revision save",
-            draft=draft,
-        )
+    if revision:
+        revision_meta = save_edited_revision_entry(draft, record, revision)
     elif existing_revision:
         revision_meta = {
             "row": existing_revision["__row"],
@@ -2922,47 +3040,15 @@ def update_group_report_entry_from_edit(draft, record):
 
 
 def update_revision_message_entry_from_edit(draft, record):
-    existing = find_group_report_revision_entry(record)
-    if not existing:
-        existing = find_revision_record(draft["period"], draft["point"], True)
-
-    values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
-    for item_name, value in draft.get("values", {}).items():
-        values[item_name] = value
-
-    payload = {
-        "period": draft["period"],
-        "location": draft["point"],
-        "who": draft.get("who", ""),
-        "filled_at": today(),
-        "values": values,
-    }
-    if existing:
-        run_group_sheet_write_blocking_with_retry(
-            lambda: update_revision_row(existing["__row"], payload),
-            "edited revision snapshot update",
-            draft=draft,
-        )
-        revision_meta = {
-            "row": existing["__row"],
+    revision_meta = save_edited_revision_entry(
+        draft,
+        record,
+        {
             "period": draft["period"],
             "location": draft["point"],
-            "mode": record.get("Revision_Mode", "") or "updated",
-            "backup": record.get("Revision_Backup", "") or build_group_report_revision_backup(existing),
-        }
-    else:
-        row_num = run_group_sheet_write_blocking_with_retry(
-            lambda: add_revision_row(payload),
-            "edited revision snapshot create",
-            draft=draft,
-        )
-        revision_meta = {
-            "row": row_num,
-            "period": draft["period"],
-            "location": draft["point"],
-            "mode": "created",
-            "backup": "",
-        }
+            "values": draft.get("values", {}),
+        },
+    )
 
     updated_log = {
         "chat_id": draft["chat_id"],
@@ -18358,11 +18444,11 @@ async def finalize_group_report_media_group(application, media_key):
 async def group_report_message_handler(update: Update, context):
     message = update.effective_message
     if not message:
-        return
+        return False
     if not is_allowed_user(update) or not is_allowed_group_report_chat(update):
-        return
+        return False
     if getattr(message.from_user, "is_bot", False):
-        return
+        return False
 
     if message.media_group_id:
         media_key = f"{message.chat_id}:{message.media_group_id}"
@@ -18382,9 +18468,46 @@ async def group_report_message_handler(update: Update, context):
         if not payload["task_started"]:
             payload["task_started"] = True
             asyncio.create_task(finalize_group_report_media_group(context.application, media_key))
-        return
+        return True
 
     await process_group_report_message(message, context.application)
+    return True
+
+
+async def edited_group_report_message_handler(update: Update, context):
+    processed = await group_report_message_handler(update, context)
+    if processed:
+        # Do not let an active ConversationHandler interpret the same edited
+        # report as an answer to its current question.
+        raise ApplicationHandlerStop
+
+
+GROUP_REPORT_MESSAGE_FILTER = filters.PHOTO | (filters.TEXT & ~filters.COMMAND)
+EDITED_GROUP_REPORT_MESSAGE_FILTER = (
+    filters.UpdateType.EDITED_MESSAGE & GROUP_REPORT_MESSAGE_FILTER
+)
+NEW_GROUP_REPORT_MESSAGE_FILTER = (
+    GROUP_REPORT_MESSAGE_FILTER & ~filters.UpdateType.EDITED_MESSAGE
+)
+
+
+def register_group_report_message_handlers(application):
+    # Edited messages must run before ConversationHandler.  Otherwise an
+    # employee who is currently inside a bot dialogue can have the edit
+    # consumed by that dialogue and the saved report never gets refreshed.
+    application.add_handler(
+        MessageHandler(
+            EDITED_GROUP_REPORT_MESSAGE_FILTER,
+            edited_group_report_message_handler,
+        ),
+        group=-1,
+    )
+    application.add_handler(
+        MessageHandler(
+            NEW_GROUP_REPORT_MESSAGE_FILTER,
+            group_report_message_handler,
+        )
+    )
 
 
 async def group_report_callback_handler(update: Update, context):
@@ -21011,7 +21134,7 @@ def main():
             pattern=r"^grp_report_",
         )
     )
-    app.add_handler(MessageHandler((filters.PHOTO | (filters.TEXT & ~filters.COMMAND)), group_report_message_handler))
+    register_group_report_message_handlers(app)
     app.add_error_handler(global_error_handler)
     logger.info("🤖 Бот запущен")
     # Keep retrying bootstrap requests when Telegram is temporarily unreachable.
