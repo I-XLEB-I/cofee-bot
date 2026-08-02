@@ -10886,6 +10886,58 @@ OWNER_AI_HELP_TEXT = (
     "выплаты и команды терминалам через ИИ запрещены."
 )
 
+OWNER_AI_SECTION_PREFIXES = (
+    "☕ ",
+    "🕒 ",
+    "📊 ",
+    "📡 ",
+    "🎫 ",
+    "⚠️ ",
+    "🔎 ",
+    "💡 ",
+)
+OWNER_AI_BOLD_LABELS = (
+    "Точка",
+    "Период",
+    "Всего",
+    "Итого",
+    "Продажи",
+    "Выручка",
+    "Средний чек",
+    "Последняя продажа",
+    "Сравнение",
+    "Разница",
+    "Вывод",
+    "Сигналы проверки",
+    "Открытых заявок",
+    "Рейтинг по количеству",
+    "Рейтинг по выручке",
+)
+
+
+def format_owner_ai_answer_html(answer):
+    """Add trusted Telegram emphasis after escaping all model text."""
+    rendered = []
+    for raw_line in str(answer or "").strip().splitlines():
+        line = raw_line.strip()
+        if not line:
+            rendered.append("")
+            continue
+        if line.startswith(OWNER_AI_SECTION_PREFIXES) and len(line) <= 100:
+            rendered.append(f"<b>{escape_html(line)}</b>")
+            continue
+        for label in OWNER_AI_BOLD_LABELS:
+            marker = f"{label}:"
+            if line.startswith(marker):
+                rest = line[len(marker):]
+                rendered.append(
+                    f"<b>{escape_html(marker)}</b>{escape_html(rest)}"
+                )
+                break
+        else:
+            rendered.append(escape_html(raw_line.rstrip()))
+    return "\n".join(rendered)
+
 
 def owner_ai_back_markup():
     return InlineKeyboardMarkup(
@@ -10967,10 +11019,25 @@ async def answer_owner_ai_message(message, context, question):
         return
 
     scope_label = "владелец" if result["scope"] == "owner" else "сотрудник"
-    await status.edit_text(
-        f"🤖 ИИ-аналитик · {scope_label}\n\n{result['answer']}",
-        link_preview_options=NO_LINK_PREVIEW,
-    )
+    plain_answer = str(result["answer"])
+    formatted_answer = format_owner_ai_answer_html(plain_answer)
+    try:
+        await status.edit_text(
+            f"<b>🤖 ИИ-аналитик · {escape_html(scope_label)}</b>"
+            f"\n\n{formatted_answer}",
+            parse_mode="HTML",
+            link_preview_options=NO_LINK_PREVIEW,
+        )
+    except BadRequest as exc:
+        logger.warning(
+            "owner_ai_html_render_failed user_id=%s error_type=%s",
+            user_id,
+            type(exc).__name__,
+        )
+        await status.edit_text(
+            f"🤖 ИИ-аналитик · {scope_label}\n\n{plain_answer}",
+            link_preview_options=NO_LINK_PREVIEW,
+        )
 
 
 def owner_ai_question_needs_maintenance_context(question):
