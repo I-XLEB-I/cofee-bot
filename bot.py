@@ -11228,6 +11228,28 @@ async def owner_ai_message_handler(update: Update, context):
     return OWNER_AI_CHAT
 
 
+PRIVATE_OWNER_AI_IDLE_FILTER = (
+    filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND
+)
+
+
+def register_private_owner_ai_idle_handler(application):
+    """Route otherwise-unhandled private text to the owner AI.
+
+    The handler is registered immediately after the main conversation in the
+    same handler group.  Telegram therefore keeps all explicit bot workflows
+    (menus, revisions, salary inputs, and so on), while an idle private chat
+    behaves like a normal AI conversation without requiring ``/ai``.  Group
+    chats remain explicit-command-only.
+    """
+    application.add_handler(
+        MessageHandler(
+            PRIVATE_OWNER_AI_IDLE_FILTER,
+            owner_ai_message_handler,
+        )
+    )
+
+
 async def owner_ai_callback_handler(update: Update, context):
     query = update.callback_query
     if not is_allowed_user(update):
@@ -21146,6 +21168,7 @@ def main():
     )
 
     app.add_handler(conv)
+    register_private_owner_ai_idle_handler(app)
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("ids", cmd_ids))
     app.add_handler(CommandHandler("shortages", cmd_shortages))

@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import bot
 
@@ -63,6 +63,47 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, bot.ConversationHandler.END)
         answer.assert_not_awaited()
         update.effective_message.reply_text.assert_awaited_once()
+
+    async def test_idle_private_message_is_forwarded_without_ai_command(self):
+        message = SimpleNamespace(
+            text="йоу",
+            reply_text=AsyncMock(),
+            from_user=SimpleNamespace(id=1_395_822_345),
+        )
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=message.from_user,
+            effective_chat=SimpleNamespace(
+                id=1_395_822_345,
+                type="private",
+            ),
+        )
+        context = SimpleNamespace()
+
+        with (
+            patch.object(bot, "is_allowed_user", return_value=True),
+            patch.object(bot, "is_private_chat", return_value=True),
+            patch.object(
+                bot,
+                "answer_owner_ai_message",
+                new=AsyncMock(),
+            ) as answer,
+        ):
+            result = await bot.owner_ai_message_handler(update, context)
+
+        self.assertEqual(result, bot.OWNER_AI_CHAT)
+        answer.assert_awaited_once_with(message, context, "йоу")
+
+    def test_idle_ai_handler_is_private_text_only(self):
+        application = Mock()
+
+        bot.register_private_owner_ai_idle_handler(application)
+
+        application.add_handler.assert_called_once()
+        handler = application.add_handler.call_args.args[0]
+        self.assertIsInstance(handler, bot.MessageHandler)
+        self.assertIs(handler.callback, bot.owner_ai_message_handler)
+        self.assertIs(handler.filters, bot.PRIVATE_OWNER_AI_IDLE_FILTER)
 
     async def test_ai_request_uses_chat_scoped_conversation_id(self):
         status = SimpleNamespace(edit_text=AsyncMock())
