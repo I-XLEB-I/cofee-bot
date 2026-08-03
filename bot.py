@@ -43,6 +43,11 @@ from owner_ai_client import (
     OwnerAiClientError,
     query_owner_ai,
 )
+from payroll_api import (
+    PayrollApiConfig,
+    PayrollApiServer,
+    build_payroll_payload,
+)
 
 
 # ============ НАСТРОЙКИ ============
@@ -102,6 +107,10 @@ OPERATIONS_CACHE_TTL_SECONDS = float(os.getenv("OPERATIONS_CACHE_TTL_SECONDS", "
 OWNER_AI_INTERNAL_URL = os.getenv("OWNER_AI_INTERNAL_URL", "").strip()
 OWNER_AI_INTERNAL_TOKEN = os.getenv("OWNER_AI_INTERNAL_TOKEN", "").strip()
 OWNER_AI_TIMEOUT_SECONDS = float(os.getenv("OWNER_AI_TIMEOUT_SECONDS", "25.0"))
+OWNER_PAYROLL_API_TOKEN = os.getenv("OWNER_PAYROLL_API_TOKEN", "").strip()
+OWNER_PAYROLL_API_PORT = int(
+    os.getenv("OWNER_PAYROLL_API_PORT", os.getenv("PORT", "8080"))
+)
 TELEMETRON_TODAY_REPORT_URL = (
     "https://my.telemetron.net/reports/sales-by-machines"
 )
@@ -20822,6 +20831,21 @@ async def reminder_loop(application):
 
 async def on_app_startup(application):
     await run_blocking(get_user_directory)
+    if OWNER_PAYROLL_API_TOKEN:
+        payroll_server = PayrollApiServer(
+            PayrollApiConfig(
+                token=OWNER_PAYROLL_API_TOKEN,
+                port=OWNER_PAYROLL_API_PORT,
+            ),
+            payload_builder=lambda request: build_payroll_payload(
+                request,
+                paid_workers=get_paid_workers(),
+                sources_factory=build_payout_sources,
+                settlement_factory=compute_payout_settlement,
+            ),
+        )
+        payroll_server.start()
+        application.bot_data["owner_payroll_api_server"] = payroll_server
     load_reminder_state(application)
     if ALLOWED_GROUP_CHAT_IDS:
         try:
@@ -20832,6 +20856,9 @@ async def on_app_startup(application):
 
 
 async def on_app_shutdown(application):
+    payroll_server = application.bot_data.pop("owner_payroll_api_server", None)
+    if payroll_server is not None:
+        await run_blocking(payroll_server.close)
     refresh_task = application.bot_data.pop(GROUP_REPORT_REFRESH_TASK_KEY, None)
     if refresh_task:
         refresh_task.cancel()
