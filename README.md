@@ -28,6 +28,8 @@ Telegram-бот для учета обслуживания точек, заку�
 - `ALLOWED_USER_IDS` — список разрешённых Telegram user id через запятую; если переменная не задана, бот берёт id из `USERS_JSON` или листа `Пользователи`
 - `ALLOWED_GROUP_CHAT_IDS` — список разрешённых group/supergroup chat id через запятую
 - `GROUP_REPORT_DRAFT_TTL_SECONDS` — время жизни черновиков из групповых сообщений (в секундах)
+- `OWNER_PAYROLL_API_TOKEN` — отдельный секрет (не короче 32 символов) для read-only API расчёта зарплаты владельца
+- `OWNER_PAYROLL_API_PORT` — порт внутреннего payroll API; в Railway обычно `8080`
 - `CARD_MESSAGES_AUTO_CLEANUP_SECONDS` — автоочистка карточек точек в чате (в секундах, `0` выключает)
 - `OPERATIONS_API_URL` — полный HTTPS-адрес защищённой оперативной сводки, обычно `/internal/operations/points`
 - `OPERATIONS_API_TOKEN` — отдельный токен только для чтения оперативной сводки; не используй здесь MCP/admin-токен
