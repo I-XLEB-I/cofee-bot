@@ -80,12 +80,23 @@ def build_payroll_payload(
     if not workers:
         raise PayrollApiError("No paid workers are configured.")
 
+    # The HTTP contract uses the conventional YYYY-MM form, while the
+    # long-standing bot settlement engine stores month keys as MM.YYYY.
+    # Keep that translation at this boundary so callers never need to know
+    # about the internal spreadsheet key format.
+    year, month = period.split("-", 1)
+    settlement_period = f"{month}.{year}"
+
     sources = sources_factory()
     rows: list[dict[str, Any]] = []
     total = 0.0
     period_label = period
     for worker in workers:
-        settlement = settlement_factory(period, sources=sources, worker=worker)
+        settlement = settlement_factory(
+            settlement_period,
+            sources=sources,
+            worker=worker,
+        )
         period_label = str(settlement.get("period_label") or period)[:80]
         display_total = _number(settlement.get("display_total"))
         total += display_total

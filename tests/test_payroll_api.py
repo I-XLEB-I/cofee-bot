@@ -13,7 +13,7 @@ from payroll_api import (
 
 
 def _settlement(period, *, sources, worker):
-    assert period == "2026-07"
+    assert period == "07.2026"
     assert sources == {"loaded": True}
     amount = 1200 if worker == "Кирилл" else 2300
     return {
@@ -41,6 +41,7 @@ def test_build_payroll_payload_uses_canonical_calculation_once_per_worker():
     )
 
     assert payload["period_label"] == "Июль 2026"
+    assert payload["period"] == "2026-07"
     assert [row["worker"] for row in payload["workers"]] == [
         "Кирилл",
         "Александр",
