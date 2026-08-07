@@ -35,6 +35,7 @@ Telegram-бот для учета обслуживания точек, заку�
 - `OPERATIONS_API_TOKEN` — отдельный токен только для чтения оперативной сводки; не используй здесь MCP/admin-токен
 - `OPERATIONS_API_TIMEOUT_SECONDS` — тайм-аут запроса оперативной сводки, по умолчанию 5 секунд
 - `OPERATIONS_CACHE_TTL_SECONDS` — локальный кэш сводки в боте, по умолчанию 60 секунд
+- `OPERATIONS_STALE_CACHE_SECONDS` — сколько секунд показывать последнюю подтверждённую сводку при кратком сбое API, по умолчанию 1800 секунд
 - `OWNER_AI_INTERNAL_URL` — полный HTTPS-адрес versioned read-only API, обычно `/internal/owner-ai/v1/query`
 - `OWNER_AI_INTERNAL_TOKEN` — отдельный service-to-service токен длиной не менее 32 символов; не переиспользовать MCP, Telegram, operations или provider-токены
 - `OWNER_AI_TIMEOUT_SECONDS` — тайм-аут одного вопроса, по умолчанию 25 секунд

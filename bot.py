@@ -104,6 +104,9 @@ OPERATIONS_API_URL = os.getenv("OPERATIONS_API_URL", "").strip().rstrip("/")
 OPERATIONS_API_TOKEN = os.getenv("OPERATIONS_API_TOKEN", "").strip()
 OPERATIONS_API_TIMEOUT_SECONDS = float(os.getenv("OPERATIONS_API_TIMEOUT_SECONDS", "5.0"))
 OPERATIONS_CACHE_TTL_SECONDS = float(os.getenv("OPERATIONS_CACHE_TTL_SECONDS", "60.0"))
+OPERATIONS_STALE_CACHE_SECONDS = float(
+    os.getenv("OPERATIONS_STALE_CACHE_SECONDS", "1800.0")
+)
 OWNER_AI_INTERNAL_URL = os.getenv("OWNER_AI_INTERNAL_URL", "").strip()
 OWNER_AI_INTERNAL_TOKEN = os.getenv("OWNER_AI_INTERNAL_TOKEN", "").strip()
 OWNER_AI_TIMEOUT_SECONDS = float(os.getenv("OWNER_AI_TIMEOUT_SECONDS", "25.0"))
@@ -232,6 +235,7 @@ _ENSURED_WORKSHEET_GROUPS = set()
 _OPERATIONS_CACHE = {
     "payload": None,
     "expires_at": 0.0,
+    "stale_until": 0.0,
 }
 _OPERATIONS_FETCH_LOCK = asyncio.Lock()
 
@@ -7239,6 +7243,16 @@ def _non_negative_int(value):
     return normalized if normalized >= 0 else None
 
 
+def _non_negative_number(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(normalized, 2) if normalized >= 0 else None
+
+
 def _operations_datetime(value):
     if not value:
         return None
@@ -7299,6 +7313,12 @@ def normalize_operations_digest(payload):
             "today_sales_count": _non_negative_int(
                 raw_row.get("today_sales_count")
             ),
+            "yesterday_sales_value": _non_negative_number(
+                raw_row.get("yesterday_sales_value")
+            ),
+            "today_sales_value": _non_negative_number(
+                raw_row.get("today_sales_value")
+            ),
             "last_sale_at": (
                 str(raw_row.get("last_sale_at") or "").strip() or None
             ),
@@ -7326,6 +7346,8 @@ def normalize_operations_digest(payload):
                 "warnings": ["missing_point"],
                 "yesterday_sales_count": None,
                 "today_sales_count": None,
+                "yesterday_sales_value": None,
+                "today_sales_value": None,
                 "last_sale_at": None,
                 "last_sale_product_name": None,
                 "last_sale_contains_coffee": None,
@@ -7334,12 +7356,33 @@ def normalize_operations_digest(payload):
                 "last_successful_payment_at": None,
             }
         )
+    yesterday_total = _non_negative_number(
+        payload.get("yesterday_sales_value_total")
+    )
+    today_total = _non_negative_number(payload.get("today_sales_value_total"))
+    if yesterday_total is None and all(
+        row["yesterday_sales_value"] is not None for row in points
+    ):
+        yesterday_total = round(
+            sum(row["yesterday_sales_value"] for row in points),
+            2,
+        )
+    if today_total is None and all(
+        row["today_sales_value"] is not None for row in points
+    ):
+        today_total = round(
+            sum(row["today_sales_value"] for row in points),
+            2,
+        )
     return {
         "available": True,
         "observed_at": str(payload.get("observed_at") or "").strip() or None,
         "incomplete_data": bool(payload.get("incomplete_data")) or len(rows_by_name) < len(
             ACTIVE_OPERATIONAL_POINTS
         ),
+        "yesterday_sales_value_total": yesterday_total,
+        "today_sales_value_total": today_total,
+        "stale": False,
         "points": points,
     }
 
@@ -7362,14 +7405,29 @@ async def get_operations_digest():
         ):
             return cached
 
-        try:
-            payload = await run_blocking(_request_operations_digest)
-            normalized = normalize_operations_digest(payload)
-        except Exception as exc:
+        normalized = None
+        last_error = None
+        for _attempt in range(2):
+            try:
+                payload = await run_blocking(_request_operations_digest)
+                normalized = normalize_operations_digest(payload)
+                break
+            except Exception as exc:
+                last_error = exc
+        if normalized is None:
             logger.warning(
                 "operations_digest_unavailable error_type=%s",
-                type(exc).__name__,
+                type(last_error).__name__,
             )
+            cached = _OPERATIONS_CACHE.get("payload")
+            if cached is not None and current_monotonic < _OPERATIONS_CACHE.get(
+                "stale_until",
+                0.0,
+            ):
+                stale = dict(cached)
+                stale["stale"] = True
+                stale["incomplete_data"] = True
+                return stale
             return {
                 "available": False,
                 "observed_at": None,
@@ -7379,6 +7437,11 @@ async def get_operations_digest():
 
         _OPERATIONS_CACHE["payload"] = normalized
         _OPERATIONS_CACHE["expires_at"] = current_monotonic + max(
+            OPERATIONS_CACHE_TTL_SECONDS,
+            0.0,
+        )
+        _OPERATIONS_CACHE["stale_until"] = current_monotonic + max(
+            OPERATIONS_STALE_CACHE_SECONDS,
             OPERATIONS_CACHE_TTL_SECONDS,
             0.0,
         )
@@ -7542,13 +7605,23 @@ def build_operations_notice(digest, reference=None):
     lines = [
         "<b>📡 Работа и продажи</b>",
         f"<pre>{escape_html(chr(10).join(table_rows))}</pre>",
+    ]
+    yesterday_value = digest.get("yesterday_sales_value_total")
+    today_value = digest.get("today_sales_value_total")
+    if yesterday_value is not None or today_value is not None:
+        lines.append(
+            "<b>Выручка всех точек:</b> "
+            f"вчера {escape_html(format_money_spaced(yesterday_value))} · "
+            f"сегодня {escape_html(format_money_spaced(today_value))}"
+        )
+    lines.append(
         "<blockquote>"
         f"{escape_html(_operations_connection_summary(points))}\n"
         "Вч / Сег — продажи. Последняя — безналичная.\n"
         "Пауза: 🟢 &lt;2ч · 🟡 2–3ч · 🔴 3ч+ · ⚪ вне графика.\n"
         f"Обновлено: {escape_html(observed_text)} МСК."
-        "</blockquote>",
-    ]
+        "</blockquote>"
+    )
 
     coffee_hints = _operations_coffee_hints(points, reference)
     if coffee_hints:
@@ -7561,6 +7634,11 @@ def build_operations_notice(digest, reference=None):
     if digest.get("incomplete_data"):
         lines.append(
             "<i>Часть оперативных данных пока недоступна.</i>"
+        )
+    if digest.get("stale"):
+        lines.append(
+            "<i>Показаны последние подтверждённые данные: обновление "
+            "временно задерживается.</i>"
         )
     lines.append(
         "<i>Продажи и напитки — Telemetron; связь — Vendista.</i>"
