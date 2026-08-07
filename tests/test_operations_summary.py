@@ -74,8 +74,28 @@ class OperationsSummaryTests(unittest.TestCase):
             True,
         )
         self.assertFalse(normalized["incomplete_data"])
+        self.assertEqual(normalized["yesterday_sales_count_total"], 60)
+        self.assertEqual(normalized["today_sales_count_total"], 24)
         self.assertEqual(normalized["yesterday_sales_value_total"], 9540)
         self.assertEqual(normalized["today_sales_value_total"], 3816)
+
+    def test_notice_shows_total_sales_count_below_point_table(self):
+        rows = [
+            point_row(name, yesterday=10, today=4)
+            for name in bot.ACTIVE_OPERATIONAL_POINTS
+        ]
+
+        text = bot.build_operations_notice(
+            bot.normalize_operations_digest({"points": rows}),
+            reference=self.reference,
+        )
+
+        table_end = text.index("</pre>")
+        total_at = text.index("<b>Итого продаж:</b>")
+        revenue_at = text.index("<b>Выручка всех точек:</b>")
+        self.assertGreater(total_at, table_end)
+        self.assertLess(total_at, revenue_at)
+        self.assertIn("вчера 60 · сегодня 24", text)
 
     def test_notice_shows_combined_revenue_below_point_table(self):
         rows = [

@@ -7356,6 +7356,23 @@ def normalize_operations_digest(payload):
                 "last_successful_payment_at": None,
             }
         )
+    yesterday_count_total = _non_negative_int(
+        payload.get("yesterday_sales_count_total")
+    )
+    today_count_total = _non_negative_int(
+        payload.get("today_sales_count_total")
+    )
+    if yesterday_count_total is None and all(
+        row["yesterday_sales_count"] is not None for row in points
+    ):
+        yesterday_count_total = sum(
+            row["yesterday_sales_count"] for row in points
+        )
+    if today_count_total is None and all(
+        row["today_sales_count"] is not None for row in points
+    ):
+        today_count_total = sum(row["today_sales_count"] for row in points)
+
     yesterday_total = _non_negative_number(
         payload.get("yesterday_sales_value_total")
     )
@@ -7380,6 +7397,8 @@ def normalize_operations_digest(payload):
         "incomplete_data": bool(payload.get("incomplete_data")) or len(rows_by_name) < len(
             ACTIVE_OPERATIONAL_POINTS
         ),
+        "yesterday_sales_count_total": yesterday_count_total,
+        "today_sales_count_total": today_count_total,
         "yesterday_sales_value_total": yesterday_total,
         "today_sales_value_total": today_total,
         "stale": False,
@@ -7606,6 +7625,22 @@ def build_operations_notice(digest, reference=None):
         "<b>📡 Работа и продажи</b>",
         f"<pre>{escape_html(chr(10).join(table_rows))}</pre>",
     ]
+    yesterday_count_total = digest.get("yesterday_sales_count_total")
+    today_count_total = digest.get("today_sales_count_total")
+    if yesterday_count_total is not None or today_count_total is not None:
+        yesterday_count_text = (
+            str(yesterday_count_total)
+            if yesterday_count_total is not None
+            else "—"
+        )
+        today_count_text = (
+            str(today_count_total) if today_count_total is not None else "—"
+        )
+        lines.append(
+            "<b>Итого продаж:</b> "
+            f"вчера {escape_html(yesterday_count_text)} · "
+            f"сегодня {escape_html(today_count_text)}"
+        )
     yesterday_value = digest.get("yesterday_sales_value_total")
     today_value = digest.get("today_sales_value_total")
     if yesterday_value is not None or today_value is not None:
