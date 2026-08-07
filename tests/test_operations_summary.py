@@ -16,6 +16,8 @@ def point_row(
     warnings=None,
     yesterday=10,
     today=4,
+    yesterday_value=1590,
+    today_value=636,
     last_sale="2026-07-29T13:40:00+03:00",
     last_product="Капучино",
     contains_coffee=True,
@@ -29,6 +31,8 @@ def point_row(
         "warnings": warnings or [],
         "yesterday_sales_count": yesterday,
         "today_sales_count": today,
+        "yesterday_sales_value": yesterday_value,
+        "today_sales_value": today_value,
         "last_sale_at": last_sale,
         "last_sale_product_name": last_product,
         "last_sale_contains_coffee": contains_coffee,
@@ -70,6 +74,24 @@ class OperationsSummaryTests(unittest.TestCase):
             True,
         )
         self.assertFalse(normalized["incomplete_data"])
+        self.assertEqual(normalized["yesterday_sales_value_total"], 9540)
+        self.assertEqual(normalized["today_sales_value_total"], 3816)
+
+    def test_notice_shows_combined_revenue_below_point_table(self):
+        rows = [
+            point_row(name, yesterday_value=1000, today_value=250)
+            for name in bot.ACTIVE_OPERATIONAL_POINTS
+        ]
+
+        text = bot.build_operations_notice(
+            bot.normalize_operations_digest({"points": rows}),
+            reference=self.reference,
+        )
+
+        table_end = text.index("</pre>")
+        revenue_at = text.index("<b>Выручка всех точек:</b>")
+        self.assertGreater(revenue_at, table_end)
+        self.assertIn("вчера 6 000 ₽ · сегодня 1 500 ₽", text)
 
     def test_missing_point_is_rendered_as_no_data(self):
         normalized = bot.normalize_operations_digest(
