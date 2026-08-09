@@ -7599,7 +7599,9 @@ def build_operations_notice(digest, reference=None):
 
     reference = (reference or now_local()).astimezone(BOT_TIMEZONE)
     points = list(digest.get("points") or [])
-    table_rows = ["Точка       Вч  Сег  Последняя"]
+    table_rows = [
+        f"{'Точка':<10} {'Вч':>7} {'Сег':>7} {'Последняя':<11}"
+    ]
     for row in points:
         point_name = POINT_SHORT_LABELS.get(
             row.get("point_name"),
@@ -7615,16 +7617,12 @@ def build_operations_notice(digest, reference=None):
         )
         activity_icon = operations_activity_icon(row, reference)
         table_rows.append(
-            f"{point_name:<10} {yesterday_text:>3}  "
-            f"{today_text:>3}  {sale_text:<11} {activity_icon}"
+            f"{point_name:<10} {yesterday_text:>7} "
+            f"{today_text:>7} {sale_text:<11} {activity_icon}"
         )
 
     observed = _operations_datetime(digest.get("observed_at"))
     observed_text = (observed or reference).strftime("%H:%M")
-    lines = [
-        "<b>📡 Работа и продажи</b>",
-        f"<pre>{escape_html(chr(10).join(table_rows))}</pre>",
-    ]
     yesterday_count_total = digest.get("yesterday_sales_count_total")
     today_count_total = digest.get("today_sales_count_total")
     if yesterday_count_total is not None or today_count_total is not None:
@@ -7636,19 +7634,25 @@ def build_operations_notice(digest, reference=None):
         today_count_text = (
             str(today_count_total) if today_count_total is not None else "—"
         )
-        lines.append(
-            "<b>Итого продаж:</b> "
-            f"вчера {escape_html(yesterday_count_text)} · "
-            f"сегодня {escape_html(today_count_text)}"
+        table_rows.append(
+            f"{'Итого':<10} {yesterday_count_text:>7} "
+            f"{today_count_text:>7}"
         )
     yesterday_value = digest.get("yesterday_sales_value_total")
     today_value = digest.get("today_sales_value_total")
     if yesterday_value is not None or today_value is not None:
-        lines.append(
-            "<b>Выручка всех точек:</b> "
-            f"вчера {escape_html(format_money_spaced(yesterday_value))} · "
-            f"сегодня {escape_html(format_money_spaced(today_value))}"
+        yesterday_value_text = format_money_spaced(yesterday_value).removesuffix(
+            " ₽"
         )
+        today_value_text = format_money_spaced(today_value).removesuffix(" ₽")
+        table_rows.append(
+            f"{'Сумма ₽':<10} {yesterday_value_text:>7} "
+            f"{today_value_text:>7}"
+        )
+    lines = [
+        "<b>📡 Работа и продажи</b>",
+        f"<pre>{escape_html(chr(10).join(table_rows))}</pre>",
+    ]
     lines.append(
         "<blockquote>"
         f"{escape_html(_operations_connection_summary(points))}\n"
