@@ -114,23 +114,22 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
         )
         config = SimpleNamespace()
 
+        maintenance = {"points": []}
+        calls = []
+
+        async def fake_run(func, *args, **kwargs):
+            calls.append((func, args, kwargs))
+            if func is bot.build_owner_ai_maintenance_context:
+                return maintenance
+            self.assertIs(func, bot.query_owner_ai)
+            return {
+                "scope": "staff",
+                "answer": "Вчера 2 продажи.",
+            }
+
         with (
             patch.object(bot, "get_owner_ai_client_config", return_value=config),
-            patch.object(
-                bot,
-                "owner_ai_question_needs_maintenance_context",
-                return_value=False,
-            ),
-            patch.object(
-                bot,
-                "run_blocking",
-                new=AsyncMock(
-                    return_value={
-                        "scope": "staff",
-                        "answer": "Вчера 2 продажи.",
-                    }
-                ),
-            ) as run,
+            patch.object(bot, "run_blocking", new=fake_run),
         ):
             await bot.answer_owner_ai_message(
                 message,
@@ -138,13 +137,19 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
                 "А вчера?",
             )
 
-        run.assert_awaited_once_with(
-            bot.query_owner_ai,
-            config,
-            user_id=874403512,
-            question="А вчера?",
-            conversation_id="telegram:-100123:874403512",
-            maintenance_context=None,
+        self.assertEqual(len(calls), 2)
+        self.assertIs(calls[0][0], bot.build_owner_ai_maintenance_context)
+        self.assertEqual(calls[0][1:], ((), {}))
+        self.assertIs(calls[1][0], bot.query_owner_ai)
+        self.assertEqual(calls[1][1], (config,))
+        self.assertEqual(
+            calls[1][2],
+            {
+                "user_id": 874403512,
+                "question": "А вчера?",
+                "conversation_id": "telegram:-100123:874403512",
+                "maintenance_context": maintenance,
+            },
         )
         edit_call = status.edit_text.await_args
         self.assertEqual(edit_call.kwargs["parse_mode"], "HTML")
@@ -199,27 +204,22 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
             chat_id=-100123,
         )
 
+        async def fake_run(func, *args, **kwargs):
+            if func is bot.build_owner_ai_maintenance_context:
+                return {"points": []}
+            self.assertIs(func, bot.query_owner_ai)
+            return {
+                "scope": "staff",
+                "answer": "Точка: Гиппо <тест>",
+            }
+
         with (
             patch.object(
                 bot,
                 "get_owner_ai_client_config",
                 return_value=SimpleNamespace(),
             ),
-            patch.object(
-                bot,
-                "owner_ai_question_needs_maintenance_context",
-                return_value=False,
-            ),
-            patch.object(
-                bot,
-                "run_blocking",
-                new=AsyncMock(
-                    return_value={
-                        "scope": "staff",
-                        "answer": "Точка: Гиппо <тест>",
-                    }
-                ),
-            ),
+            patch.object(bot, "run_blocking", new=fake_run),
         ):
             await bot.answer_owner_ai_message(
                 message,

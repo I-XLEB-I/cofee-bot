@@ -11182,19 +11182,23 @@ async def answer_owner_ai_message(message, context, question):
     if chat_id is None:
         chat_id = getattr(getattr(message, "chat", None), "id", None)
     conversation_id = f"telegram:{chat_id or user_id}:{user_id}"
+    # Supply the small read-only service-history dataset on every turn.  The
+    # model decides whether ``maintenance.history`` is relevant from the tool
+    # description; keyword matching here would make natural follow-ups such as
+    # "а когда её обслуживали?" brittle.  The MCP service still exposes the
+    # facts only after an allowlisted tool call.
     maintenance_context = None
-    if owner_ai_question_needs_maintenance_context(question):
-        try:
-            maintenance_context = await run_blocking(
-                build_owner_ai_maintenance_context
-            )
-        except Exception as exc:
-            logger.warning(
-                "owner_ai_maintenance_context_unavailable "
-                "user_id=%s error_type=%s",
-                user_id,
-                type(exc).__name__,
-            )
+    try:
+        maintenance_context = await run_blocking(
+            build_owner_ai_maintenance_context
+        )
+    except Exception as exc:
+        logger.warning(
+            "owner_ai_maintenance_context_unavailable "
+            "user_id=%s error_type=%s",
+            user_id,
+            type(exc).__name__,
+        )
     try:
         result = await run_blocking(
             query_owner_ai,
@@ -11252,24 +11256,8 @@ async def answer_owner_ai_message(message, context, question):
         )
 
 
-def owner_ai_question_needs_maintenance_context(question):
-    normalized = str(question or "").casefold().replace("ё", "е")
-    return any(
-        marker in normalized
-        for marker in (
-            "почему",
-            "из-за чего",
-            "мало продаж",
-            "нет продаж",
-            "не было продаж",
-            "давно не было продаж",
-            "обслуж",
-        )
-    )
-
-
 def build_owner_ai_maintenance_context():
-    """Return bounded historical service dates for operational AI questions."""
+    """Return bounded historical service dates for the read-only AI tool."""
     dates_by_point = {point: set() for point in ACTIVE_OPERATIONAL_POINTS}
     for record in get_all_services():
         point = str(record.get("Точка") or "").strip()
