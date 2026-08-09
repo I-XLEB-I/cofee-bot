@@ -79,7 +79,7 @@ class OperationsSummaryTests(unittest.TestCase):
         self.assertEqual(normalized["yesterday_sales_value_total"], 9540)
         self.assertEqual(normalized["today_sales_value_total"], 3816)
 
-    def test_notice_shows_total_sales_count_below_point_table(self):
+    def test_notice_shows_total_sales_count_inside_point_table(self):
         rows = [
             point_row(name, yesterday=10, today=4)
             for name in bot.ACTIVE_OPERATIONAL_POINTS
@@ -90,14 +90,16 @@ class OperationsSummaryTests(unittest.TestCase):
             reference=self.reference,
         )
 
+        table_start = text.index("<pre>")
         table_end = text.index("</pre>")
-        total_at = text.index("<b>Итого продаж:</b>")
-        revenue_at = text.index("<b>Выручка всех точек:</b>")
-        self.assertGreater(total_at, table_end)
+        total_at = text.index("Итого")
+        revenue_at = text.index("Сумма ₽")
+        self.assertGreater(total_at, table_start)
+        self.assertLess(total_at, table_end)
         self.assertLess(total_at, revenue_at)
-        self.assertIn("вчера 60 · сегодня 24", text)
+        self.assertIn("Итого           60      24", text)
 
-    def test_notice_shows_combined_revenue_below_point_table(self):
+    def test_notice_shows_combined_revenue_inside_point_table(self):
         rows = [
             point_row(name, yesterday_value=1000, today_value=250)
             for name in bot.ACTIVE_OPERATIONAL_POINTS
@@ -108,10 +110,12 @@ class OperationsSummaryTests(unittest.TestCase):
             reference=self.reference,
         )
 
+        table_start = text.index("<pre>")
         table_end = text.index("</pre>")
-        revenue_at = text.index("<b>Выручка всех точек:</b>")
-        self.assertGreater(revenue_at, table_end)
-        self.assertIn("вчера 6 000 ₽ · сегодня 1 500 ₽", text)
+        revenue_at = text.index("Сумма ₽")
+        self.assertGreater(revenue_at, table_start)
+        self.assertLess(revenue_at, table_end)
+        self.assertIn("Сумма ₽      6 000   1 500", text)
 
     def test_missing_point_is_rendered_as_no_data(self):
         normalized = bot.normalize_operations_digest(
