@@ -61,6 +61,7 @@ class OwnerAiClientTests(unittest.TestCase):
                     }
                 ]
             },
+            reply_context="  Вчера   было 12 продаж.  ",
             urlopen=urlopen,
         )
 
@@ -91,6 +92,7 @@ class OwnerAiClientTests(unittest.TestCase):
                         }
                     ]
                 },
+                "reply_context": "Вчера было 12 продаж.",
             },
         )
 
