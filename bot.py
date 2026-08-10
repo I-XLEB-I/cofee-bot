@@ -11182,6 +11182,13 @@ async def answer_owner_ai_message(message, context, question):
     if chat_id is None:
         chat_id = getattr(getattr(message, "chat", None), "id", None)
     conversation_id = f"telegram:{chat_id or user_id}:{user_id}"
+    replied_message = getattr(message, "reply_to_message", None)
+    reply_context = None
+    if replied_message is not None:
+        reply_context = (
+            getattr(replied_message, "text", None)
+            or getattr(replied_message, "caption", None)
+        )
     # Supply the small read-only service-history dataset on every turn.  The
     # model decides whether ``maintenance.history`` is relevant from the tool
     # description; keyword matching here would make natural follow-ups such as
@@ -11200,13 +11207,18 @@ async def answer_owner_ai_message(message, context, question):
             type(exc).__name__,
         )
     try:
+        owner_ai_query_context = {
+            "user_id": user_id,
+            "question": question,
+            "conversation_id": conversation_id,
+            "maintenance_context": maintenance_context,
+        }
+        if reply_context:
+            owner_ai_query_context["reply_context"] = reply_context
         result = await run_blocking(
             query_owner_ai,
             config,
-            user_id=user_id,
-            question=question,
-            conversation_id=conversation_id,
-            maintenance_context=maintenance_context,
+            **owner_ai_query_context,
         )
     except OwnerAiAccessError as exc:
         await status.edit_text(f"⛔ {exc}")

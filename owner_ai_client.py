@@ -48,6 +48,7 @@ def query_owner_ai(
     question: str,
     conversation_id: str | None = None,
     maintenance_context: Mapping[str, Any] | None = None,
+    reply_context: str | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
 ) -> dict[str, str]:
     """Call the versioned internal API and return its validated response."""
@@ -86,6 +87,10 @@ def query_owner_ai(
         payload["maintenance_context"] = _normalize_maintenance_context(
             maintenance_context
         )
+    if reply_context is not None:
+        normalized_reply_context = " ".join(str(reply_context).split())[:800].strip()
+        if normalized_reply_context:
+            payload["reply_context"] = normalized_reply_context
     request_body = json.dumps(
         payload,
         ensure_ascii=False,

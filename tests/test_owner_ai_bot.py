@@ -111,6 +111,9 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
             reply_text=AsyncMock(return_value=status),
             from_user=SimpleNamespace(id=874403512),
             chat_id=-100123,
+            reply_to_message=SimpleNamespace(
+                text="Вчера на Гагарина было 16 продаж."
+            ),
         )
         config = SimpleNamespace()
 
@@ -149,6 +152,7 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
                 "question": "А вчера?",
                 "conversation_id": "telegram:-100123:874403512",
                 "maintenance_context": maintenance,
+                "reply_context": "Вчера на Гагарина было 16 продаж.",
             },
         )
         edit_call = status.edit_text.await_args
