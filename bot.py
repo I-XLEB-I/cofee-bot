@@ -3186,6 +3186,27 @@ def save_revision_restock_entry(draft):
     }
 
 
+def update_group_service_or_legacy_revision(draft, record):
+    if (
+        not str(record.get("Service_Row", "")).strip()
+        and record.get("Revision_Row")
+        and draft.get("revision")
+    ):
+        # Preserve snapshots saved by the earlier revision-only release.
+        # An edit must not silently create historical salary charges.
+        result = update_revision_message_entry_from_edit({
+            **draft,
+            "period": draft["revision"]["period"],
+            "values": draft["revision"]["values"],
+        }, record)
+        result["warnings"].append(
+            "прежняя запись содержит только ревизию; обслуживание и оплата "
+            "не добавлены автоматически — их нужно проверить отдельно"
+        )
+        return result
+    return update_group_report_entry_from_edit(draft, record)
+
+
 def save_revision_message_entry(draft):
     existing = find_revision_record(draft["period"], draft["point"], True)
     values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
@@ -3980,6 +4001,8 @@ def parse_revision_snapshot_messages_text(text):
     location_dates = {}
     header_warnings = []
     saw_revision_header = False
+    location_blocks = {}
+    current_block = None
     for line in lines:
         header_match = re.match(r"^/\s*(.+?)\s*$", line)
         raw_location = header_match.group(1) if header_match else None
@@ -3995,13 +4018,19 @@ def parse_revision_snapshot_messages_text(text):
                 raw_location = dated_header_match.group(2)
 
         if raw_location is None:
+            if current_block is not None:
+                current_block.append(line)
             continue
 
         location = normalize_revision_location_name(raw_location)
         if not location:
+            if current_block is not None:
+                current_block.append(line)
             continue
 
         saw_revision_header = True
+        current_block = [line]
+        location_blocks.setdefault(location, []).append(current_block)
         if location not in explicit_locations:
             explicit_locations.append(location)
         elif location not in duplicate_locations:
@@ -4017,12 +4046,16 @@ def parse_revision_snapshot_messages_text(text):
     if not saw_revision_header:
         return []
 
-    parsed, warnings = parse_revision_import_text(raw_text)
-    warnings = [*header_warnings, *warnings]
-    for location in duplicate_locations:
-        warnings.append(f"{location}: повторный блок объединён без удвоения")
     snapshots = []
     for location in explicit_locations:
+        unique_blocks = list(dict.fromkeys(
+            "\n".join(block) for block in location_blocks[location]
+        ))
+        source_text = "\n\n".join(unique_blocks)
+        parsed, warnings = parse_revision_import_text(source_text)
+        warnings = [*header_warnings, *warnings]
+        if location in duplicate_locations:
+            warnings.append(f"{location}: повторный блок объединён без удвоения")
         location_values = parsed.get(location, {})
         if len(location_values) < 3:
             continue
@@ -4030,7 +4063,7 @@ def parse_revision_snapshot_messages_text(text):
             "location": location,
             "values": location_values,
             "warnings": list(warnings),
-            "source_text": raw_text,
+            "source_text": source_text,
             "date": location_dates.get(location, ""),
         })
 
@@ -4042,6 +4075,54 @@ def parse_revision_snapshot_message_text(text):
     if len(snapshots) != 1:
         return None
     return snapshots[0]
+
+
+def build_service_report_from_revision_snapshot(snapshot, message_date):
+    """A point inventory is also a service visit; warehouse snapshots are not."""
+    source_text = snapshot["source_text"]
+    report_date = snapshot.get("date") or message_date
+    purchases, purchase_sum, purchase_warnings = extract_service_report_purchases(source_text)
+    water = snapshot["values"].get("Вода", "")
+    warnings = [*snapshot.get("warnings", []), *purchase_warnings]
+    if water == "":
+        warnings.append("не нашёл воду, запись сохранится без воды")
+    return {
+        "point": snapshot["location"],
+        "date": report_date,
+        "period": get_period_key_for_date(report_date),
+        "water": water,
+        "purchases": purchases,
+        "purchase_sum": purchase_sum,
+        "shortage_items": extract_service_report_shortage_items(source_text),
+        "source_text": source_text,
+        "warnings": warnings,
+        "revision": {
+            "period": get_period_key_for_date(report_date),
+            "location": snapshot["location"],
+            "values": snapshot["values"],
+        },
+    }
+
+
+def build_group_service_report_draft(parsed, message, photo_ids=None, source_key=None):
+    draft = {
+        **parsed,
+        "who": get_service_report_author(message),
+        "user_id": getattr(getattr(message, "from_user", None), "id", None),
+        "chat_id": message.chat_id,
+        "source_message_id": message.message_id,
+        "media_group_id": getattr(message, "media_group_id", "") or "",
+        "source_key": source_key or build_group_report_source_key(message),
+        "photo_ids": list(photo_ids if photo_ids is not None else (
+            [message.photo[-1].file_id] if getattr(message, "photo", None) else []
+        )),
+    }
+    if "revision" not in draft:
+        revision_data, revision_warnings = build_group_report_revision_data(draft)
+        draft["revision"] = revision_data
+        draft["warnings"] = [*draft.get("warnings", []), *revision_warnings]
+    draft["fingerprint"] = build_group_report_fingerprint(draft)
+    return draft
 
 
 def build_revision_import_preview(period, parsed, warnings):
@@ -18178,6 +18259,7 @@ def build_revision_snapshot_batch_result_text(outcomes):
     lines = [title, "", f"Сохранено/обновлено: {saved_count}"]
     status_labels = {
         "saved": "сохранена",
+        "pending": "нужно проверить возможный повтор обслуживания",
         "already": "уже была сохранена",
         "duplicate": "дубль пропущен",
         "ignored": "ранее отмечена как неучитываемая",
@@ -18187,6 +18269,10 @@ def build_revision_snapshot_batch_result_text(outcomes):
     for outcome in outcomes:
         draft = outcome.get("draft", {})
         label = status_labels.get(outcome.get("status"), outcome.get("status", "неизвестно"))
+        if outcome.get("status") == "saved" and outcome.get("save_result", {}).get("service_row"):
+            label = "обслуживание и ревизия сохранены"
+            if not outcome["save_result"].get("revision"):
+                label = "обслуживание сохранено, ревизия не сохранена"
         period_label = format_period_label(draft.get("period", ""))
         lines.append(
             f"• {draft.get('point', '?')} · {period_label} — {label}"
@@ -18194,7 +18280,10 @@ def build_revision_snapshot_batch_result_text(outcomes):
 
     warnings = []
     for outcome in outcomes:
-        for warning in outcome.get("draft", {}).get("warnings", []):
+        for warning in [
+            *outcome.get("draft", {}).get("warnings", []),
+            *outcome.get("save_result", {}).get("warnings", []),
+        ]:
             warning = str(warning or "").strip()
             if warning and warning not in warnings:
                 warnings.append(warning)
@@ -18215,6 +18304,27 @@ async def process_revision_snapshot_batch(message, application, snapshots):
     message_date = get_message_local_date(message)
     base_source_key = build_group_report_source_key(message)
     outcomes = []
+
+    for snapshot in snapshots:
+        if snapshot["location"] not in POINTS:
+            continue
+        parsed = build_service_report_from_revision_snapshot(snapshot, message_date)
+        draft = build_group_service_report_draft(
+            parsed,
+            message,
+            photo_ids=[],
+            source_key=f"{base_source_key}:revision:{normalize_text_key(snapshot['location'])}",
+        )
+        outcomes.append(await process_group_service_report_draft(
+            message, application, draft, send_saved_feedback=False,
+        ))
+        if outcomes[-1]["status"] == "error":
+            break
+
+    if any(outcome["status"] == "error" for outcome in outcomes):
+        snapshots = []
+    else:
+        snapshots = [snapshot for snapshot in snapshots if snapshot["location"] not in POINTS]
 
     async with GROUP_REPORT_SAVE_LOCK:
         for snapshot in snapshots:
@@ -18408,7 +18518,7 @@ async def process_group_report_message(message, application, photo_ids=None):
         return
 
     revision_parsed = revision_snapshots[0] if revision_snapshots else None
-    if revision_parsed:
+    if revision_parsed and revision_parsed["location"] not in POINTS:
         revision_date = revision_parsed.get("date") or get_message_local_date(message)
         draft = {
             **revision_parsed,
@@ -18599,7 +18709,14 @@ async def process_group_report_message(message, application, photo_ids=None):
             )
         return
 
-    parsed = parse_service_report_message_text(body_text, has_photo=bool(photo_ids or getattr(message, "photo", None)))
+    if revision_parsed:
+        parsed = build_service_report_from_revision_snapshot(
+            revision_parsed, get_message_local_date(message),
+        )
+    else:
+        parsed = parse_service_report_message_text(
+            body_text, has_photo=bool(photo_ids or getattr(message, "photo", None)),
+        )
     if not parsed:
         logger.info(
             "Skipped group report message chat=%s message=%s: parser returned None",
@@ -18608,22 +18725,12 @@ async def process_group_report_message(message, application, photo_ids=None):
         )
         return
 
-    draft = {
-        **parsed,
-        "who": get_service_report_author(message),
-        "user_id": getattr(getattr(message, "from_user", None), "id", None),
-        "chat_id": message.chat_id,
-        "source_message_id": message.message_id,
-        "media_group_id": getattr(message, "media_group_id", "") or "",
-        "source_key": build_group_report_source_key(message),
-        "photo_ids": list(photo_ids or ([message.photo[-1].file_id] if getattr(message, "photo", None) else [])),
-    }
-    revision_data, revision_warnings = build_group_report_revision_data(draft)
-    draft["revision"] = revision_data
-    if revision_warnings:
-        draft["warnings"] = list(draft.get("warnings", [])) + revision_warnings
-    draft["fingerprint"] = build_group_report_fingerprint(draft)
+    draft = build_group_service_report_draft(parsed, message, photo_ids=photo_ids)
+    await process_group_service_report_draft(message, application, draft)
 
+
+async def process_group_service_report_draft(message, application, draft, send_saved_feedback=True):
+    outcome = {"draft": draft, "status": "error"}
     save_result = None
     try:
         async with GROUP_REPORT_SAVE_LOCK:
@@ -18639,7 +18746,9 @@ async def process_group_report_message(message, application, photo_ids=None):
                 fingerprint_changed = str(existing.get("Fingerprint", "")) != str(draft.get("fingerprint", ""))
                 if status == "saved" and is_edited_message and fingerprint_changed:
                     save_result = await run_group_sheet_write_with_retry(
-                        lambda current_draft: update_group_report_entry_from_edit(current_draft, existing),
+                        lambda current_draft: update_group_service_or_legacy_revision(
+                            current_draft, existing,
+                        ),
                         draft,
                         "edited group report update",
                         application=application,
@@ -18658,7 +18767,7 @@ async def process_group_report_message(message, application, photo_ids=None):
                         draft["source_message_id"],
                         text,
                     )
-                    return
+                    return {**outcome, "status": "already" if status == "saved" else status}
 
             if save_result is None and duplicate:
                 await send_group_report_feedback_message(
@@ -18667,7 +18776,7 @@ async def process_group_report_message(message, application, photo_ids=None):
                     draft["source_message_id"],
                     "⚪ Похоже, это дубль отчёта — он уже сохранён.",
                 )
-                return
+                return {**outcome, "status": "duplicate"}
 
             if save_result is None:
                 semantic_duplicates = await run_blocking(
@@ -18689,7 +18798,7 @@ async def process_group_report_message(message, application, photo_ids=None):
                         build_group_report_duplicate_warning_text(draft, semantic_duplicates),
                         reply_markup=build_group_report_duplicate_draft_markup(draft_id),
                     )
-                    return
+                    return {**outcome, "status": "pending"}
 
             if save_result is None:
                 save_result = await run_group_sheet_write_with_retry(
@@ -18706,7 +18815,7 @@ async def process_group_report_message(message, application, photo_ids=None):
                 draft["source_key"],
             )
             await show_sheets_busy_notice(message)
-            return
+            return outcome
         logger.exception(
             "Failed to auto-save group report chat=%s source=%s",
             draft["chat_id"],
@@ -18718,7 +18827,7 @@ async def process_group_report_message(message, application, photo_ids=None):
             draft["source_message_id"],
             "❌ Не удалось сохранить отчёт из сообщения. Попробуйте отправить ещё раз или поправьте вручную.",
         )
-        return
+        return outcome
     except Exception:
         logger.exception(
             "Failed to auto-save group report chat=%s source=%s",
@@ -18731,9 +18840,12 @@ async def process_group_report_message(message, application, photo_ids=None):
             draft["source_message_id"],
             "❌ Не удалось сохранить отчёт из сообщения. Попробуйте отправить ещё раз или поправьте вручную.",
         )
-        return
+        return outcome
 
     await request_group_service_today_refresh(application)
+    outcome.update(status="saved", save_result=save_result)
+    if not send_saved_feedback:
+        return outcome
 
     last_error = None
     for attempt in range(4):
@@ -18777,6 +18889,8 @@ async def process_group_report_message(message, application, photo_ids=None):
                 draft["chat_id"],
                 draft["source_key"],
             )
+
+    return outcome
 
 
 async def finalize_group_report_media_group(application, media_key):
