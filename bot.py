@@ -37,6 +37,7 @@ from telegram.ext import (
 )
 from telegram.helpers import escape_markdown
 
+import bdr_revision
 from owner_ai_client import (
     OwnerAiAccessError,
     OwnerAiClientConfig,
@@ -70,6 +71,9 @@ def parse_env_id_set(name, default_values=None):
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+BDR_SPREADSHEET_ID = os.getenv(
+    "BDR_SPREADSHEET_ID", "1GZhau1YOqKKD_FUvdWrtHMkVmFscqmBoGejYWP-X3sU",
+).strip()
 PHOTO_CHAT_ID_RAW = os.getenv("PHOTO_CHAT_ID", "").strip()
 CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json").strip()
 USERS_JSON = os.getenv("USERS_JSON", "").strip()
@@ -2415,6 +2419,7 @@ def restore_revision_source_after_relocation(record, source_record, draft):
 
 def save_edited_revision_entry(draft, record, revision):
     """Update a revision and safely relocate it when the point was edited."""
+    revision, bdr_context = resolve_group_revision_bdr(draft, revision)
     target_period = str(revision.get("period", "")).strip()
     target_location = str(revision.get("location", "")).strip()
     if not target_period or not target_location:
@@ -2431,6 +2436,15 @@ def save_edited_revision_entry(draft, record, revision):
 
     target_record = None
     reuse_source_row = False
+    bdr_target = (
+        find_revision_record(target_period, target_location, True)
+        if relocated else (
+            source_record or find_revision_record(target_period, target_location, True)
+        )
+    ) if bdr_context else None
+    bdr_meta = sync_group_revision_bdr(
+        revision, bdr_context, bdr_target, record=record, source_record=source_record,
+    )
     if relocated:
         target_record = find_revision_record(target_period, target_location, True)
         source_mode = str(record.get("Revision_Mode", "")).strip() or "created"
@@ -2493,8 +2507,10 @@ def save_edited_revision_entry(draft, record, revision):
         "period": target_period,
         "location": target_location,
         "mode": mode,
-        "backup": backup,
+        "backup": add_bdr_revision_backup(backup, bdr_meta)
+        if relocated or not json.loads(backup or "{}").get("bdr") else backup,
         "relocated": relocated,
+        "bdr": bdr_meta,
     }
 
 
@@ -2545,12 +2561,72 @@ def parse_logged_row_numbers(raw_value):
     return values
 
 
+def resolve_group_revision_bdr(draft, revision):
+    if not draft.get("sync_bdr") or not BDR_SPREADSHEET_ID:
+        return revision, None
+    client = get_sheet().client
+    layout = bdr_revision.read_layout(client, BDR_SPREADSHEET_ID)
+    block = layout.nearest(draft["date"])
+    revision = {**revision, "period": block.period}
+    draft["period"] = block.period
+    if draft.get("revision"):
+        draft["revision"] = revision
+    return revision, (client, layout, block)
+
+
+def add_bdr_revision_backup(backup, bdr_meta):
+    if not bdr_meta:
+        return backup
+    data = json.loads(backup) if backup else {}
+    data["bdr"] = {
+        "date": bdr_meta["date"], "location": bdr_meta["location"],
+        "values": bdr_meta["before"],
+    }
+    return json.dumps(data, ensure_ascii=False)
+
+
+def sync_group_revision_bdr(revision, context, target_record=None, record=None, source_record=None):
+    if context is None:
+        return None
+    client, layout, block = context
+    previous = build_revision_values_from_record(target_record) if target_record else {}
+    requests, before, checks = layout.plan(
+        block, revision["location"], revision["values"], previous,
+    )
+    if record and source_record and (
+        record.get("Revision_Period"), record.get("Revision_Location")
+    ) != (revision["period"], revision["location"]):
+        backup = json.loads(record.get("Revision_Backup") or "{}").get("bdr")
+        if not backup:
+            raise bdr_revision.BdrRevisionError(
+                "БДР: у прежней ревизии нет связи с ячейками; "
+                "перенос точки или месяца требует ручной сверки"
+            )
+        restore, _, restore_checks = layout.plan(
+            layout.exact(backup["date"]), backup["location"], backup["values"],
+            build_revision_values_from_record(source_record), clear=True,
+        )
+        requests = restore + requests
+        checks = {**restore_checks, **checks}
+    logger.info(
+        "bdr_revision_plan point=%s block=%s changes=%s",
+        revision["location"], block.date, len(requests),
+    )
+    bdr_revision.apply_and_verify(client, BDR_SPREADSHEET_ID, layout, requests, checks)
+    return {
+        "date": block.date.strftime("%d.%m.%Y"), "location": revision["location"],
+        "before": before, "changed_cells": len(requests),
+    }
+
+
 def save_group_report_revision(draft):
     revision = draft.get("revision")
     if not revision:
         return None
 
+    revision, bdr_context = resolve_group_revision_bdr(draft, revision)
     existing = find_revision_record(revision["period"], revision["location"], True)
+    bdr_meta = sync_group_revision_bdr(revision, bdr_context, existing)
     values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
     for item_name, value in revision["values"].items():
         values[item_name] = value
@@ -2559,7 +2635,7 @@ def save_group_report_revision(draft):
         "period": revision["period"],
         "location": revision["location"],
         "who": draft.get("who", ""),
-        "filled_at": today(),
+        "filled_at": draft.get("date") or today(),
         "values": values,
     }
     if existing:
@@ -2569,7 +2645,10 @@ def save_group_report_revision(draft):
             "period": revision["period"],
             "location": revision["location"],
             "mode": "updated",
-            "backup": build_group_report_revision_backup(existing),
+            "backup": add_bdr_revision_backup(
+                build_group_report_revision_backup(existing), bdr_meta,
+            ),
+            "bdr": bdr_meta,
         }
 
     row_num = add_revision_row(payload)
@@ -2578,7 +2657,8 @@ def save_group_report_revision(draft):
         "period": revision["period"],
         "location": revision["location"],
         "mode": "created",
-        "backup": "",
+        "backup": add_bdr_revision_backup("", bdr_meta),
+        "bdr": bdr_meta,
     }
 
 
@@ -2641,6 +2721,17 @@ def restore_group_report_revision(record):
         return "missing"
 
     current = find_group_report_revision_entry(record)
+    bdr_backup = json.loads(record.get("Revision_Backup") or "{}").get("bdr")
+    if bdr_backup and BDR_SPREADSHEET_ID:
+        if not current:
+            raise bdr_revision.BdrRevisionError("БДР: исходная ревизия не найдена для отмены")
+        client = get_sheet().client
+        layout = bdr_revision.read_layout(client, BDR_SPREADSHEET_ID)
+        requests, _, checks = layout.plan(
+            layout.exact(bdr_backup["date"]), bdr_backup["location"], bdr_backup["values"],
+            build_revision_values_from_record(current), clear=True,
+        )
+        bdr_revision.apply_and_verify(client, BDR_SPREADSHEET_ID, layout, requests, checks)
     if revision_mode == "updated":
         backup_raw = str(record.get("Revision_Backup", "")).strip()
         if not backup_raw:
@@ -2702,6 +2793,8 @@ def build_group_report_saved_text(draft, save_result=None):
         lines.append(
             f"📦 Ревизия: {format_period_label(revision_period)} · {revision_location}"
         )
+    if revision_meta.get("bdr"):
+        lines.append(f"📊 БДР: записано в блок {revision_meta['bdr']['date']}")
 
     warnings = []
     for warning in list(draft.get("warnings", [])) + list(save_result.get("warnings", [])):
@@ -2731,6 +2824,8 @@ def build_revision_message_saved_text(draft, save_result=None):
         f"👤 {draft['who']}",
         f"📦 Позиций: {len(values)}",
     ]
+    if (save_result.get("revision") or {}).get("bdr"):
+        lines.append(f"📊 БДР: записано в блок {save_result['revision']['bdr']['date']}")
 
     item_lines = []
     for item_name in REVISION_ITEMS:
@@ -2912,7 +3007,7 @@ def save_group_report_entry(draft):
             "group report revision auto-save",
             draft=draft,
         )
-    except Exception:
+    except Exception as error:
         logger.exception(
             "Failed to auto-save revision from group message: point=%s date=%s who=%s",
             draft.get("point", ""),
@@ -2920,6 +3015,8 @@ def save_group_report_entry(draft):
             draft.get("who", ""),
         )
         save_warnings.append("ревизию не удалось сохранить автоматически, обслуживание сохранено")
+        if isinstance(error, bdr_revision.BdrRevisionError):
+            save_warnings.append(str(error))
     logger.info(
         "service saved: user_id=%s point=%s date=%s source=group",
         draft.get("user_id"),
@@ -2941,7 +3038,9 @@ def save_group_report_entry(draft):
         "revision_row": (revision_meta or {}).get("row", ""),
         "revision_period": (revision_meta or {}).get("period", ""),
         "revision_location": (revision_meta or {}).get("location", ""),
-        "revision_mode": (revision_meta or {}).get("mode", ""),
+        "revision_mode": (revision_meta or {}).get(
+            "mode", "pending_bdr" if draft.get("revision") and draft.get("sync_bdr") else "",
+        ),
         "revision_backup": (revision_meta or {}).get("backup", ""),
         "status": "saved",
         "created_at": format_group_report_created_at(),
@@ -2967,7 +3066,7 @@ def update_group_report_entry_from_edit(draft, record):
         raise ValueError("saved service row not found for edited group message")
 
     payload = build_group_report_payload(draft)
-    salary_workers = get_service_salary_workers_from_entry(service_entry)
+    salary_workers = get_service_salary_workers(service_entry)
     payload["salary_workers"] = salary_workers
     payload["service_sum"] = calculate_service_sum_for_workers(salary_workers)
     service_row = service_entry["__row"]
@@ -3208,7 +3307,12 @@ def update_group_service_or_legacy_revision(draft, record):
 
 
 def save_revision_message_entry(draft):
+    revision, bdr_context = resolve_group_revision_bdr(draft, {
+        "period": draft["period"], "location": draft["point"],
+        "values": draft.get("values", {}),
+    })
     existing = find_revision_record(draft["period"], draft["point"], True)
+    bdr_meta = sync_group_revision_bdr(revision, bdr_context, existing)
     values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
 
     for item_name, value in draft.get("values", {}).items():
@@ -3248,6 +3352,8 @@ def save_revision_message_entry(draft):
             "backup": "",
         }
 
+    revision_meta["backup"] = add_bdr_revision_backup(revision_meta["backup"], bdr_meta)
+    revision_meta["bdr"] = bdr_meta
     log_payload = {
         "chat_id": draft["chat_id"],
         "source_key": draft["source_key"],
@@ -3331,6 +3437,8 @@ def delete_group_report_entry_by_log_row(log_row_num):
     service_row = record.get("Service_Row", "")
     photo_rows = parse_logged_row_numbers(record.get("Photo_Rows", ""))
 
+    # Resolve BDR conflicts before deleting an associated paid service.
+    restore_group_report_revision(record)
     if photo_rows:
         photo_sheet = book.worksheet("Фото")
         for row_num in sorted(photo_rows, reverse=True):
@@ -3338,8 +3446,6 @@ def delete_group_report_entry_by_log_row(log_row_num):
 
     if str(service_row).strip():
         book.worksheet("Обслуживание").delete_rows(int(service_row))
-
-    restore_group_report_revision(record)
 
     updated = {
         "chat_id": record.get("Chat_ID", ""),
@@ -3999,6 +4105,7 @@ def parse_revision_snapshot_messages_text(text):
     explicit_locations = []
     duplicate_locations = []
     location_dates = {}
+    date_errors = {}
     header_warnings = []
     saw_revision_header = False
     location_blocks = {}
@@ -4039,8 +4146,12 @@ def parse_revision_snapshot_messages_text(text):
         if raw_date:
             parsed_date, date_error = validate_manual_date_input(raw_date)
             if not date_error:
-                location_dates[location] = format_date(parsed_date)
+                report_date = format_date(parsed_date)
+                if location in location_dates and location_dates[location] != report_date:
+                    date_errors[location] = "в одной ревизии несколько дат; разделите сообщения"
+                location_dates[location] = report_date
             else:
+                date_errors[location] = date_error.lstrip("❌ ").strip()
                 header_warnings.append(f"{location}: {date_error.lstrip('❌ ').strip()}")
 
     if not saw_revision_header:
@@ -4065,6 +4176,7 @@ def parse_revision_snapshot_messages_text(text):
             "warnings": list(warnings),
             "source_text": source_text,
             "date": location_dates.get(location, ""),
+            "date_error": date_errors.get(location, ""),
         })
 
     return snapshots
@@ -4121,6 +4233,7 @@ def build_group_service_report_draft(parsed, message, photo_ids=None, source_key
         revision_data, revision_warnings = build_group_report_revision_data(draft)
         draft["revision"] = revision_data
         draft["warnings"] = [*draft.get("warnings", []), *revision_warnings]
+    draft["sync_bdr"] = bool(draft.get("revision"))
     draft["fingerprint"] = build_group_report_fingerprint(draft)
     return draft
 
@@ -18257,8 +18370,14 @@ async def run_group_sheet_write_with_retry(save_callable, draft, operation_label
 
 
 def build_revision_snapshot_batch_result_text(outcomes):
-    saved_count = sum(1 for outcome in outcomes if outcome.get("status") == "saved")
-    error_count = sum(1 for outcome in outcomes if outcome.get("status") == "error")
+    partial_count = sum(
+        1 for outcome in outcomes
+        if outcome.get("status") == "saved"
+        and outcome.get("draft", {}).get("revision")
+        and not outcome.get("save_result", {}).get("revision")
+    )
+    saved_count = sum(1 for outcome in outcomes if outcome.get("status") == "saved") - partial_count
+    error_count = sum(1 for outcome in outcomes if outcome.get("status") == "error") + partial_count
     title = "✅ Ревизии из сообщения обработаны"
     if error_count:
         title = "⚠️ Ревизии обработаны не полностью"
@@ -18280,6 +18399,9 @@ def build_revision_snapshot_batch_result_text(outcomes):
             label = "обслуживание и ревизия сохранены"
             if not outcome["save_result"].get("revision"):
                 label = "обслуживание сохранено, ревизия не сохранена"
+        bdr_meta = (outcome.get("save_result", {}).get("revision") or {}).get("bdr")
+        if bdr_meta:
+            label += f"; БДР {bdr_meta['date']}"
         period_label = format_period_label(draft.get("period", ""))
         lines.append(
             f"• {draft.get('point', '?')} · {period_label} — {label}"
@@ -18301,8 +18423,8 @@ def build_revision_snapshot_batch_result_text(outcomes):
     if error_count:
         lines.extend([
             "",
-            "Не отправляйте весь пакет повторно: "
-            "уже сохранённые точки защищены от дублей.",
+            "Можно повторить исходное сообщение: "
+            "уже сохранённые точки и обслуживание защищены от дублей.",
         ])
     return "\n".join(lines)
 
@@ -18338,6 +18460,7 @@ async def process_revision_snapshot_batch(message, application, snapshots):
             revision_date = snapshot.get("date") or message_date
             draft = {
                 **snapshot,
+                "sync_bdr": True,
                 "point": snapshot["location"],
                 "who": get_service_report_author(message),
                 "date": revision_date,
@@ -18403,13 +18526,15 @@ async def process_revision_snapshot_batch(message, application, snapshots):
                     application=application,
                 )
                 outcomes.append({"draft": draft, "status": "saved", "save_result": save_result})
-            except Exception:
+            except Exception as error:
                 logger.exception(
                     "Failed to auto-save revision snapshot batch chat=%s source=%s point=%s",
                     draft["chat_id"],
                     draft["source_key"],
                     draft["point"],
                 )
+                if isinstance(error, bdr_revision.BdrRevisionError):
+                    draft["warnings"] = [*draft.get("warnings", []), str(error)]
                 outcomes.append({"draft": draft, "status": "error"})
                 break
 
@@ -18520,6 +18645,16 @@ async def process_group_report_message(message, application, photo_ids=None):
         return
 
     revision_snapshots = parse_revision_snapshot_messages_text(body_text)
+    invalid_dates = [snapshot for snapshot in revision_snapshots if snapshot.get("date_error")]
+    if invalid_dates:
+        details = "\n".join(
+            f"{snapshot['location']}: {snapshot['date_error']}" for snapshot in invalid_dates
+        )
+        await send_group_report_feedback_message(
+            application, message.chat_id, message.message_id,
+            "⚠️ Отчёт не записан: уточните дату ревизии.\n" + details,
+        )
+        return
     if len(revision_snapshots) > 1:
         await process_revision_snapshot_batch(message, application, revision_snapshots)
         return
@@ -18529,6 +18664,7 @@ async def process_group_report_message(message, application, photo_ids=None):
         revision_date = revision_parsed.get("date") or get_message_local_date(message)
         draft = {
             **revision_parsed,
+            "sync_bdr": True,
             "point": revision_parsed["location"],
             "who": get_service_report_author(message),
             "date": revision_date,
@@ -18593,6 +18729,10 @@ async def process_group_report_message(message, application, photo_ids=None):
                         application=application,
                     )
             await send_revision_message_saved_message(application, draft, save_result)
+        except bdr_revision.BdrRevisionError as error:
+            await send_group_report_feedback_message(
+                application, draft["chat_id"], draft["source_message_id"], f"⚠️ {error}",
+            )
         except APIError as error:
             if is_google_sheets_busy_error(error):
                 logger.exception(
@@ -18747,11 +18887,26 @@ async def process_group_service_report_draft(message, application, draft, send_s
                 draft["source_key"],
                 draft["fingerprint"],
             )
+            if (
+                not existing and duplicate and draft.get("revision")
+                and duplicate.get("Revision_Mode") == "pending_bdr"
+                and str(duplicate.get("Chat_ID")) == str(draft["chat_id"])
+            ):
+                existing = duplicate
+                draft["source_key"] = existing["Source_Key"]
+                draft["source_message_id"] = int(existing["Source_Message_ID"])
+                draft["media_group_id"] = existing.get("Media_Group_ID", "")
             if existing and existing.get("Статус") in {"saved", "ignored", "deleted"}:
                 status = existing.get("Статус")
                 is_edited_message = bool(getattr(message, "edit_date", None))
                 fingerprint_changed = str(existing.get("Fingerprint", "")) != str(draft.get("fingerprint", ""))
-                if status == "saved" and is_edited_message and fingerprint_changed:
+                revision_pending = bool(
+                    draft.get("revision") and existing.get("Service_Row")
+                    and existing.get("Revision_Mode") == "pending_bdr"
+                )
+                if status == "saved" and (
+                    (is_edited_message and fingerprint_changed) or revision_pending
+                ):
                     save_result = await run_group_sheet_write_with_retry(
                         lambda current_draft: update_group_service_or_legacy_revision(
                             current_draft, existing,
@@ -18814,6 +18969,11 @@ async def process_group_service_report_draft(message, application, draft, send_s
                     "group report save",
                     application=application,
                 )
+    except bdr_revision.BdrRevisionError as error:
+        await send_group_report_feedback_message(
+            application, draft["chat_id"], draft["source_message_id"], f"⚠️ {error}",
+        )
+        return outcome
     except APIError as error:
         if is_google_sheets_busy_error(error):
             logger.exception(
