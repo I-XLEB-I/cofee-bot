@@ -262,6 +262,44 @@ class OperationsSummaryTests(unittest.TestCase):
             "⚪",
         )
 
+    def test_extra_red_circle_only_for_offline_point_and_disappears_on_recovery(self):
+        for state in ("online", "offline", "no_data", "closed", "online"):
+            with self.subTest(state=state):
+                rows = [
+                    point_row(name, state=state if name == "Сити" else "online")
+                    for name in bot.ACTIVE_OPERATIONAL_POINTS
+                ]
+                text = bot.build_operations_notice(
+                    bot.normalize_operations_digest({"points": rows}),
+                    reference=self.reference,
+                )
+                table = text.split("<pre>", 1)[1].split("</pre>", 1)[0]
+                city_line = next(line for line in table.splitlines() if "Сити" in line)
+                activity = "⚪" if state == "closed" else "🟡"
+                expected = activity + (" 🔴" if state == "offline" else "")
+                self.assertTrue(city_line.endswith(expected), city_line)
+                self.assertEqual(city_line.count("🔴"), int(state == "offline"))
+                for line in table.splitlines():
+                    if "Сити" not in line:
+                        self.assertNotIn("🔴", line)
+                self.assertEqual("Второй 🔴 справа" in text, state == "offline")
+
+    def test_offline_alert_preserves_each_sales_pause_color(self):
+        for no_sales_since, activity in (
+            ("2026-07-29T13:00:00+03:00", "🟢"),
+            ("2026-07-29T12:00:00+03:00", "🟡"),
+            ("2026-07-29T11:00:00+03:00", "🔴"),
+            (None, "❔"),
+        ):
+            with self.subTest(activity=activity):
+                digest = bot.normalize_operations_digest({"points": [
+                    point_row("Сити", state="offline", no_sales_since=no_sales_since),
+                ]})
+                text = bot.build_operations_notice(digest, reference=self.reference)
+                table = text.split("<pre>", 1)[1].split("</pre>", 1)[0]
+                city_line = next(line for line in table.splitlines() if "Сити" in line)
+                self.assertTrue(city_line.endswith(f"{activity} 🔴"), city_line)
+
     def test_coffee_free_last_drink_is_only_a_hypothesis(self):
         rows = [
             point_row(
