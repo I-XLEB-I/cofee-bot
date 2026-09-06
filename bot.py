@@ -1938,6 +1938,12 @@ def extract_service_report_purchases(text):
             continue
 
         item_name = resolve_service_report_purchase_item(line)
+        if not item_name and re.search(r"\bбак(?:а|ов)?\b", normalized_line):
+            # In employee reports a bare "купил 2 бака" means the
+            # standard 19 litre water bottles.  Requiring both a purchase verb
+            # (checked above) and a rouble amount (checked below) keeps a stock
+            # line such as "Воды - 2.2" from becoming an expense.
+            item_name = "Вода 19л"
         if not item_name:
             continue
 
@@ -3481,9 +3487,9 @@ def is_current_revision_period_available(date_value=None):
     return current_date.day >= open_day
 
 
-def get_revision_period_keys(show_all=False):
+def get_revision_period_keys(show_all=False, include_current=False):
     total_count = 8 if show_all else 2
-    if is_current_revision_period_available():
+    if is_current_revision_period_available() or include_current:
         completed_count = max(total_count - 1, 0)
         return [current_period_key(), *recent_completed_period_keys(completed_count)]
     return recent_completed_period_keys(total_count)
@@ -3846,7 +3852,7 @@ def parse_revision_import_text(text):
                 warnings.append(f"Не понял точку в строке: {line}")
             continue
 
-        block_match = re.match(r"^\d{1,2}\.\d{1,2}\s+(.+)$", line)
+        block_match = re.match(r"^\d{1,2}\.\d{1,2}(?:\.\d{4})?\s+(.+)$", line)
         if block_match:
             current_block_location = normalize_revision_location_name(block_match.group(1))
             slash_locations = None
@@ -3861,10 +3867,11 @@ def parse_revision_import_text(text):
             current_block_location = None
             continue
 
-        if "-" not in line:
+        item_parts = re.split(r"\s*[-–—:=]\s*", line, maxsplit=1)
+        if len(item_parts) != 2:
             continue
 
-        raw_item, raw_values = [part.strip() for part in line.split("-", 1)]
+        raw_item, raw_values = [part.strip() for part in item_parts]
         item_spec = get_revision_import_item_spec(raw_item)
         if not item_spec:
             warnings.append(f"Не понял товар: {raw_item}")
@@ -3959,34 +3966,82 @@ def parse_revision_restock_message_text(text):
     }
 
 
-def parse_revision_snapshot_message_text(text):
+def parse_revision_snapshot_messages_text(text):
     raw_text = str(text or "").strip()
     if not raw_text:
-        return None
+        return []
 
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     if len(lines) < 2:
-        return None
+        return []
 
-    header_match = re.match(r"^/\s*(.+?)\s*$", lines[0])
-    if not header_match:
-        return None
+    explicit_locations = []
+    duplicate_locations = []
+    location_dates = {}
+    header_warnings = []
+    saw_revision_header = False
+    for line in lines:
+        header_match = re.match(r"^/\s*(.+?)\s*$", line)
+        raw_location = header_match.group(1) if header_match else None
+        raw_date = None
 
-    location = normalize_revision_location_name(header_match.group(1))
-    if not location:
-        return None
+        if raw_location is None:
+            dated_header_match = re.match(
+                r"^(\d{1,2}\.\d{1,2}(?:\.\d{4})?)\s+(.+?)\s*$",
+                line,
+            )
+            if dated_header_match:
+                raw_date = dated_header_match.group(1)
+                raw_location = dated_header_match.group(2)
+
+        if raw_location is None:
+            continue
+
+        location = normalize_revision_location_name(raw_location)
+        if not location:
+            continue
+
+        saw_revision_header = True
+        if location not in explicit_locations:
+            explicit_locations.append(location)
+        elif location not in duplicate_locations:
+            duplicate_locations.append(location)
+
+        if raw_date:
+            parsed_date, date_error = validate_manual_date_input(raw_date)
+            if not date_error:
+                location_dates[location] = format_date(parsed_date)
+            else:
+                header_warnings.append(f"{location}: {date_error.lstrip('❌ ').strip()}")
+
+    if not saw_revision_header:
+        return []
 
     parsed, warnings = parse_revision_import_text(raw_text)
-    location_values = parsed.get(location, {})
-    if len(location_values) < 3:
-        return None
+    warnings = [*header_warnings, *warnings]
+    for location in duplicate_locations:
+        warnings.append(f"{location}: повторный блок объединён без удвоения")
+    snapshots = []
+    for location in explicit_locations:
+        location_values = parsed.get(location, {})
+        if len(location_values) < 3:
+            continue
+        snapshots.append({
+            "location": location,
+            "values": location_values,
+            "warnings": list(warnings),
+            "source_text": raw_text,
+            "date": location_dates.get(location, ""),
+        })
 
-    return {
-        "location": location,
-        "values": location_values,
-        "warnings": warnings,
-        "source_text": raw_text,
-    }
+    return snapshots
+
+
+def parse_revision_snapshot_message_text(text):
+    snapshots = parse_revision_snapshot_messages_text(text)
+    if len(snapshots) != 1:
+        return None
+    return snapshots[0]
 
 
 def build_revision_import_preview(period, parsed, warnings):
@@ -9887,10 +9942,14 @@ def get_revision_context(context):
 
 
 def build_revision_period_markup(show_all=False, action=None):
-    periods = get_revision_period_keys(show_all=show_all)
+    include_current = action in {"view", "edit", "procurement", "compare"}
+    periods = get_revision_period_keys(
+        show_all=show_all,
+        include_current=include_current,
+    )
     keyboard = []
     row = []
-    current_period = current_period_key() if is_current_revision_period_available() else None
+    current_period = current_period_key() if current_period_key() in periods else None
     for i, period in enumerate(periods):
         label = format_period_label(period)
         if period == current_period:
@@ -9923,6 +9982,8 @@ def build_revision_period_menu_text(action=None):
         "compare": "📊 Ревизия\n\nКакой месяц сравнить с прошлым?",
     }
     if not current_open:
+        if action in {"view", "edit", "procurement", "compare"}:
+            return titles.get(action, "📦 Выберите месяц:")
         return {
             "fill": "📦 Ревизия\n\nВыберите завершённый месяц:",
             "import": "📥 Импорт ревизии\n\nЗа какой завершённый месяц импортировать данные?",
@@ -18107,6 +18168,142 @@ async def run_group_sheet_write_with_retry(save_callable, draft, operation_label
             )
 
 
+def build_revision_snapshot_batch_result_text(outcomes):
+    saved_count = sum(1 for outcome in outcomes if outcome.get("status") == "saved")
+    error_count = sum(1 for outcome in outcomes if outcome.get("status") == "error")
+    title = "✅ Ревизии из сообщения обработаны"
+    if error_count:
+        title = "⚠️ Ревизии обработаны не полностью"
+
+    lines = [title, "", f"Сохранено/обновлено: {saved_count}"]
+    status_labels = {
+        "saved": "сохранена",
+        "already": "уже была сохранена",
+        "duplicate": "дубль пропущен",
+        "ignored": "ранее отмечена как неучитываемая",
+        "deleted": "ранее удалена",
+        "error": "ошибка сохранения",
+    }
+    for outcome in outcomes:
+        draft = outcome.get("draft", {})
+        label = status_labels.get(outcome.get("status"), outcome.get("status", "неизвестно"))
+        period_label = format_period_label(draft.get("period", ""))
+        lines.append(
+            f"• {draft.get('point', '?')} · {period_label} — {label}"
+        )
+
+    warnings = []
+    for outcome in outcomes:
+        for warning in outcome.get("draft", {}).get("warnings", []):
+            warning = str(warning or "").strip()
+            if warning and warning not in warnings:
+                warnings.append(warning)
+    if warnings:
+        lines.extend(["", "⚠️ Что стоит проверить:"])
+        lines.extend(f"• {warning}" for warning in warnings[:8])
+
+    if error_count:
+        lines.extend([
+            "",
+            "Не отправляйте весь пакет повторно: "
+            "уже сохранённые точки защищены от дублей.",
+        ])
+    return "\n".join(lines)
+
+
+async def process_revision_snapshot_batch(message, application, snapshots):
+    message_date = get_message_local_date(message)
+    base_source_key = build_group_report_source_key(message)
+    outcomes = []
+
+    async with GROUP_REPORT_SAVE_LOCK:
+        for snapshot in snapshots:
+            revision_date = snapshot.get("date") or message_date
+            draft = {
+                **snapshot,
+                "point": snapshot["location"],
+                "who": get_service_report_author(message),
+                "date": revision_date,
+                "period": get_period_key_for_date(revision_date),
+                "chat_id": message.chat_id,
+                "source_message_id": message.message_id,
+                "media_group_id": getattr(message, "media_group_id", "") or "",
+                "source_key": (
+                    f"{base_source_key}:revision:"
+                    f"{normalize_text_key(snapshot['location'])}"
+                ),
+            }
+            draft["fingerprint"] = build_revision_message_fingerprint(draft)
+
+            if not draft["period"]:
+                outcomes.append({"draft": draft, "status": "error"})
+                continue
+
+            try:
+                existing, duplicate = await run_blocking(
+                    find_group_report_duplicate,
+                    draft["chat_id"],
+                    draft["source_key"],
+                    draft["fingerprint"],
+                )
+                if existing and existing.get("Статус") in {"saved", "ignored", "deleted"}:
+                    status = existing.get("Статус")
+                    is_edited_message = bool(getattr(message, "edit_date", None))
+                    fingerprint_changed = (
+                        str(existing.get("Fingerprint", ""))
+                        != str(draft["fingerprint"])
+                    )
+                    if status == "saved" and is_edited_message and fingerprint_changed:
+                        save_result = await run_group_sheet_write_with_retry(
+                            lambda current_draft: update_revision_message_entry_from_edit(
+                                current_draft,
+                                existing,
+                            ),
+                            draft,
+                            "edited revision snapshot batch save",
+                            application=application,
+                        )
+                        outcomes.append({
+                            "draft": draft,
+                            "status": "saved",
+                            "save_result": save_result,
+                        })
+                    else:
+                        outcomes.append({
+                            "draft": draft,
+                            "status": "already" if status == "saved" else status,
+                        })
+                    continue
+
+                if duplicate:
+                    outcomes.append({"draft": draft, "status": "duplicate"})
+                    continue
+
+                save_result = await run_group_sheet_write_with_retry(
+                    save_revision_message_entry,
+                    draft,
+                    "revision snapshot batch save",
+                    application=application,
+                )
+                outcomes.append({"draft": draft, "status": "saved", "save_result": save_result})
+            except Exception:
+                logger.exception(
+                    "Failed to auto-save revision snapshot batch chat=%s source=%s point=%s",
+                    draft["chat_id"],
+                    draft["source_key"],
+                    draft["point"],
+                )
+                outcomes.append({"draft": draft, "status": "error"})
+                break
+
+    await send_group_report_feedback_message(
+        application,
+        message.chat_id,
+        message.message_id,
+        build_revision_snapshot_batch_result_text(outcomes),
+    )
+
+
 async def process_group_report_message(message, application, photo_ids=None):
     if not message or not getattr(message, "chat", None):
         return
@@ -18205,14 +18402,20 @@ async def process_group_report_message(message, application, photo_ids=None):
             )
         return
 
-    revision_parsed = parse_revision_snapshot_message_text(body_text)
+    revision_snapshots = parse_revision_snapshot_messages_text(body_text)
+    if len(revision_snapshots) > 1:
+        await process_revision_snapshot_batch(message, application, revision_snapshots)
+        return
+
+    revision_parsed = revision_snapshots[0] if revision_snapshots else None
     if revision_parsed:
+        revision_date = revision_parsed.get("date") or get_message_local_date(message)
         draft = {
             **revision_parsed,
             "point": revision_parsed["location"],
             "who": get_service_report_author(message),
-            "date": get_message_local_date(message),
-            "period": get_period_key_for_date(get_message_local_date(message)),
+            "date": revision_date,
+            "period": get_period_key_for_date(revision_date),
             "chat_id": message.chat_id,
             "source_message_id": message.message_id,
             "media_group_id": getattr(message, "media_group_id", "") or "",
