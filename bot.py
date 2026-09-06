@@ -7752,9 +7752,10 @@ def build_operations_notice(digest, reference=None):
             reference=reference,
         )
         activity_icon = operations_activity_icon(row, reference)
+        connection_alert = " 🔴" if row.get("operational_state") == "offline" else ""
         table_rows.append(
             f"{point_name:<10} {yesterday_text:>7} "
-            f"{today_text:>7} {sale_text:<11} {activity_icon}"
+            f"{today_text:>7} {sale_text:<11} {activity_icon}{connection_alert}"
         )
 
     observed = _operations_datetime(digest.get("observed_at"))
@@ -7789,11 +7790,17 @@ def build_operations_notice(digest, reference=None):
         "<b>📡 Работа и продажи</b>",
         f"<pre>{escape_html(chr(10).join(table_rows))}</pre>",
     ]
+    connection_legend = (
+        "Второй 🔴 справа — нет связи.\n"
+        if any(row.get("operational_state") == "offline" for row in points)
+        else ""
+    )
     lines.append(
         "<blockquote>"
         f"{escape_html(_operations_connection_summary(points))}\n"
         "Вч / Сег — продажи. Последняя — безналичная.\n"
         "Пауза: 🟢 &lt;2ч · 🟡 2–3ч · 🔴 3ч+ · ⚪ вне графика.\n"
+        f"{connection_legend}"
         f"Обновлено: {escape_html(observed_text)} МСК."
         "</blockquote>"
     )
