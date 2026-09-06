@@ -198,6 +198,91 @@ class RevisionChatIngestionTests(unittest.TestCase):
 
 
 class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.services = []
+        self.revisions = []
+        self.logs = []
+        self.application = SimpleNamespace(bot_data={})
+
+        def append_record(records, payload):
+            records.append(payload)
+            return len(records) + 1
+
+        def find_duplicate(chat_id, source_key, fingerprint):
+            for row, record in enumerate(self.logs, 2):
+                if record["chat_id"] != chat_id:
+                    continue
+                logged = {
+                    "__row": row,
+                    "Статус": record["status"],
+                    "Fingerprint": record["fingerprint"],
+                    "Service_Row": record["service_row"],
+                }
+                if record["source_key"] == source_key:
+                    return logged, None
+                if record["fingerprint"] == fingerprint:
+                    return None, logged
+            return None, None
+
+        async def run_locally(function, *args):
+            return function(*args)
+
+        self.enterContext(
+            patch(
+                "bot.now_local",
+                return_value=datetime(
+                    2026,
+                    9,
+                    6,
+                    12,
+                    0,
+                    tzinfo=bot.BOT_TIMEZONE,
+                ),
+            )
+        )
+        self.enterContext(patch("bot.get_service_report_author", return_value="Александр"))
+        self.enterContext(patch("bot.get_paid_workers", return_value=["Александр"]))
+        self.enterContext(patch("bot.get_user_directory_entries", return_value={}))
+        self.enterContext(patch("bot.GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS", 0))
+        self.enterContext(patch("bot.run_blocking", side_effect=run_locally))
+        self.enterContext(patch("bot.find_group_report_duplicate", side_effect=find_duplicate))
+        self.semantic_duplicates = self.enterContext(
+            patch(
+                "bot.find_service_semantic_duplicates",
+                return_value=[],
+            )
+        )
+        self.enterContext(
+            patch(
+                "bot.add_service_row",
+                side_effect=lambda payload: append_record(self.services, payload),
+            )
+        )
+        self.enterContext(
+            patch(
+                "bot.add_revision_row",
+                side_effect=lambda payload: append_record(self.revisions, payload),
+            )
+        )
+        self.enterContext(
+            patch(
+                "bot.append_group_report_log",
+                side_effect=lambda payload: append_record(self.logs, payload),
+            )
+        )
+        self.enterContext(patch("bot.find_revision_record", return_value=None))
+        self.enterContext(patch("bot.auto_close_repair_for_point"))
+        self.enterContext(patch("bot.request_group_service_today_refresh", new_callable=AsyncMock))
+        self.send_saved = self.enterContext(
+            patch("bot.send_group_report_saved_message", new_callable=AsyncMock)
+        )
+        self.send_revision = self.enterContext(
+            patch("bot.send_revision_message_saved_message", new_callable=AsyncMock)
+        )
+        self.send_feedback = self.enterContext(
+            patch("bot.send_group_report_feedback_message", new_callable=AsyncMock)
+        )
+
     def make_message(self, text, message_id=101):
         return SimpleNamespace(
             caption=None,
@@ -211,53 +296,23 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
             edit_date=None,
         )
 
-    async def test_dated_revision_routes_to_revision_only_save(self):
-        message = self.make_message(
-            "04.09 Южный\nКофе - 4.1\nМолоко - 4.5\nВоды - 0.8"
-        )
-        application = SimpleNamespace(bot_data={})
-        saved_drafts = []
+    async def test_dated_revision_saves_service_pay_and_inventory_together(self):
+        message = self.make_message("04.09 Южный\nКофе - 4.1\nМолоко - 4.5\nВоды - 0.8")
+        await bot.process_group_report_message(message, self.application)
 
-        async def fake_run_blocking(callable_value, *args):
-            if callable_value is bot.find_group_report_duplicate:
-                return None, None
-            if callable_value is bot.save_revision_message_entry:
-                saved_drafts.append(args[0])
-                return {
-                    "log_row": 1,
-                    "service_row": "",
-                    "who": "Александр",
-                    "revision": {
-                        "period": "09.2026",
-                        "location": "Южный",
-                    },
-                    "warnings": [],
-                }
-            raise AssertionError(f"Unexpected blocking call: {callable_value}")
+        self.send_saved.assert_awaited_once()
+        self.send_revision.assert_not_awaited()
+        self.assertEqual(len(self.services), 1)
+        self.assertEqual(self.services[0]["service_sum"], 250)
+        self.assertEqual(self.services[0]["salary_workers"], ["Александр"])
+        self.assertEqual(self.services[0]["water"], "0,8")
+        self.assertEqual(self.services[0]["date"], "04.09.2026")
+        self.assertEqual(self.revisions[0]["period"], "09.2026")
+        self.assertEqual(self.revisions[0]["values"]["Кофе"], "4,1")
+        self.assertEqual(self.logs[0]["service_row"], 2)
+        self.assertEqual(self.logs[0]["revision_row"], 2)
 
-        with (
-            patch(
-                "bot.now_local",
-                return_value=datetime(2026, 9, 6, 12, 0, tzinfo=bot.BOT_TIMEZONE),
-            ),
-            patch("bot.get_service_report_author", return_value="Александр"),
-            patch("bot.GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS", 0),
-            patch("bot.run_blocking", side_effect=fake_run_blocking),
-            patch("bot.parse_service_report_message_text") as service_parser,
-            patch(
-                "bot.send_revision_message_saved_message",
-                new_callable=AsyncMock,
-            ) as send_saved,
-        ):
-            await bot.process_group_report_message(message, application)
-
-        service_parser.assert_not_called()
-        send_saved.assert_awaited_once()
-        self.assertEqual(len(saved_drafts), 1)
-        self.assertEqual(saved_drafts[0]["period"], "09.2026")
-        self.assertEqual(saved_drafts[0]["date"], "04.09.2026")
-
-    async def test_multi_point_revision_routes_to_batch_without_service(self):
+    async def test_multi_point_revision_routes_to_batch(self):
         message = self.make_message(REVISION_PACKAGE)
         application = SimpleNamespace(bot_data={})
 
@@ -281,52 +336,95 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_saves_each_unique_point_with_its_own_source_key(self):
         message = self.make_message(REVISION_PACKAGE)
-        application = SimpleNamespace(bot_data={})
+        await bot.process_group_report_message(message, self.application)
+
+        self.assertEqual(len(self.services), 5)
+        self.assertEqual(len(self.revisions), 5)
+        self.assertEqual(sum(service["service_sum"] for service in self.services), 1250)
+        self.assertEqual(len({record["source_key"] for record in self.logs}), 5)
+        self.assertTrue(all(revision["period"] == "09.2026" for revision in self.revisions))
+        self.assertTrue(
+            all(record["service_row"] and record["revision_row"] for record in self.logs)
+        )
+        result_text = self.send_feedback.await_args.args[3]
+        self.assertIn("Сохранено/обновлено: 5", result_text)
+        self.assertEqual(result_text.count("обслуживание и ревизия сохранены"), 5)
+
+        # Retries of this message and a separately resent copy must not pay twice.
+        await bot.process_group_report_message(message, self.application)
+        await bot.process_group_report_message(
+            self.make_message(REVISION_PACKAGE, 102), self.application
+        )
+        self.assertEqual(len(self.services), 5)
+        self.assertEqual(len(self.revisions), 5)
+
+    async def test_batch_purchase_belongs_only_to_its_point(self):
+        message = self.make_message(
+            "04.09 Южный\nКофе - 4\nМолоко - 5\nВоды - 2.2\n(Купил 2 бака 280₽)\n\n"
+            "04.09 Сити\nКофе - 6\nМолоко - 4\nВоды - 2.5"
+        )
+        await bot.process_group_report_message(message, self.application)
+        self.assertEqual([service["purchase_sum"] for service in self.services], [280, 0])
+
+    async def test_warehouse_revision_does_not_create_service_or_salary(self):
+        message = self.make_message("/Дома\nКофе - 4\nМолоко - 5\nВоды - 2")
+        await bot.process_group_report_message(message, self.application)
+        self.assertEqual(self.services, [])
+        self.assertEqual(self.revisions[0]["location"], "Дома")
+        self.assertEqual(self.logs[0]["service_row"], "")
+        self.send_revision.assert_awaited_once()
+
+    async def test_slash_revision_without_water_still_records_service(self):
+        message = self.make_message("/Сити\nКофе: 6\nМолоко = 4,3\nСироп — 2.5")
+        await bot.process_group_report_message(message, self.application)
+        self.assertEqual(self.services[0]["water"], "")
+        self.assertEqual(self.services[0]["service_sum"], 250)
+        self.assertEqual(self.revisions[0]["values"]["Сиропы"], "2,5")
+
+    async def test_batch_checks_existing_service_before_new_salary(self):
+        self.semantic_duplicates.return_value = [{"__row": 345}]
+        await bot.process_group_report_message(
+            self.make_message(REVISION_PACKAGE), self.application
+        )
+        self.assertEqual(self.services, [])
+        self.assertEqual(self.revisions, [])
+        self.assertEqual(len(bot.get_group_report_drafts(self.application.bot_data)), 5)
+        self.assertIn("нужно проверить возможный повтор", self.send_feedback.await_args.args[3])
+
+    async def test_edit_of_combined_report_uses_linked_service_update(self):
+        message = self.make_message("04.09 Южный\nКофе - 4\nМолоко - 5\nВоды - 2")
+        await bot.process_group_report_message(message, self.application)
+        message.text = message.text.replace("Кофе - 4", "Кофе - 6")
+        message.edit_date = datetime(2026, 9, 6)
         with patch(
-            "bot.now_local",
-            return_value=datetime(2026, 9, 6, 12, 0, tzinfo=bot.BOT_TIMEZONE),
-        ):
-            snapshots = bot.parse_revision_snapshot_messages_text(REVISION_PACKAGE)
-        saved_drafts = []
+            "bot.update_group_report_entry_from_edit", return_value={"service_row": 2}
+        ) as update:
+            await bot.process_group_report_message(message, self.application)
+        update.assert_called_once()
+        self.assertEqual(update.call_args.args[0]["revision"]["values"]["Кофе"], "6")
+        self.assertEqual(len(self.services), 1)
 
-        async def fake_run_blocking(callable_value, *args):
-            if callable_value is bot.find_group_report_duplicate:
-                return None, None
-            if callable_value is bot.save_revision_message_entry:
-                draft = args[0]
-                saved_drafts.append(draft)
-                return {
-                    "log_row": len(saved_drafts),
-                    "service_row": "",
-                    "who": "Александр",
-                    "revision": {
-                        "period": draft["period"],
-                        "location": draft["point"],
-                    },
-                    "warnings": [],
-                }
-            raise AssertionError(f"Unexpected blocking call: {callable_value}")
-
+    def test_legacy_snapshot_edit_does_not_add_historical_salary(self):
+        draft = {
+            "point": "Южный",
+            "revision": {"period": "09.2026", "values": {"Кофе": "6"}},
+        }
+        record = {"Service_Row": "", "Revision_Row": "43"}
         with (
             patch(
-                "bot.now_local",
-                return_value=datetime(2026, 9, 6, 12, 0, tzinfo=bot.BOT_TIMEZONE),
-            ),
-            patch("bot.get_service_report_author", return_value="Александр"),
-            patch("bot.GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS", 0),
-            patch("bot.run_blocking", side_effect=fake_run_blocking),
-            patch(
-                "bot.send_group_report_feedback_message",
-                new_callable=AsyncMock,
-            ) as send_feedback,
+                "bot.update_revision_message_entry_from_edit",
+                return_value={
+                    "service_row": "",
+                    "warnings": [],
+                },
+            ) as update_revision,
+            patch("bot.update_group_report_entry_from_edit") as update_service,
         ):
-            await bot.process_revision_snapshot_batch(message, application, snapshots)
-
-        self.assertEqual(len(saved_drafts), 5)
-        self.assertEqual(len({draft["source_key"] for draft in saved_drafts}), 5)
-        self.assertTrue(all(draft["period"] == "09.2026" for draft in saved_drafts))
-        result_text = send_feedback.await_args.args[3]
-        self.assertIn("Сохранено/обновлено: 5", result_text)
+            result = bot.update_group_service_or_legacy_revision(draft, record)
+        update_revision.assert_called_once()
+        self.assertEqual(update_revision.call_args.args[0]["values"], {"Кофе": "6"})
+        update_service.assert_not_called()
+        self.assertIn("не добавлены автоматически", result["warnings"][0])
 
 
 if __name__ == "__main__":
