@@ -214,9 +214,17 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
                     continue
                 logged = {
                     "__row": row,
+                    "Chat_ID": record["chat_id"],
+                    "Source_Key": record["source_key"],
+                    "Source_Message_ID": record["source_message_id"],
                     "Статус": record["status"],
                     "Fingerprint": record["fingerprint"],
                     "Service_Row": record["service_row"],
+                    "Revision_Row": record["revision_row"],
+                    "Revision_Period": record["revision_period"],
+                    "Revision_Location": record["revision_location"],
+                    "Revision_Backup": record["revision_backup"],
+                    "Revision_Mode": record["revision_mode"],
                 }
                 if record["source_key"] == source_key:
                     return logged, None
@@ -241,6 +249,7 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.enterContext(patch("bot.get_service_report_author", return_value="Александр"))
+        self.enterContext(patch("bot.BDR_SPREADSHEET_ID", ""))
         self.enterContext(patch("bot.get_paid_workers", return_value=["Александр"]))
         self.enterContext(patch("bot.get_user_directory_entries", return_value={}))
         self.enterContext(patch("bot.GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS", 0))
@@ -425,6 +434,132 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(update_revision.call_args.args[0]["values"], {"Кофе": "6"})
         update_service.assert_not_called()
         self.assertIn("не добавлены автоматически", result["warnings"][0])
+
+    async def test_bdr_full_package_records_august_without_changing_service_date_or_pay(self):
+        from test_bdr_revision import FakeBdrClient
+
+        client = FakeBdrClient()
+        with (
+            patch("bot.BDR_SPREADSHEET_ID", "bdr"),
+            patch("bot.get_sheet", return_value=SimpleNamespace(client=client)),
+        ):
+            message = self.make_message(REVISION_PACKAGE)
+            await bot.process_group_report_message(message, self.application)
+            await bot.process_group_report_message(message, self.application)
+        self.assertEqual(len(self.revisions), 5)
+        self.assertTrue(all(row["period"] == "08.2026" for row in self.revisions))
+        self.assertTrue(all(row["date"] == "04.09.2026" for row in self.services))
+        self.assertEqual(sum(row["service_sum"] for row in self.services), 1250)
+        self.assertEqual(sum(len(batch["requests"]) for batch in client.writes), 75)
+        self.assertEqual(client.rows[92]["values"][3]["userEnteredValue"]["numberValue"], 0.4)
+        self.assertEqual(client.rows[92]["values"][4]["userEnteredValue"]["numberValue"], 0.08)
+        self.assertEqual(client.rows[79]["values"][7], {})  # Maxi was not supplied.
+        self.assertIn("formulaValue", client.rows[79]["values"][9]["userEnteredValue"])
+        self.assertTrue(all('"bdr"' in row["revision_backup"] for row in self.logs))
+
+    async def test_resending_pending_bdr_revision_reuses_service_and_original_log(self):
+        from test_bdr_revision import FakeBdrClient
+
+        client = FakeBdrClient()
+        client.fail_write = True
+        text = "04.09 Сити\nКофе - 6\nМолоко - 4\nВоды - 2.5"
+        with (
+            patch("bot.BDR_SPREADSHEET_ID", "bdr"),
+            patch("bot.get_sheet", return_value=SimpleNamespace(client=client)),
+        ):
+            await bot.process_group_report_message(self.make_message(text), self.application)
+            self.assertEqual(self.logs[0]["revision_mode"], "pending_bdr")
+            self.assertEqual(self.revisions, [])
+            client.fail_write = False
+            with (
+                patch(
+                    "bot.find_group_report_service_entry",
+                    return_value={
+                        "__row": 2,
+                        "Кто": "Александр",
+                        "В ЗП": "Александр",
+                    },
+                ),
+                patch("bot.update_service_row") as update_service,
+                patch("bot.find_group_report_revision_entry", return_value=None),
+                patch(
+                    "bot.update_group_report_log",
+                    side_effect=lambda row, payload: self.logs.__setitem__(row - 2, payload),
+                ),
+            ):
+                await bot.process_group_report_message(
+                    self.make_message(text, 102), self.application
+                )
+        self.assertEqual(len(self.services), 1)
+        self.assertEqual(len(self.logs), 1)
+        self.assertEqual(len(self.revisions), 1)
+        self.assertEqual(self.logs[0]["revision_period"], "08.2026")
+        self.assertEqual(self.logs[0]["source_key"], "msg:101")
+        self.assertEqual(self.logs[0]["revision_mode"], "created")
+        self.assertEqual(update_service.call_args.args[1]["service_sum"], 250)
+
+    async def test_intentionally_removed_revision_is_not_treated_as_pending(self):
+        message = self.make_message("04.09 Сити\nКофе - 6\nМолоко - 4\nВоды - 2.5")
+        await bot.process_group_report_message(message, self.application)
+        self.logs[0]["revision_row"] = ""
+        self.logs[0]["revision_mode"] = ""
+        await bot.process_group_report_message(message, self.application)
+        self.assertEqual(len(self.revisions), 1)
+
+    async def test_invalid_or_conflicting_dates_are_not_replaced_with_today(self):
+        for text in (
+            "31.09 Сити\nКофе - 6\nМолоко - 4\nВоды - 2.5",
+            "04.09 Сити\nКофе - 6\nМолоко - 4\nВоды - 2.5\n"
+            "04.08 Сити\nКофе - 5\nМолоко - 3\nВоды - 2",
+        ):
+            await bot.process_group_report_message(self.make_message(text), self.application)
+        self.assertEqual(self.services, [])
+        self.assertEqual(self.revisions, [])
+        self.assertIn("уточните дату", self.send_feedback.await_args.args[3])
+
+    def test_edit_preserves_explicitly_unpaid_service(self):
+        draft = {
+            "date": "04.09.2026",
+            "who": "Александр",
+            "point": "Сити",
+            "chat_id": -1001,
+            "source_key": "msg:101",
+            "source_message_id": 101,
+        }
+        with (
+            patch(
+                "bot.find_group_report_service_entry",
+                return_value={
+                    "__row": 2,
+                    "Кто": "Александр",
+                    "В ЗП": "нет",
+                },
+            ),
+            patch("bot.update_service_row") as update,
+            patch("bot.find_group_report_revision_entry", return_value=None),
+            patch("bot.update_group_report_log"),
+        ):
+            bot.update_group_report_entry_from_edit(draft, {"__row": 2})
+        self.assertEqual(update.call_args.args[1]["service_sum"], 0)
+        self.assertEqual(update.call_args.args[1]["salary_workers"], [])
+
+    def test_batch_does_not_claim_inventory_saved_when_only_service_was_saved(self):
+        text = bot.build_revision_snapshot_batch_result_text(
+            [
+                {
+                    "status": "saved",
+                    "draft": {
+                        "point": "Сити",
+                        "period": "08.2026",
+                        "revision": {"values": {"Кофе": "6"}},
+                    },
+                    "save_result": {"service_row": 348, "revision": None},
+                }
+            ]
+        )
+        self.assertTrue(text.startswith("⚠️"))
+        self.assertIn("Сохранено/обновлено: 0", text)
+        self.assertIn("обслуживание сохранено, ревизия не сохранена", text)
 
 
 if __name__ == "__main__":
