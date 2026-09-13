@@ -504,6 +504,7 @@ GROUP_REPORT_SAVE_LOCK = asyncio.Lock()
 GROUP_REPORT_WRITE_THROTTLE_LOCK = asyncio.Lock()
 GROUP_REPORT_LAST_WRITE_TS_KEY = "_group_report_last_write_ts"
 GROUP_REPORT_REFRESH_TASK_KEY = "_group_report_refresh_task"
+APPLICATION_RUNTIME = {}
 OWNER_AI_WORK_QUEUE = OwnerAiWorkQueue()
 OWNER_AI_MAINTENANCE_TIMEOUT_SECONDS = 5.0
 
@@ -18397,7 +18398,7 @@ async def wait_for_group_report_sheet_slot(application):
 
 
 async def request_group_service_today_refresh(application):
-    existing_task = application.bot_data.get(GROUP_REPORT_REFRESH_TASK_KEY)
+    existing_task = APPLICATION_RUNTIME.get(GROUP_REPORT_REFRESH_TASK_KEY)
     if existing_task and not existing_task.done():
         existing_task.cancel()
 
@@ -18410,11 +18411,11 @@ async def request_group_service_today_refresh(application):
         except Exception:
             logger.exception("Failed to refresh group service-today post after debounced save")
         finally:
-            current_task = application.bot_data.get(GROUP_REPORT_REFRESH_TASK_KEY)
+            current_task = APPLICATION_RUNTIME.get(GROUP_REPORT_REFRESH_TASK_KEY)
             if current_task is asyncio.current_task():
-                application.bot_data.pop(GROUP_REPORT_REFRESH_TASK_KEY, None)
+                APPLICATION_RUNTIME.pop(GROUP_REPORT_REFRESH_TASK_KEY, None)
 
-    application.bot_data[GROUP_REPORT_REFRESH_TASK_KEY] = asyncio.create_task(_delayed_refresh())
+    APPLICATION_RUNTIME[GROUP_REPORT_REFRESH_TASK_KEY] = asyncio.create_task(_delayed_refresh())
 
 
 async def run_group_sheet_write_with_retry(save_callable, draft, operation_label, application=None):
@@ -21544,28 +21545,28 @@ async def on_app_startup(application):
             ),
         )
         payroll_server.start()
-        application.bot_data["owner_payroll_api_server"] = payroll_server
+        APPLICATION_RUNTIME["owner_payroll_api_server"] = payroll_server
     load_reminder_state(application)
     if ALLOWED_GROUP_CHAT_IDS:
         try:
             await process_group_reminders(application)
         except Exception:
             logger.exception("Initial reminder sync failed on startup")
-        application.bot_data["reminder_loop_task"] = asyncio.create_task(reminder_loop(application))
+        APPLICATION_RUNTIME["reminder_loop_task"] = asyncio.create_task(reminder_loop(application))
 
 
 async def on_app_shutdown(application):
-    payroll_server = application.bot_data.pop("owner_payroll_api_server", None)
+    payroll_server = APPLICATION_RUNTIME.pop("owner_payroll_api_server", None)
     if payroll_server is not None:
         await run_blocking(payroll_server.close)
-    refresh_task = application.bot_data.pop(GROUP_REPORT_REFRESH_TASK_KEY, None)
+    refresh_task = APPLICATION_RUNTIME.pop(GROUP_REPORT_REFRESH_TASK_KEY, None)
     if refresh_task:
         refresh_task.cancel()
         try:
             await refresh_task
         except asyncio.CancelledError:
             pass
-    task = application.bot_data.pop("reminder_loop_task", None)
+    task = APPLICATION_RUNTIME.pop("reminder_loop_task", None)
     if task:
         task.cancel()
         try:

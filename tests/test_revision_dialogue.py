@@ -467,3 +467,38 @@ def test_legacy_google_writer_joins_revision_critical_section():
         thread.join(1)
         assert not thread.is_alive()
         request.assert_called_once()
+
+
+class BotPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_server_and_jobs_are_not_in_persisted_bot_data(self):
+        import pickle
+        import threading
+        from copy import deepcopy
+
+        app = SimpleNamespace(bot_data={})
+
+        class Server:
+            def __init__(self, *args, **kwargs):
+                self.lock = threading.Lock()
+
+            def start(self):
+                pass
+
+            def close(self):
+                pass
+
+        with (
+            patch.dict(bot.APPLICATION_RUNTIME, {}, clear=True),
+            patch.object(bot, "get_user_directory", return_value={12: "Сотрудник"}),
+            patch.object(bot, "OWNER_PAYROLL_API_TOKEN", "t" * 32),
+            patch.object(bot, "PayrollApiServer", Server),
+            patch.object(bot, "load_reminder_state"),
+            patch.object(bot, "process_group_reminders", new=AsyncMock()),
+            patch.object(bot, "ALLOWED_GROUP_CHAT_IDS", set()),
+            patch.object(revision_bot, "resume"),
+        ):
+            await bot.on_app_startup(app)
+            self.assertIn("owner_payroll_api_server", bot.APPLICATION_RUNTIME)
+            pickle.dumps(deepcopy(app.bot_data))
+            await bot.on_app_shutdown(app)
+            self.assertFalse(bot.APPLICATION_RUNTIME)
