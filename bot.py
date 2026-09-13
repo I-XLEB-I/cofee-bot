@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import urllib.request
 from datetime import date, datetime, timedelta
@@ -38,6 +39,8 @@ from telegram.ext import (
 from telegram.helpers import escape_markdown
 
 import bdr_revision
+import revision_bot
+from revision_sheet_journal import SerializedSheetsClient
 from owner_ai_client import (
     OwnerAiAccessError,
     OwnerAiClientConfig,
@@ -910,7 +913,7 @@ def get_sheet():
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
     creds = get_google_credentials(scopes)
-    client = gspread.authorize(creds)
+    client = gspread.authorize(creds, http_client=SerializedSheetsClient)
     book = client.open_by_key(SPREADSHEET_ID)
     _BOOK_CACHE["book"] = book
     _BOOK_CACHE["expires_at"] = now + timedelta(seconds=max(SHEETS_BOOK_CACHE_TTL_SECONDS, 5))
@@ -11450,6 +11453,8 @@ async def show_owner_ai_screen(query, context):
 
 async def enqueue_owner_ai_message(message, context, question):
     """Acknowledge quickly; the AI worker runs outside ConversationHandler."""
+    if await revision_bot.handle_message(sys.modules[__name__], message, context, question):
+        return
     if not owner_ai_api_configured():
         await message.reply_text("⚪ ИИ-аналитик пока не подключён.")
         return
@@ -21524,6 +21529,7 @@ async def reminder_loop(application):
 
 async def on_app_startup(application):
     await run_blocking(get_user_directory)
+    revision_bot.resume(sys.modules[__name__], application)
     if OWNER_PAYROLL_API_TOKEN:
         payroll_server = PayrollApiServer(
             PayrollApiConfig(
@@ -21838,6 +21844,7 @@ def main():
         ],
     )
 
+    revision_bot.register(app, sys.modules[__name__])
     app.add_handler(conv)
     register_private_owner_ai_idle_handler(app)
     app.add_handler(CommandHandler("cancel", cancel))
