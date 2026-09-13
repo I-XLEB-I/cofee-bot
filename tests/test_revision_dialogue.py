@@ -1,4 +1,5 @@
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -252,8 +253,8 @@ class AccountingTests(unittest.TestCase):
         self.patch.start()
         self.addCleanup(self.patch.stop)
 
-    def prepare(self, location="Сити", values=None):
-        self.store.accept(12, 12, 1, "ревизия", "2026-09-04")
+    def prepare(self, location="Сити", values=None, day="2026-09-04"):
+        self.store.accept(12, 12, 1, "ревизия", day)
         draft = self.store.apply_message(12, 12, 1, proposal(location, values), expected_version=0)
         preview = revision_accounting.prepare(self.host, draft, 12, 12)
         self.assertFalse(self.sheets.calls, "Preview must be read only")
@@ -305,6 +306,30 @@ class AccountingTests(unittest.TestCase):
         self.assertFalse(preview["needs_confirmation"])
         revision_accounting.save(self.host, self.store, opid, 12, 12)
         self.assertEqual(len(self.sheets.worksheet("Обслуживание").get_all_values()), 1)
+
+    def test_missing_bdr_period_keeps_order_actual_date_and_durable_pending_marker(self):
+        values = {name: str(i) for i, name in reversed(list(enumerate(bot.REVISION_ITEMS, 1)))}
+        opid, preview = self.prepare("Дома", values, day="2026-09-13")
+        self.assertFalse(preview["needs_confirmation"])
+        self.assertEqual([s["spreadsheet_id"] for s in preview["steps"]], ["ledger"])
+        summary = preview["summaries"][0]
+        self.assertEqual(summary["period"], "09.2026")
+        self.assertEqual(summary["bdr_date"], "")
+        self.assertEqual([c["item"] for c in summary["changes"]], bot.REVISION_ITEMS)
+        self.sheets.fail_after = "ledger"
+        with self.assertRaises(TimeoutError):
+            revision_accounting.save(self.host, self.store, opid, 12, 12)
+        self.store = RevisionStore(self.store.path)
+        revision_accounting.save(self.host, self.store, opid, 12, 12)
+        self.assertEqual(len(self.sheets.calls), 1)
+        row = self.sheets.worksheet("Ревизия").get_all_values()[1]
+        self.assertEqual(row[:4], ["09.2026", "Дома", "Сотрудник", "13.09.2026"])
+        self.assertEqual(row[4:], list(range(1, len(bot.REVISION_ITEMS) + 1)))
+        log = self.sheets.worksheet("Импорт группы").get_all_values()[1]
+        marker = json.loads(log[bot.GROUP_REPORT_LOG_HEADERS.index("Revision_Backup")])
+        self.assertEqual(marker["pending_bdr"]["date"], "13.09.2026")
+        self.assertNotIn("bdr", marker)
+        self.assertEqual(self.store.get(12, 12)["status"], "saved")
 
     def test_same_day_correction_reuses_visit(self):
         opid, _ = self.prepare()
@@ -358,6 +383,33 @@ class TelegramDialogueTests(unittest.IsolatedAsyncioTestCase):
             await revision_bot.drain(bot, self.application, 12, 12)
         model.assert_not_called()
         self.assertEqual(self.store.get(12, 12)["records"][0]["values"]["Кофе"], "4.5")
+
+    async def test_complete_report_starts_reconciliation_without_save_command(self):
+        self.store.accept(12, 12, 1, "Ревизия Дома: все остатки", "2026-09-13")
+        self.store.mark_message(12, 12, 1, "parsed", proposal("Дома", {n: "1" for n in bot.REVISION_ITEMS}))
+        with (
+            patch.object(revision_bot, "get_store", return_value=self.store),
+            patch.object(bot, "get_allowed_user_ids", return_value={12}),
+            patch.object(revision_bot, "prepare_save", new=AsyncMock()) as prepare,
+        ):
+            await revision_bot.drain(bot, self.application, 12, 12)
+        prepare.assert_awaited_once()
+
+    async def test_do_not_save_survives_restart_and_later_complete_update(self):
+        self.store.accept(12, 12, 1, "Ревизия Дома, пока не сохраняй", "2026-09-13")
+        self.store.mark_message(12, 12, 1, "parsed", proposal("Дома", {"Кофе": "1"}))
+        with (
+            patch.object(revision_bot, "get_store", side_effect=lambda _: self.store),
+            patch.object(bot, "get_allowed_user_ids", return_value={12}),
+            patch.object(revision_bot, "prepare_save", new=AsyncMock()) as prepare,
+        ):
+            await revision_bot.drain(bot, self.application, 12, 12)
+            self.store = RevisionStore(self.store.path)
+            self.store.accept(12, 12, 2, "Остальные количества", "2026-09-13")
+            self.store.mark_message(12, 12, 2, "parsed", proposal("Дома", {n: "1" for n in bot.REVISION_ITEMS}))
+            await revision_bot.drain(bot, self.application, 12, 12)
+        prepare.assert_not_awaited()
+        self.assertTrue(self.store.get(12, 12)["auto_save_paused"])
 
     async def test_whole_dialogue_calls_model_once_per_message_and_never_writes_without_save(self):
         self.store.accept(12, 12, 1, "Ревизия на Южном кофе четыре с половиной", "2026-09-04")

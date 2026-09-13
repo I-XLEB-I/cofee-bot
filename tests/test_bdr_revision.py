@@ -108,6 +108,43 @@ class BdrRevisionTests(unittest.TestCase):
         with self.assertRaisesRegex(BdrRevisionError, "равноудалены"):
             self.layout.nearest("05.09.2026")
 
+    def test_group_revision_without_bdr_block_is_saved_with_actual_date_and_pending_log(self):
+        draft = {
+            "sync_bdr": True, "date": "13.09.2026", "period": "09.2026",
+            "point": "Гараж", "who": "Александр", "values": {"Молоко": "3", "Кофе": "2"},
+            "chat_id": -100, "source_key": "msg:13", "source_message_id": 13,
+        }
+        with (
+            patch("bot.BDR_SPREADSHEET_ID", "bdr"),
+            patch("bot.get_sheet", return_value=SimpleNamespace(client=self.client)),
+            patch("bot.find_revision_record", return_value=None),
+            patch("bot.add_revision_row", return_value=45) as add,
+            patch("bot.append_group_report_log", return_value=400) as log,
+        ):
+            result = bot.save_revision_message_entry(draft)
+        self.assertEqual(self.client.writes, [])
+        self.assertEqual(add.call_args.args[0]["filled_at"], "13.09.2026")
+        self.assertEqual(add.call_args.args[0]["period"], "09.2026")
+        backup = json.loads(log.call_args.args[0]["revision_backup"])
+        self.assertEqual(backup["pending_bdr"]["location"], "Гараж")
+        self.assertIsNone(result["revision"]["bdr"])
+        text = bot.build_revision_message_saved_text(draft, result)
+        self.assertIn("ожидает подходящего блока", text)
+        self.assertNotIn("записано в блок", text)
+
+    def test_missing_target_block_cannot_leave_previous_bdr_contribution_behind(self):
+        draft = {"sync_bdr": True, "date": "13.09.2026"}
+        revision = {"period": "09.2026", "location": "Сити", "values": {"Кофе": "2"}}
+        log = {"Revision_Backup": json.dumps({"bdr": {"date": "31.08.2026"}})}
+        with (
+            patch("bot.BDR_SPREADSHEET_ID", "bdr"),
+            patch("bot.get_sheet", return_value=SimpleNamespace(client=self.client)),
+            patch("bot.update_revision_row") as update,
+        ):
+            with self.assertRaisesRegex(BdrRevisionError, "сверка перед переносом"):
+                bot.save_edited_revision_entry(draft, log, revision)
+        update.assert_not_called()
+
     def test_actual_august_headers_determine_point_columns(self):
         self.assertEqual(self.block.columns["Южный"], 4)
         self.assertEqual(self.block.columns["Беломорский"], 5)

@@ -35,6 +35,29 @@ def is_revision_request(text):
     )
 
 
+def defer_automatic_save(text):
+    """Explicit drafts, examples and questions must not become automatic writes."""
+    return bool(
+        re.search(
+            r"\b(?:не|нет|нельзя|пока|позже|потом|если|когда|подожди|стоп|"
+            r"черновик\w*|пример\w*|образец\w*|досчит\w*|провер\w*)\b",
+            str(text).casefold(),
+        )
+        or any(c in str(text) for c in '?«»"')
+    )
+
+
+def complete_report_ready(draft, items):
+    return bool(
+        draft.get("records")
+        and not draft.get("auto_save_paused")
+        and not draft.get("clarification")
+        and not draft.get("unassigned")
+        and all(record.get("location") and set(record["values"]) == set(items)
+                for record in draft["records"])
+    )
+
+
 def number(value):
     if not isinstance(value, str) or not re.fullmatch(r"\d+(?:[.,]\d{1,4})?", value):
         raise RevisionInputError("Количество должно быть неотрицательным числом.")
@@ -400,6 +423,10 @@ class RevisionStore:
             if current["status"] not in ("draft", "preview"):
                 raise RevisionConflict("Этот черновик уже завершён.")
             result = apply_proposal(current, proposal, event["message_date"])
+            if proposal["action"] == "save":
+                result["auto_save_paused"] = False
+            elif defer_automatic_save(event["text"]):
+                result["auto_save_paused"] = True
             result["version"] += 1
             db.execute(
                 "UPDATE drafts SET version=?,payload=? WHERE chat_id=? AND user_id=?",
