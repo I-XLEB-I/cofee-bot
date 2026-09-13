@@ -55,8 +55,9 @@ def query_owner_ai(
     maintenance_context: Mapping[str, Any] | None = None,
     reply_context: str | None = None,
     audience: str | None = None,
+    revision_context: Mapping[str, Any] | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Call the versioned internal API and return its validated response."""
     if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
         raise OwnerAiClientError("Invalid Telegram user ID.")
@@ -97,6 +98,10 @@ def query_owner_ai(
         payload["conversation_id"] = normalized_conversation_id
     if audience is not None:
         payload["audience"] = audience
+    if revision_context is not None:
+        if audience != "private" or normalized_conversation_id != f"telegram:{user_id}:{user_id}":
+            raise OwnerAiAccessError("Ревизия через ИИ доступна в личном чате.")
+        payload["revision_context"] = dict(revision_context)
     if maintenance_context is not None:
         payload["maintenance_context"] = _normalize_maintenance_context(
             maintenance_context
@@ -134,6 +139,10 @@ def query_owner_ai(
                 )
             raw = response.read(config.max_response_bytes + 1)
     except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise OwnerAiClientError(
+                "Достигнут лимит ИИ. Черновик сохранён; можно продолжить позже или через меню."
+            ) from exc
         if exc.code == 413:
             raise OwnerAiInputError(
                 "Вопрос вместе с контекстом слишком длинный. "
@@ -169,6 +178,11 @@ def query_owner_ai(
     answer = payload.get("answer")
     if scope not in {"owner", "staff"}:
         raise OwnerAiClientError("Owner AI returned an invalid access scope.")
+    if revision_context is not None:
+        proposal = payload.get("revision")
+        if not isinstance(proposal, dict):
+            raise OwnerAiClientError("Сервис не вернул проверяемый черновик ревизии.")
+        return {"scope": scope, "revision": proposal}
     if not isinstance(answer, str) or not answer.strip():
         raise OwnerAiClientError("Owner AI returned an empty answer.")
     answer = answer.strip()

@@ -20,3 +20,5 @@ bot.py.save*
 # Local artifacts
 coffee-bot.bundle
 .claude/
+*.sqlite3
+*.sqlite3-journal
