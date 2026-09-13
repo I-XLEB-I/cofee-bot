@@ -19,6 +19,10 @@ class OwnerAiAccessError(OwnerAiClientError):
     """The current employee is not allowlisted by the AI service."""
 
 
+class OwnerAiInputError(OwnerAiClientError):
+    """The user can correct the request without retrying a provider failure."""
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerAiClientConfig:
     url: str
@@ -27,6 +31,7 @@ class OwnerAiClientConfig:
     max_question_chars: int = 1_200
     max_response_bytes: int = 65_536
     max_answer_chars: int = 4_000
+    max_request_bytes: int = 16_384
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.url.strip())
@@ -49,6 +54,7 @@ def query_owner_ai(
     conversation_id: str | None = None,
     maintenance_context: Mapping[str, Any] | None = None,
     reply_context: str | None = None,
+    audience: str | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
 ) -> dict[str, str]:
     """Call the versioned internal API and return its validated response."""
@@ -58,7 +64,13 @@ def query_owner_ai(
     if not normalized:
         raise OwnerAiClientError("Question must not be empty.")
     if len(normalized) > config.max_question_chars:
-        raise OwnerAiClientError("Question is too long.")
+        raise OwnerAiInputError(
+            f"Вопрос слишком длинный: сократите его до {config.max_question_chars} символов."
+        )
+    if audience is not None and (
+        not isinstance(audience, str) or audience not in {"private", "group"}
+    ):
+        raise OwnerAiInputError("Не удалось определить тип чата.")
     normalized_conversation_id = None
     if conversation_id is not None:
         normalized_conversation_id = str(conversation_id).strip()
@@ -83,6 +95,8 @@ def query_owner_ai(
     }
     if normalized_conversation_id is not None:
         payload["conversation_id"] = normalized_conversation_id
+    if audience is not None:
+        payload["audience"] = audience
     if maintenance_context is not None:
         payload["maintenance_context"] = _normalize_maintenance_context(
             maintenance_context
@@ -96,6 +110,11 @@ def query_owner_ai(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
+    if len(request_body) > config.max_request_bytes:
+        raise OwnerAiInputError(
+            "Вопрос вместе с контекстом слишком длинный. "
+            "Сократите вопрос или отправьте его без цитирования предыдущего сообщения."
+        )
     request = urllib.request.Request(
         config.url,
         data=request_body,
@@ -115,6 +134,11 @@ def query_owner_ai(
                 )
             raw = response.read(config.max_response_bytes + 1)
     except urllib.error.HTTPError as exc:
+        if exc.code == 413:
+            raise OwnerAiInputError(
+                "Вопрос вместе с контекстом слишком длинный. "
+                "Сократите вопрос или отправьте его без цитирования предыдущего сообщения."
+            ) from exc
         if exc.code == 403:
             raise OwnerAiAccessError(
                 "ИИ ещё не разрешён для этого сотрудника."

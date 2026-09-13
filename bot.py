@@ -42,8 +42,10 @@ from owner_ai_client import (
     OwnerAiAccessError,
     OwnerAiClientConfig,
     OwnerAiClientError,
+    OwnerAiInputError,
     query_owner_ai,
 )
+from owner_ai_queue import OwnerAiWorkQueue
 from payroll_api import (
     PayrollApiConfig,
     PayrollApiServer,
@@ -499,6 +501,8 @@ GROUP_REPORT_SAVE_LOCK = asyncio.Lock()
 GROUP_REPORT_WRITE_THROTTLE_LOCK = asyncio.Lock()
 GROUP_REPORT_LAST_WRITE_TS_KEY = "_group_report_last_write_ts"
 GROUP_REPORT_REFRESH_TASK_KEY = "_group_report_refresh_task"
+OWNER_AI_WORK_QUEUE = OwnerAiWorkQueue()
+OWNER_AI_MAINTENANCE_TIMEOUT_SECONDS = 5.0
 
 
 async def run_blocking(func, *args, **kwargs):
@@ -876,6 +880,24 @@ REPAIR_SHEET_SERVICE = "Ремонт_служебное"
 SALARY_TASK_SHEET = "ЗП задачи"
 
 
+def get_google_credentials(scopes):
+    credentials_json = os.getenv("CREDENTIALS_JSON", "").strip()
+    if credentials_json:
+        return Credentials.from_service_account_info(json.loads(credentials_json), scopes=scopes)
+    return Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+
+
+@lru_cache(maxsize=1)
+def get_owner_ai_readonly_book():
+    """Separate read-only credentials/session; never alter accounting timeouts."""
+    if not SPREADSHEET_ID:
+        raise RuntimeError("SPREADSHEET_ID is not set")
+    creds = get_google_credentials(["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    client = gspread.authorize(creds)
+    client.set_timeout((3, 5))
+    return client.open_by_key(SPREADSHEET_ID)
+
+
 def get_sheet():
     if not SPREADSHEET_ID:
         raise RuntimeError("SPREADSHEET_ID is not set")
@@ -887,11 +909,7 @@ def get_sheet():
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets",
               "https://www.googleapis.com/auth/drive"]
-    credentials_json = os.getenv("CREDENTIALS_JSON", "").strip()
-    if credentials_json:
-        creds = Credentials.from_service_account_info(json.loads(credentials_json), scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    creds = get_google_credentials(scopes)
     client = gspread.authorize(creds)
     book = client.open_by_key(SPREADSHEET_ID)
     _BOOK_CACHE["book"] = book
@@ -11430,7 +11448,35 @@ async def show_owner_ai_screen(query, context):
     return OWNER_AI_CHAT
 
 
-async def answer_owner_ai_message(message, context, question):
+async def enqueue_owner_ai_message(message, context, question):
+    """Acknowledge quickly; the AI worker runs outside ConversationHandler."""
+    if not owner_ai_api_configured():
+        await message.reply_text("⚪ ИИ-аналитик пока не подключён.")
+        return
+    user_id = message.from_user.id
+    chat_id = getattr(message, "chat_id", None) or user_id
+    status = await message.reply_text("🤖 Вопрос принят. Собираю точные данные…")
+
+    async def answer():
+        await answer_owner_ai_message(message, context, question, status=status)
+
+    async def expired():
+        await status.edit_text(
+            "⌛ Очередь ИИ заняла слишком много времени. Отправьте вопрос ещё раз."
+        )
+
+    accepted = OWNER_AI_WORK_QUEUE.submit(
+        (chat_id, user_id), answer, expired,
+        create_task=context.application.create_task,
+    )
+    if not accepted:
+        await status.edit_text(
+            "⌛ ИИ занят предыдущими вопросами. Дождитесь ответа и повторите вопрос. "
+            "Обычные кнопки и отчёты доступны."
+        )
+
+
+async def answer_owner_ai_message(message, context, question, *, status=None):
     config = get_owner_ai_client_config()
     if config is None:
         await message.reply_text(
@@ -11438,12 +11484,14 @@ async def answer_owner_ai_message(message, context, question):
             "Обычные отчёты продолжают работать."
         )
         return
-    status = await message.reply_text("🤖 Собираю точные данные…")
+    if status is None:
+        status = await message.reply_text("🤖 Собираю точные данные…")
     user_id = getattr(getattr(message, "from_user", None), "id", None)
     chat_id = getattr(message, "chat_id", None)
     if chat_id is None:
         chat_id = getattr(getattr(message, "chat", None), "id", None)
     conversation_id = f"telegram:{chat_id or user_id}:{user_id}"
+    audience = "private" if chat_id == user_id else "group"
     replied_message = getattr(message, "reply_to_message", None)
     reply_context = None
     if replied_message is not None:
@@ -11458,8 +11506,9 @@ async def answer_owner_ai_message(message, context, question):
     # facts only after an allowlisted tool call.
     maintenance_context = None
     try:
-        maintenance_context = await run_blocking(
-            build_owner_ai_maintenance_context
+        maintenance_context = await asyncio.wait_for(
+            run_blocking(build_owner_ai_maintenance_context),
+            timeout=OWNER_AI_MAINTENANCE_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         logger.warning(
@@ -11474,6 +11523,7 @@ async def answer_owner_ai_message(message, context, question):
             "question": question,
             "conversation_id": conversation_id,
             "maintenance_context": maintenance_context,
+            "audience": audience,
         }
         if reply_context:
             owner_ai_query_context["reply_context"] = reply_context
@@ -11484,6 +11534,9 @@ async def answer_owner_ai_message(message, context, question):
         )
     except OwnerAiAccessError as exc:
         await status.edit_text(f"⛔ {exc}")
+        return
+    except OwnerAiInputError as exc:
+        await status.edit_text(str(exc))
         return
     except OwnerAiClientError as exc:
         logger.warning(
@@ -11508,6 +11561,13 @@ async def answer_owner_ai_message(message, context, question):
         )
         return
 
+    if audience == "group" and result["scope"] != "staff":
+        # Defense in depth during rolling deploys or a backend regression.
+        await status.edit_text(
+            "Закрытая аналитика владельца доступна только в личном чате с ботом. "
+            "Отправьте вопрос туда."
+        )
+        return
     scope_label = "владелец" if result["scope"] == "owner" else "сотрудник"
     plain_answer = str(result["answer"])
     formatted_answer = format_owner_ai_answer_html(plain_answer)
@@ -11533,7 +11593,17 @@ async def answer_owner_ai_message(message, context, question):
 def build_owner_ai_maintenance_context():
     """Return bounded historical service dates for the read-only AI tool."""
     dates_by_point = {point: set() for point in ACTIVE_OPERATIONAL_POINTS}
-    for record in get_all_services():
+    # Never call get_all_services here: it repairs/creates sheet headers.
+    sheet = get_owner_ai_readonly_book().worksheet("Обслуживание")
+    rows = sheet.get_all_values()
+    headers = rows[0] if rows else []
+    if headers.count("Точка") != 1 or headers.count("Дата") != 1:
+        raise ValueError("Service sheet must have unique point and date columns")
+    point_index, date_index = headers.index("Точка"), headers.index("Дата")
+    for row in rows[1:]:
+        if len(row) <= max(point_index, date_index):
+            continue
+        record = {"Точка": row[point_index], "Дата": row[date_index]}
         point = str(record.get("Точка") or "").strip()
         if point not in dates_by_point:
             continue
@@ -11584,7 +11654,7 @@ async def cmd_ai(update: Update, context):
             else ConversationHandler.END
         )
 
-    await answer_owner_ai_message(
+    await enqueue_owner_ai_message(
         update.effective_message,
         context,
         question,
@@ -11599,7 +11669,7 @@ async def cmd_ai(update: Update, context):
 async def owner_ai_message_handler(update: Update, context):
     if not is_allowed_user(update) or not is_private_chat(update):
         return await deny_private_access(update)
-    await answer_owner_ai_message(
+    await enqueue_owner_ai_message(
         update.effective_message,
         context,
         update.effective_message.text,

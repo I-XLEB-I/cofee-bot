@@ -31,7 +31,7 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "owner_ai_api_configured", return_value=True),
             patch.object(
                 bot,
-                "answer_owner_ai_message",
+                "enqueue_owner_ai_message",
                 new=AsyncMock(),
             ) as answer,
         ):
@@ -54,7 +54,7 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "is_allowed_group_chat", return_value=False),
             patch.object(
                 bot,
-                "answer_owner_ai_message",
+                "enqueue_owner_ai_message",
                 new=AsyncMock(),
             ) as answer,
         ):
@@ -85,7 +85,7 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "is_private_chat", return_value=True),
             patch.object(
                 bot,
-                "answer_owner_ai_message",
+                "enqueue_owner_ai_message",
                 new=AsyncMock(),
             ) as answer,
         ):
@@ -153,6 +153,7 @@ class OwnerAiBotAccessTests(unittest.IsolatedAsyncioTestCase):
                 "conversation_id": "telegram:-100123:874403512",
                 "maintenance_context": maintenance,
                 "reply_context": "Вчера на Гагарина было 16 продаж.",
+                "audience": "group",
             },
         )
         edit_call = status.edit_text.await_args
