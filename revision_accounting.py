@@ -1,5 +1,6 @@
 """Revision reconciliation using the bot's existing units and payroll rules."""
 
+import json
 from datetime import date
 from decimal import Decimal
 
@@ -79,28 +80,38 @@ def prepare(host, draft, chat_id, user_id):
     for record in draft["records"]:
         location = record["location"]
         report_date = date.fromisoformat(record["date"]).strftime("%d.%m.%Y")
-        block = layout.nearest(report_date)
+        try:
+            block = layout.nearest(report_date)
+        except bdr_revision.BdrPeriodUnavailable:
+            block = None
+        period = block.period if block else date.fromisoformat(record["date"]).strftime("%m.%Y")
+        pending_bdr = None if block else {
+            "date": report_date, "period": period, "location": location,
+            "reason": "missing_period",
+        }
         values = record["values"]
         revision_rows = tables["Ревизия"][1]
         matches = [
             (i, row)
             for i, row in enumerate(revision_rows[1:], 1)
-            if row[:2] == [block.period, location]
+            if row[:2] == [period, location]
         ]
         if len(matches) > 1:
             raise RevisionConflict(
-                f"{location}: найдено несколько ревизий за {block.period}; нужна сверка."
+                f"{location}: найдено несколько ревизий за {period}; нужна сверка."
             )
         previous = dict(zip(host.REVISION_HEADERS, matches[0][1])) if matches else None
         before_values = host.build_revision_values_from_record(previous) if previous else {}
         # Keep the established conflict policy, including dry napkins / 500 and
         # water excluded from BDR. No arithmetic is delegated to the model.
-        _, bdr_before, checks = layout.plan(block, location, values, before_values)
-        for row, column in [
+        bdr_before, checks = {}, {}
+        if block:
+            _, bdr_before, checks = layout.plan(block, location, values, before_values)
+        for row, column in ([
             (block.row, 1),
             (block.row, block.columns[location]),
             *[(row, 1) for row, _ in checks],
-        ]:
+        ] if block else []):
             bdr_guards[row, column] = {
                 "sheet_id": layout.sheet_id,
                 "title": layout.title,
@@ -123,7 +134,7 @@ def prepare(host, draft, chat_id, user_id):
         merged = {**before_values, **values}
         rev_index = matches[0][0] if matches else allocate("Ревизия")
         revision_payload = {
-            "period": block.period,
+            "period": period,
             "location": location,
             "who": who,
             "filled_at": report_date,
@@ -145,10 +156,10 @@ def prepare(host, draft, chat_id, user_id):
             {
                 "item": item,
                 "before": str(before_values.get(item, "")),
-                "after": value,
+                "after": values[item],
                 "unit": host.REVISION_UNITS[item],
             }
-            for item, value in values.items()
+            for item in host.REVISION_ITEMS if item in values
         ]
         service_row = ""
         salary = 0
@@ -184,7 +195,7 @@ def prepare(host, draft, chat_id, user_id):
                 row_cells("Обслуживание", service_index, host.build_service_row_values(payload))
                 service_status = f"Будет записано обслуживание. Начисление: {salary} ₽."
             service_row = service_index + 1
-            needs_confirmation = True
+            needs_confirmation = needs_confirmation or not visits
         needs_confirmation = (
             needs_confirmation
             or bool(missing)
@@ -196,8 +207,12 @@ def prepare(host, draft, chat_id, user_id):
                 "date": block.date.strftime("%d.%m.%Y"),
                 "location": location,
                 "before": bdr_before,
-            },
+            } if block else None,
         )
+        if pending_bdr:
+            backup_data = json.loads(backup or "{}")
+            backup_data["pending_bdr"] = pending_bdr
+            backup = json.dumps(backup_data, ensure_ascii=False)
         log = [
             str(chat_id),
             f"dialogue:{op_key}:{location}",
@@ -210,7 +225,7 @@ def prepare(host, draft, chat_id, user_id):
             service_row,
             "",
             rev_index + 1,
-            block.period,
+            period,
             location,
             "updated" if matches else "created",
             backup,
@@ -222,8 +237,9 @@ def prepare(host, draft, chat_id, user_id):
             {
                 "location": location,
                 "date": report_date,
-                "period": block.period,
-                "bdr_date": block.date.strftime("%d.%m.%Y"),
+                "period": period,
+                "bdr_date": block.date.strftime("%d.%m.%Y") if block else "",
+                "pending_bdr": pending_bdr,
                 "changes": changes,
                 "missing": missing,
                 "service": service_status,

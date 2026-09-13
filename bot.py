@@ -2442,6 +2442,10 @@ def restore_revision_source_after_relocation(record, source_record, draft):
 def save_edited_revision_entry(draft, record, revision):
     """Update a revision and safely relocate it when the point was edited."""
     revision, bdr_context = resolve_group_revision_bdr(draft, revision)
+    if draft.get("pending_bdr") and json.loads(record.get("Revision_Backup") or "{}").get("bdr"):
+        raise bdr_revision.BdrRevisionError(
+            "БДР: прежняя запись связана с блоком; сначала нужна сверка перед переносом."
+        )
     target_period = str(revision.get("period", "")).strip()
     target_location = str(revision.get("location", "")).strip()
     if not target_period or not target_location:
@@ -2529,10 +2533,11 @@ def save_edited_revision_entry(draft, record, revision):
         "period": target_period,
         "location": target_location,
         "mode": mode,
-        "backup": add_bdr_revision_backup(backup, bdr_meta)
+        "backup": add_bdr_revision_backup(backup, bdr_meta, draft.get("pending_bdr"))
         if relocated or not json.loads(backup or "{}").get("bdr") else backup,
         "relocated": relocated,
         "bdr": bdr_meta,
+        "pending_bdr": draft.get("pending_bdr"),
     }
 
 
@@ -2584,11 +2589,24 @@ def parse_logged_row_numbers(raw_value):
 
 
 def resolve_group_revision_bdr(draft, revision):
+    draft.pop("pending_bdr", None)
     if not draft.get("sync_bdr") or not BDR_SPREADSHEET_ID:
         return revision, None
     client = get_sheet().client
     layout = bdr_revision.read_layout(client, BDR_SPREADSHEET_ID)
-    block = layout.nearest(draft["date"])
+    try:
+        block = layout.nearest(draft["date"])
+    except bdr_revision.BdrPeriodUnavailable:
+        period = get_period_key_for_date(draft["date"])
+        revision = {**revision, "period": period}
+        draft["period"] = period
+        draft["pending_bdr"] = {
+            "date": draft["date"], "period": period,
+            "location": revision["location"], "reason": "missing_period",
+        }
+        if draft.get("revision"):
+            draft["revision"] = revision
+        return revision, None
     revision = {**revision, "period": block.period}
     draft["period"] = block.period
     if draft.get("revision"):
@@ -2596,14 +2614,18 @@ def resolve_group_revision_bdr(draft, revision):
     return revision, (client, layout, block)
 
 
-def add_bdr_revision_backup(backup, bdr_meta):
-    if not bdr_meta:
+def add_bdr_revision_backup(backup, bdr_meta, pending_bdr=None):
+    if not bdr_meta and not pending_bdr:
         return backup
     data = json.loads(backup) if backup else {}
-    data["bdr"] = {
-        "date": bdr_meta["date"], "location": bdr_meta["location"],
-        "values": bdr_meta["before"],
-    }
+    if bdr_meta:
+        data.pop("pending_bdr", None)
+        data["bdr"] = {
+            "date": bdr_meta["date"], "location": bdr_meta["location"],
+            "values": bdr_meta["before"],
+        }
+    if pending_bdr:
+        data["pending_bdr"] = pending_bdr
     return json.dumps(data, ensure_ascii=False)
 
 
@@ -2668,9 +2690,10 @@ def save_group_report_revision(draft):
             "location": revision["location"],
             "mode": "updated",
             "backup": add_bdr_revision_backup(
-                build_group_report_revision_backup(existing), bdr_meta,
+                build_group_report_revision_backup(existing), bdr_meta, draft.get("pending_bdr"),
             ),
             "bdr": bdr_meta,
+            "pending_bdr": draft.get("pending_bdr"),
         }
 
     row_num = add_revision_row(payload)
@@ -2679,8 +2702,9 @@ def save_group_report_revision(draft):
         "period": revision["period"],
         "location": revision["location"],
         "mode": "created",
-        "backup": add_bdr_revision_backup("", bdr_meta),
+        "backup": add_bdr_revision_backup("", bdr_meta, draft.get("pending_bdr")),
         "bdr": bdr_meta,
+        "pending_bdr": draft.get("pending_bdr"),
     }
 
 
@@ -2817,6 +2841,8 @@ def build_group_report_saved_text(draft, save_result=None):
         )
     if revision_meta.get("bdr"):
         lines.append(f"📊 БДР: записано в блок {revision_meta['bdr']['date']}")
+    if revision_meta.get("pending_bdr"):
+        lines.append("📊 Ревизия в таблице бота; перенос в БДР ожидает подходящего блока (отмечено в журнале).")
 
     warnings = []
     for warning in list(draft.get("warnings", [])) + list(save_result.get("warnings", [])):
@@ -2848,6 +2874,8 @@ def build_revision_message_saved_text(draft, save_result=None):
     ]
     if (save_result.get("revision") or {}).get("bdr"):
         lines.append(f"📊 БДР: записано в блок {save_result['revision']['bdr']['date']}")
+    if (save_result.get("revision") or {}).get("pending_bdr"):
+        lines.append("📊 Перенос в БДР ожидает подходящего блока; ревизия сохранена в таблице бота и журнале.")
 
     item_lines = []
     for item_name in REVISION_ITEMS:
@@ -3344,7 +3372,7 @@ def save_revision_message_entry(draft):
         "period": draft["period"],
         "location": draft["point"],
         "who": draft.get("who", ""),
-        "filled_at": today(),
+        "filled_at": draft.get("date") or today(),
         "values": values,
     }
     if existing:
@@ -3374,8 +3402,11 @@ def save_revision_message_entry(draft):
             "backup": "",
         }
 
-    revision_meta["backup"] = add_bdr_revision_backup(revision_meta["backup"], bdr_meta)
+    revision_meta["backup"] = add_bdr_revision_backup(
+        revision_meta["backup"], bdr_meta, draft.get("pending_bdr"),
+    )
     revision_meta["bdr"] = bdr_meta
+    revision_meta["pending_bdr"] = draft.get("pending_bdr")
     log_payload = {
         "chat_id": draft["chat_id"],
         "source_key": draft["source_key"],
@@ -18478,6 +18509,8 @@ def build_revision_snapshot_batch_result_text(outcomes):
         bdr_meta = (outcome.get("save_result", {}).get("revision") or {}).get("bdr")
         if bdr_meta:
             label += f"; БДР {bdr_meta['date']}"
+        elif (outcome.get("save_result", {}).get("revision") or {}).get("pending_bdr"):
+            label += "; перенос в БДР ожидает подходящего блока"
         period_label = format_period_label(draft.get("period", ""))
         lines.append(
             f"• {draft.get('point', '?')} · {period_label} — {label}"

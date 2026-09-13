@@ -10,6 +10,10 @@ class BdrRevisionError(ValueError):
     """A date, layout, unit or live-value conflict needs owner attention."""
 
 
+class BdrPeriodUnavailable(BdrRevisionError):
+    """The ledger can accept the report, but BDR has no matching period yet."""
+
+
 def key(value):
     return re.sub(r"[\s._-]+", "", str(value or "").casefold().replace("ё", "е"))
 
@@ -132,7 +136,7 @@ class BdrLayout:
             raise BdrRevisionError("БДР: не определена дата отчёта") from exc
         distances = [(abs((b.date - report_date).days), b) for b in self.blocks]
         if not distances or min(d for d, _ in distances) > max_days:
-            raise BdrRevisionError(
+            raise BdrPeriodUnavailable(
                 f"БДР: нет блока в пределах {max_days} дней от {report_date:%d.%m.%Y}; "
                 "уточните дату ревизии или добавьте нужный блок и повторите сообщение"
             )

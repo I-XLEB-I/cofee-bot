@@ -17,6 +17,7 @@ from telegram.ext import (
 
 import revision_accounting
 from revision_dialogue import (
+    complete_report_ready,
     RevisionConflict,
     RevisionInputError,
     RevisionStore,
@@ -91,8 +92,8 @@ async def send_draft(application, chat_id, draft, units):
     for record in draft["records"]:
         lines = [f"Черновик · {record['location']} · {record['date']}"]
         lines += [
-            f"{item}: {qty.replace('.', ',')} {units[item]}"
-            for item, qty in record["values"].items()
+            f"{item}: {record['values'][item].replace('.', ',')} {units[item]}"
+            for item in units if item in record["values"]
         ]
         missing = [name for name in units if name not in record["values"]]
         if missing:
@@ -110,7 +111,8 @@ async def send_preview(application, chat_id, preview):
     for record in preview["summaries"]:
         lines = [
             f"Сверка · {record['location']} · {record['date']}",
-            f"Блок БДР: {record['bdr_date']}.",
+            (f"Блок БДР: {record['bdr_date']}." if record["bdr_date"] else
+             "Ревизия будет сохранена в таблице бота. Перенос в БДР ожидает подходящего блока."),
         ]
         lines += [
             f"{c['item']}: {c['before'] or 'не заполнено'} → {c['after']} {c['unit']}"
@@ -155,9 +157,16 @@ async def perform_save(host, application, chat_id, user_id, draft, *, recover=Fa
             )
             return
     locations = ", ".join(r["location"] for r in result["summaries"])
+    pending = [r["location"] for r in result["summaries"] if r.get("pending_bdr")]
+    sync_text = (
+        " Перенос в БДР ещё не выполнен: " + ", ".join(pending)
+        + ". Нет подходящего блока; это отмечено в журнале."
+        if pending else " Значения в БДР также сверены."
+    )
     await application.bot.send_message(
         chat_id,
-        f"Ревизия сохранена: {locations}. Значения в учёте бота и БДР прочитаны обратно и сверены. "
+        f"Ревизия сохранена: {locations}. Значения в таблице бота прочитаны обратно и сверены."
+        + sync_text + " "
         "Для исправления укажите точку, дату и новое количество. "
         "Повторное обслуживание за ту же дату не начисляется.",
     )
@@ -245,7 +254,10 @@ async def drain(host, application, chat_id, user_id):
             await host.answer_owner_ai_message(
                 message, SimpleNamespace(application=application), event["text"]
             )
-        elif current.get("save_requested") and not store.next_message(chat_id, user_id):
+        elif (
+            current.get("save_requested")
+            or (proposal["action"] == "update" and complete_report_ready(current, host.REVISION_ITEMS))
+        ) and not store.next_message(chat_id, user_id):
             await prepare_save(host, application, chat_id, user_id, current)
         else:
             await send_draft(application, chat_id, current, host.REVISION_UNITS)
