@@ -99,7 +99,7 @@ SERVICE_TODAY_GROUP_POST_HOUR = int(os.getenv("SERVICE_TODAY_GROUP_POST_HOUR", "
 SERVICE_TODAY_GROUP_DELETE_HOUR = int(os.getenv("SERVICE_TODAY_GROUP_DELETE_HOUR", "2"))
 HOME_REVISION_REMINDER_HOUR = int(os.getenv("HOME_REVISION_REMINDER_HOUR", "12"))
 MONTH_CLOSE_REVISION_REMINDER_HOUR = int(os.getenv("MONTH_CLOSE_REVISION_REMINDER_HOUR", "12"))
-REVISION_CURRENT_MONTH_OPEN_DAY = int(os.getenv("REVISION_CURRENT_MONTH_OPEN_DAY", "22"))
+REVISION_CURRENT_MONTH_OPEN_DAY = bdr_revision.REVISION_PREVIOUS_MONTH_LAST_DAY + 1
 GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS = float(os.getenv("GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS", "2.0"))
 GROUP_REPORT_SAVE_RETRY_MAX_ATTEMPTS = int(os.getenv("GROUP_REPORT_SAVE_RETRY_MAX_ATTEMPTS", "6"))
 GROUP_REPORT_SAVE_RETRY_INITIAL_DELAY_SECONDS = float(
@@ -1772,6 +1772,13 @@ def get_period_key_for_date(date_str):
     return build_period_key(parsed.year, parsed.month)
 
 
+def get_revision_period_key_for_date(date_str):
+    parsed = parse_date(date_str)
+    if not parsed:
+        return None
+    return bdr_revision.revision_period(parsed.strftime("%d.%m.%Y"))
+
+
 def is_date_in_period_key(date_str, period_key):
     return get_period_key_for_date(date_str) == str(period_key).strip()
 
@@ -2348,7 +2355,7 @@ def build_group_report_revision_data(draft):
     if not values:
         return None, warnings or ["не нашёл значений ревизии для точки"]
 
-    period = get_period_key_for_date(draft.get("date", ""))
+    period = get_revision_period_key_for_date(draft.get("date", ""))
     if not period:
         warnings.append("не удалось определить месяц ревизии")
         return None, warnings
@@ -2593,14 +2600,21 @@ def parse_logged_row_numbers(raw_value):
 
 def resolve_group_revision_bdr(draft, revision):
     draft.pop("pending_bdr", None)
+    period = get_revision_period_key_for_date(draft["date"])
+    if period is None:
+        raise bdr_revision.BdrRevisionError("Не определена дата ревизии")
+    revision = {**revision, "period": period}
+    draft["period"] = period
+    if draft.get("revision"):
+        draft["revision"] = revision
     if not draft.get("sync_bdr") or not BDR_SPREADSHEET_ID:
         return revision, None
     client = get_sheet().client
     layout = bdr_revision.read_layout(client, BDR_SPREADSHEET_ID)
     try:
-        block = layout.nearest(draft["date"])
+        block = layout.for_revision(draft["date"])
     except bdr_revision.BdrPeriodUnavailable:
-        period = get_period_key_for_date(draft["date"])
+        period = get_revision_period_key_for_date(draft["date"])
         revision = {**revision, "period": period}
         draft["period"] = period
         draft["pending_bdr"] = {
@@ -4265,7 +4279,7 @@ def build_service_report_from_revision_snapshot(snapshot, message_date):
         "source_text": source_text,
         "warnings": warnings,
         "revision": {
-            "period": get_period_key_for_date(report_date),
+            "period": get_revision_period_key_for_date(report_date),
             "location": snapshot["location"],
             "values": snapshot["values"],
         },
@@ -18576,7 +18590,7 @@ async def process_revision_snapshot_batch(message, application, snapshots):
                 "point": snapshot["location"],
                 "who": get_service_report_author(message),
                 "date": revision_date,
-                "period": get_period_key_for_date(revision_date),
+                "period": get_revision_period_key_for_date(revision_date),
                 "chat_id": message.chat_id,
                 "source_message_id": message.message_id,
                 "media_group_id": getattr(message, "media_group_id", "") or "",
@@ -18780,7 +18794,7 @@ async def process_group_report_message(message, application, photo_ids=None):
             "point": revision_parsed["location"],
             "who": get_service_report_author(message),
             "date": revision_date,
-            "period": get_period_key_for_date(revision_date),
+            "period": get_revision_period_key_for_date(revision_date),
             "chat_id": message.chat_id,
             "source_message_id": message.message_id,
             "media_group_id": getattr(message, "media_group_id", "") or "",

@@ -316,7 +316,7 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.services[0]["salary_workers"], ["Александр"])
         self.assertEqual(self.services[0]["water"], "0,8")
         self.assertEqual(self.services[0]["date"], "04.09.2026")
-        self.assertEqual(self.revisions[0]["period"], "09.2026")
+        self.assertEqual(self.revisions[0]["period"], "08.2026")
         self.assertEqual(self.revisions[0]["values"]["Кофе"], "4,1")
         self.assertEqual(self.logs[0]["service_row"], 2)
         self.assertEqual(self.logs[0]["revision_row"], 2)
@@ -351,7 +351,7 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.revisions), 5)
         self.assertEqual(sum(service["service_sum"] for service in self.services), 1250)
         self.assertEqual(len({record["source_key"] for record in self.logs}), 5)
-        self.assertTrue(all(revision["period"] == "09.2026" for revision in self.revisions))
+        self.assertTrue(all(revision["period"] == "08.2026" for revision in self.revisions))
         self.assertTrue(
             all(record["service_row"] and record["revision_row"] for record in self.logs)
         )
