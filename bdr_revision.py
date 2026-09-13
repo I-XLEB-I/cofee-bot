@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 
@@ -12,6 +12,20 @@ class BdrRevisionError(ValueError):
 
 class BdrPeriodUnavailable(BdrRevisionError):
     """The ledger can accept the report, but BDR has no matching period yet."""
+
+
+REVISION_PREVIOUS_MONTH_LAST_DAY = 12
+
+
+def revision_period(report_date):
+    """Days 1–12 close the previous month; keep the physical date separate."""
+    try:
+        parsed = datetime.strptime(report_date, "%d.%m.%Y").date()
+    except (TypeError, ValueError) as exc:
+        raise BdrRevisionError("Не определена дата ревизии") from exc
+    if parsed.day <= REVISION_PREVIOUS_MONTH_LAST_DAY:
+        parsed = parsed.replace(day=1) - timedelta(days=1)
+    return parsed.strftime("%m.%Y")
 
 
 def key(value):
@@ -129,21 +143,21 @@ class BdrLayout:
                         raise BdrRevisionError(f"БДР: повторная строка {item}")
                     active.items[item] = row
 
-    def nearest(self, report_date, max_days=10):
-        try:
-            report_date = datetime.strptime(report_date, "%d.%m.%Y").date()
-        except ValueError as exc:
-            raise BdrRevisionError("БДР: не определена дата отчёта") from exc
-        distances = [(abs((b.date - report_date).days), b) for b in self.blocks]
-        if not distances or min(d for d, _ in distances) > max_days:
+    def for_revision(self, report_date):
+        period = revision_period(report_date)
+        matches = [block for block in self.blocks if block.period == period]
+        if not matches:
             raise BdrPeriodUnavailable(
-                f"БДР: нет блока в пределах {max_days} дней от {report_date:%d.%m.%Y}; "
-                "уточните дату ревизии или добавьте нужный блок и повторите сообщение"
+                f"БДР: нет блока за {period}; "
+                "ревизии с 1 по 12 число включительно относятся к предыдущему месяцу"
             )
-        closest = [b for d, b in distances if d == min(d for d, _ in distances)]
-        if len(closest) != 1:
-            raise BdrRevisionError("БДР: две ближайшие даты равноудалены — уточните дату ревизии")
-        return closest[0]
+        if len(matches) != 1:
+            raise BdrRevisionError(f"БДР: несколько блоков за {period} — нужна сверка")
+        return matches[0]
+
+    def nearest(self, report_date):
+        """Compatibility entry point; accounting month replaces date proximity."""
+        return self.for_revision(report_date)
 
     def exact(self, block_date):
         matches = [b for b in self.blocks if b.date.strftime("%d.%m.%Y") == block_date]

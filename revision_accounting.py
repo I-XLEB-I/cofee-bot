@@ -81,10 +81,10 @@ def prepare(host, draft, chat_id, user_id):
         location = record["location"]
         report_date = date.fromisoformat(record["date"]).strftime("%d.%m.%Y")
         try:
-            block = layout.nearest(report_date)
+            block = layout.for_revision(report_date)
         except bdr_revision.BdrPeriodUnavailable:
             block = None
-        period = block.period if block else date.fromisoformat(record["date"]).strftime("%m.%Y")
+        period = bdr_revision.revision_period(report_date)
         pending_bdr = None if block else {
             "date": report_date, "period": period, "location": location,
             "reason": "missing_period",

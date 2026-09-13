@@ -331,6 +331,17 @@ class AccountingTests(unittest.TestCase):
         self.assertNotIn("bdr", marker)
         self.assertEqual(self.store.get(12, 12)["status"], "saved")
 
+    def test_missing_previous_month_block_keeps_cutoff_period_in_ledger(self):
+        opid, preview = self.prepare("Дома", {name: "1" for name in bot.REVISION_ITEMS}, day="2026-10-12")
+        summary = preview["summaries"][0]
+        self.assertEqual(summary["period"], "09.2026")
+        self.assertEqual(summary["pending_bdr"]["period"], "09.2026")
+        self.assertEqual(summary["pending_bdr"]["date"], "12.10.2026")
+        self.assertEqual([step["spreadsheet_id"] for step in preview["steps"]], ["ledger"])
+        revision_accounting.save(self.host, self.store, opid, 12, 12)
+        row = self.sheets.worksheet("Ревизия").get_all_values()[1]
+        self.assertEqual(row[:4], ["09.2026", "Дома", "Сотрудник", "12.10.2026"])
+
     def test_same_day_correction_reuses_visit(self):
         opid, _ = self.prepare()
         revision_accounting.save(self.host, self.store, opid, 12, 12)

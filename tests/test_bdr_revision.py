@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import bot
-from bdr_revision import BdrRevisionError, apply_and_verify, read_layout
+from bdr_revision import BdrRevisionError, apply_and_verify, read_layout, revision_period
 
 ITEMS = [
     "Кофе ",
@@ -99,14 +99,40 @@ class BdrRevisionTests(unittest.TestCase):
         self.assertEqual(self.block.date, date(2026, 8, 31))
         self.assertEqual(self.layout.nearest("22.08.2026"), self.block)
         self.assertEqual(self.layout.nearest("10.09.2026"), self.block)
-        with self.assertRaisesRegex(BdrRevisionError, "10 дней"):
-            self.layout.nearest("11.09.2026")
+        self.assertEqual(self.layout.for_revision("11.09.2026"), self.block)
+        self.assertEqual(self.layout.for_revision("12.09.2026"), self.block)
+        with self.assertRaisesRegex(BdrRevisionError, "нет блока за 09.2026"):
+            self.layout.for_revision("13.09.2026")
 
-    def test_equidistant_blocks_require_clarification(self):
+    def test_closer_other_month_does_not_override_accounting_month(self):
         self.layout.blocks.append(copy.copy(self.block))
         self.layout.blocks[-1].date = date(2026, 9, 10)
-        with self.assertRaisesRegex(BdrRevisionError, "равноудалены"):
-            self.layout.nearest("05.09.2026")
+        self.assertEqual(self.layout.for_revision("12.09.2026"), self.block)
+        self.assertEqual(self.layout.for_revision("13.09.2026"), self.layout.blocks[-1])
+
+    def test_duplicate_blocks_in_selected_month_require_reconciliation(self):
+        self.layout.blocks.append(copy.copy(self.block))
+        with self.assertRaisesRegex(BdrRevisionError, "несколько блоков за 08.2026"):
+            self.layout.for_revision("05.09.2026")
+
+    def test_missing_selected_month_does_not_use_another_month(self):
+        self.block.date = date(2026, 9, 10)
+        with self.assertRaisesRegex(BdrRevisionError, "нет блока за 08.2026"):
+            self.layout.for_revision("12.09.2026")
+
+    def test_cutoff_and_year_boundary_keep_service_month_separate(self):
+        for report_date, period in [
+            ("01.09.2026", "08.2026"), ("12.09.2026", "08.2026"),
+            ("13.09.2026", "09.2026"), ("30.09.2026", "09.2026"),
+            ("01.01.2027", "12.2026"), ("12.01.2027", "12.2026"),
+            ("13.01.2027", "01.2027"), ("12.03.2024", "02.2024"),
+        ]:
+            with self.subTest(report_date=report_date):
+                self.assertEqual(revision_period(report_date), period)
+                self.assertEqual(bot.get_revision_period_key_for_date(report_date), period)
+                self.assertEqual(bot.get_period_key_for_date(report_date), report_date[3:])
+        self.assertFalse(bot.is_current_revision_period_available(date(2026, 9, 12)))
+        self.assertTrue(bot.is_current_revision_period_available(date(2026, 9, 13)))
 
     def test_group_revision_without_bdr_block_is_saved_with_actual_date_and_pending_log(self):
         draft = {
