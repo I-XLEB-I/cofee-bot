@@ -39,6 +39,7 @@ from telegram.ext import (
 from telegram.helpers import escape_markdown
 
 import bdr_revision
+import owner_monitoring
 import revision_bot
 from revision_sheet_journal import SerializedSheetsClient
 from owner_ai_client import (
@@ -119,6 +120,8 @@ OPERATIONS_STALE_CACHE_SECONDS = float(
 OWNER_AI_INTERNAL_URL = os.getenv("OWNER_AI_INTERNAL_URL", "").strip()
 OWNER_AI_INTERNAL_TOKEN = os.getenv("OWNER_AI_INTERNAL_TOKEN", "").strip()
 OWNER_AI_TIMEOUT_SECONDS = float(os.getenv("OWNER_AI_TIMEOUT_SECONDS", "25.0"))
+OWNER_MONITORING_ENABLED = os.getenv("OWNER_MONITORING_ENABLED", "false").strip().lower() == "true"
+OWNER_MONITORING_CHAT_ID = os.getenv("OWNER_MONITORING_CHAT_ID", "").strip()
 OWNER_PAYROLL_API_TOKEN = os.getenv("OWNER_PAYROLL_API_TOKEN", "").strip()
 OWNER_PAYROLL_API_PORT = int(
     os.getenv("OWNER_PAYROLL_API_PORT", os.getenv("PORT", "8080"))
@@ -21564,6 +21567,20 @@ async def reminder_loop(application):
 async def on_app_startup(application):
     await run_blocking(get_user_directory)
     revision_bot.resume(sys.modules[__name__], application)
+    if OWNER_MONITORING_ENABLED:
+        owners = get_payout_editor_ids()
+        recipient = owner_monitoring.recipient_id(OWNER_MONITORING_CHAT_ID, owners)
+        config = get_owner_ai_client_config()
+        if recipient not in owners or not config:
+            logger.error("owner_monitoring_not_started recipient_or_backend_unconfigured")
+        else:
+            monitoring_store = owner_monitoring.MonitorStore(
+                Path(resolve_runtime_path(PERSISTENCE_FILE)).with_name("owner_monitoring.sqlite3"), recipient,
+            )
+            APPLICATION_RUNTIME["owner_monitoring_store"] = monitoring_store
+            APPLICATION_RUNTIME["owner_monitoring_task"] = asyncio.create_task(
+                owner_monitoring.monitoring_loop(application, config, monitoring_store),
+            )
     if OWNER_PAYROLL_API_TOKEN:
         payroll_server = PayrollApiServer(
             PayrollApiConfig(
@@ -21589,6 +21606,11 @@ async def on_app_startup(application):
 
 
 async def on_app_shutdown(application):
+    monitor_task = APPLICATION_RUNTIME.pop("owner_monitoring_task", None)
+    if monitor_task:
+        monitor_task.cancel()
+        await asyncio.gather(monitor_task, return_exceptions=True)
+    APPLICATION_RUNTIME.pop("owner_monitoring_store", None)
     payroll_server = APPLICATION_RUNTIME.pop("owner_payroll_api_server", None)
     if payroll_server is not None:
         await run_blocking(payroll_server.close)
