@@ -41,6 +41,7 @@ from telegram.helpers import escape_markdown
 import bdr_revision
 import owner_monitoring
 import revision_bot
+import stock_movement_bot
 from revision_sheet_journal import SerializedSheetsClient
 from owner_ai_client import (
     OwnerAiAccessError,
@@ -3277,79 +3278,7 @@ def update_revision_message_entry_from_edit(draft, record):
 
 
 def save_revision_restock_entry(draft):
-    existing = find_revision_record(draft["period"], draft["point"], True)
-    values = build_revision_values_from_record(existing) if existing else {item: "" for item in REVISION_ITEMS}
-
-    for item_name, delta in draft.get("values", {}).items():
-        current_value = parse_numeric_value(values.get(item_name, "")) or 0
-        delta_value = parse_numeric_value(delta) or 0
-        values[item_name] = format_number(current_value + delta_value)
-
-    payload = {
-        "period": draft["period"],
-        "location": draft["point"],
-        "who": draft.get("who", ""),
-        "filled_at": today(),
-        "values": values,
-    }
-    if existing:
-        run_group_sheet_write_blocking_with_retry(
-            lambda: update_revision_row(existing["__row"], payload),
-            "revision restock update",
-            draft=draft,
-        )
-        revision_meta = {
-            "row": existing["__row"],
-            "period": draft["period"],
-            "location": draft["point"],
-            "mode": "updated",
-            "backup": build_group_report_revision_backup(existing),
-        }
-    else:
-        row_num = run_group_sheet_write_blocking_with_retry(
-            lambda: add_revision_row(payload),
-            "revision restock create",
-            draft=draft,
-        )
-        revision_meta = {
-            "row": row_num,
-            "period": draft["period"],
-            "location": draft["point"],
-            "mode": "created",
-            "backup": "",
-        }
-
-    log_payload = {
-        "chat_id": draft["chat_id"],
-        "source_key": draft["source_key"],
-        "source_message_id": draft["source_message_id"],
-        "media_group_id": draft.get("media_group_id", ""),
-        "who": draft.get("who", ""),
-        "point": draft["point"],
-        "date": draft["date"],
-        "fingerprint": draft.get("fingerprint", ""),
-        "service_row": "",
-        "photo_rows": "",
-        "revision_row": revision_meta.get("row", ""),
-        "revision_period": revision_meta.get("period", ""),
-        "revision_location": revision_meta.get("location", ""),
-        "revision_mode": revision_meta.get("mode", ""),
-        "revision_backup": revision_meta.get("backup", ""),
-        "status": "saved",
-        "created_at": format_group_report_created_at(),
-    }
-    log_row = run_group_sheet_write_blocking_with_retry(
-        lambda: append_group_report_log(log_payload),
-        "revision restock log save",
-        draft=draft,
-    )
-    return {
-        "log_row": log_row,
-        "service_row": "",
-        "who": draft.get("who", ""),
-        "revision": revision_meta,
-        "warnings": [],
-    }
+    raise ValueError("Пополнения записываются только в отдельный журнал движений; ревизию менять нельзя.")
 
 
 def update_group_service_or_legacy_revision(draft, record):
@@ -18681,93 +18610,10 @@ async def process_group_report_message(message, application, photo_ids=None):
         return
 
     body_text = message.caption or message.text or ""
-    restock_parsed = parse_revision_restock_message_text(body_text)
-    if restock_parsed:
-        draft = {
-            **restock_parsed,
-            "point": restock_parsed["location"],
-            "who": get_service_report_author(message),
-            "date": get_message_local_date(message),
-            "period": get_period_key_for_date(get_message_local_date(message)),
-            "chat_id": message.chat_id,
-            "source_message_id": message.message_id,
-            "media_group_id": getattr(message, "media_group_id", "") or "",
-            "source_key": build_group_report_source_key(message),
-        }
-        draft["fingerprint"] = build_revision_restock_fingerprint(draft)
-
-        try:
-            async with GROUP_REPORT_SAVE_LOCK:
-                existing, duplicate = await run_blocking(
-                    find_group_report_duplicate,
-                    draft["chat_id"],
-                    draft["source_key"],
-                    draft["fingerprint"],
-                )
-                if existing and existing.get("Статус") in {"saved", "ignored", "deleted"}:
-                    status = existing.get("Статус")
-                    if status == "saved":
-                        text = "⚪ Это пополнение уже сохранено."
-                    elif status == "deleted":
-                        text = "⚪ Это пополнение уже было отмечено как «не учитывать»."
-                    else:
-                        text = "⚪ Это пополнение уже обработано."
-                    await send_group_report_feedback_message(
-                        application,
-                        draft["chat_id"],
-                        draft["source_message_id"],
-                        text,
-                    )
-                    return
-
-                if duplicate:
-                    await send_group_report_feedback_message(
-                        application,
-                        draft["chat_id"],
-                        draft["source_message_id"],
-                        "⚪ Похоже, это дубль пополнения — оно уже сохранено.",
-                    )
-                    return
-
-                save_result = await run_group_sheet_write_with_retry(
-                    save_revision_restock_entry,
-                    draft,
-                    "revision restock save",
-                    application=application,
-                )
-            await send_revision_restock_saved_message(application, draft, save_result)
-        except APIError as error:
-            if is_google_sheets_busy_error(error):
-                logger.exception(
-                    "Google Sheets busy during revision restock save chat=%s source=%s",
-                    draft["chat_id"],
-                    draft["source_key"],
-                )
-                await show_sheets_busy_notice(message)
-                return
-            logger.exception(
-                "Failed to auto-save revision restock chat=%s source=%s",
-                draft["chat_id"],
-                draft["source_key"],
-            )
-            await send_group_report_feedback_message(
-                application,
-                draft["chat_id"],
-                draft["source_message_id"],
-                "❌ Не удалось добавить пополнение в ревизию. Попробуйте ещё раз.",
-            )
-        except Exception:
-            logger.exception(
-                "Failed to auto-save revision restock chat=%s source=%s",
-                draft["chat_id"],
-                draft["source_key"],
-            )
-            await send_group_report_feedback_message(
-                application,
-                draft["chat_id"],
-                draft["source_message_id"],
-                "❌ Не удалось добавить пополнение в ревизию. Попробуйте ещё раз.",
-            )
+    if await stock_movement_bot.handle(sys.modules[__name__], message, application, photo_ids):
+        return
+    if parse_revision_restock_message_text(body_text):
+        await message.reply_text("Пополнение записывается отдельно от ревизии. Напишите, например: «Макси довёз кофе 2 пачки». Укажите фактическую дату, если это было не сегодня.")
         return
 
     revision_snapshots = parse_revision_snapshot_messages_text(body_text)
@@ -21915,6 +21761,7 @@ def main():
     )
 
     revision_bot.register(app, sys.modules[__name__])
+    stock_movement_bot.register(app, sys.modules[__name__])
     app.add_handler(conv)
     register_private_owner_ai_idle_handler(app)
     app.add_handler(CommandHandler("cancel", cancel))
