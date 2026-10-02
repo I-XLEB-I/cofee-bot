@@ -1,7 +1,9 @@
+import asyncio
+import json
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import bot
@@ -384,6 +386,55 @@ class OperationsSummaryTests(unittest.TestCase):
 
 
 class OperationsTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cold_partial_digest_survives_provider_delay(self):
+        payload = {
+            "incomplete_data": True,
+            "points": [point_row(name) for name in bot.ACTIVE_OPERATIONAL_POINTS],
+        }
+        response = MagicMock()
+        response.status = 200
+        response.read.return_value = json.dumps(payload).encode()
+        response.__enter__.return_value = response
+
+        def slow_provider(request, *, timeout):
+            # Reproduce the production contract without sleeping: the server
+            # has useful sales after its slower payment source times out.
+            if timeout < 35:
+                raise TimeoutError("cold digest still being assembled")
+            return response
+
+        with (
+            patch.object(bot, "OPERATIONS_API_URL", "https://example.com/points"),
+            patch.object(bot, "OPERATIONS_API_TOKEN", "test-token"),
+            patch.object(bot, "_OPERATIONS_FETCH_LOCK", asyncio.Lock()),
+            patch.dict(bot._OPERATIONS_CACHE, {}, clear=True),
+            patch.object(bot.urllib.request, "urlopen", side_effect=slow_provider) as request,
+            patch.object(bot.time, "monotonic", side_effect=[100.0, 100.0, 135.0]),
+        ):
+            digest = await bot.get_operations_digest()
+            text = bot.build_operations_notice(digest)
+            self.assertTrue(digest["available"])
+            self.assertTrue(digest["incomplete_data"])
+            self.assertEqual(len(digest["points"]), 6)
+            self.assertIn("Сумма ₽", text)
+            self.assertNotIn("Оперативные данные временно недоступны", text)
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(bot._OPERATIONS_CACHE["expires_at"], 135.0 + bot.OPERATIONS_CACHE_TTL_SECONDS)
+
+    async def test_timeout_preserves_bounded_stale_snapshot(self):
+        cached = bot.normalize_operations_digest({"points": [point_row("Макси")]})
+        with (
+            patch.object(bot, "operations_api_configured", return_value=True),
+            patch.object(bot, "_OPERATIONS_FETCH_LOCK", asyncio.Lock()),
+            patch.dict(bot._OPERATIONS_CACHE, {"payload": cached, "expires_at": 0, "stale_until": 200}, clear=True),
+            patch.object(bot, "_request_operations_digest", side_effect=TimeoutError),
+            patch.object(bot.time, "monotonic", return_value=100),
+        ):
+            digest = await bot.get_operations_digest()
+            self.assertTrue(digest["available"])
+            self.assertTrue(digest["stale"])
+            self.assertFalse(cached["stale"])
+
     async def test_edit_disables_link_preview(self):
         edit_message_text = AsyncMock()
         application = SimpleNamespace(
