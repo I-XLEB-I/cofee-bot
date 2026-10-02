@@ -113,7 +113,9 @@ GROUP_REPORT_REFRESH_DEBOUNCE_SECONDS = float(os.getenv("GROUP_REPORT_REFRESH_DE
 RICH_SANDBOX_ENABLED = os.getenv("RICH_SANDBOX_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 OPERATIONS_API_URL = os.getenv("OPERATIONS_API_URL", "").strip().rstrip("/")
 OPERATIONS_API_TOKEN = os.getenv("OPERATIONS_API_TOKEN", "").strip()
-OPERATIONS_API_TIMEOUT_SECONDS = float(os.getenv("OPERATIONS_API_TIMEOUT_SECONDS", "5.0"))
+# A cold digest includes multiple provider requests; Vendista alone may take
+# 30 seconds before returning partial data. Keep the caller's budget larger.
+OPERATIONS_API_TIMEOUT_SECONDS = float(os.getenv("OPERATIONS_API_TIMEOUT_SECONDS", "60.0"))
 OPERATIONS_CACHE_TTL_SECONDS = float(os.getenv("OPERATIONS_CACHE_TTL_SECONDS", "60.0"))
 OPERATIONS_STALE_CACHE_SECONDS = float(
     os.getenv("OPERATIONS_STALE_CACHE_SECONDS", "1800.0")
@@ -7683,8 +7685,9 @@ async def get_operations_digest():
                 last_error = exc
         if normalized is None:
             logger.warning(
-                "operations_digest_unavailable error_type=%s",
+                "operations_digest_unavailable error_type=%s timeout_seconds=%s",
                 type(last_error).__name__,
+                OPERATIONS_API_TIMEOUT_SECONDS,
             )
             cached = _OPERATIONS_CACHE.get("payload")
             if cached is not None and current_monotonic < _OPERATIONS_CACHE.get(
@@ -7702,12 +7705,18 @@ async def get_operations_digest():
                 "points": [],
             }
 
+        completed_monotonic = time.monotonic()
+        logger.info(
+            "operations_digest_loaded points=%s incomplete=%s elapsed_seconds=%.2f",
+            len(normalized["points"]), normalized["incomplete_data"],
+            completed_monotonic - current_monotonic,
+        )
         _OPERATIONS_CACHE["payload"] = normalized
-        _OPERATIONS_CACHE["expires_at"] = current_monotonic + max(
+        _OPERATIONS_CACHE["expires_at"] = completed_monotonic + max(
             OPERATIONS_CACHE_TTL_SECONDS,
             0.0,
         )
-        _OPERATIONS_CACHE["stale_until"] = current_monotonic + max(
+        _OPERATIONS_CACHE["stale_until"] = completed_monotonic + max(
             OPERATIONS_STALE_CACHE_SECONDS,
             OPERATIONS_CACHE_TTL_SECONDS,
             0.0,
@@ -21315,6 +21324,7 @@ async def refresh_group_service_today_posts(application, force=False):
             await edit_group_service_today_post(application, chat_id, message_id, text)
             posts[chat_key]["hash"] = text_hash
             save_reminder_state(state, application)
+            logger.info("group_service_today_post_updated text_hash=%s", text_hash)
         except BadRequest as e:
             err = str(e)
             if "message is not modified" in err.lower():
