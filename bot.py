@@ -1,4 +1,5 @@
 import asyncio
+import group_equipment
 import calendar
 import hashlib
 import json
@@ -11362,7 +11363,8 @@ OWNER_AI_HELP_TEXT = (
     "• Что продали последним на Макси?\n"
     "• Сравни продажи Гагарина за эту и прошлую неделю\n"
     "• Топ напитков Сити за июль\n\n"
-    "В рабочей группе используйте явную команду:\n"
+    "В группе для ошибок аппарата: @упоминание бота или ответ на его сообщение; можно приложить фото.\n"
+    "Для аналитики используйте команду:\n"
     "<code>/ai Продажи сегодня</code>\n\n"
     "Доступные данные зависят от роли. Возвраты, изменение заявок, "
     "выплаты и команды терминалам через ИИ запрещены."
@@ -11468,7 +11470,7 @@ async def enqueue_owner_ai_message(message, context, question):
         )
 
 
-async def answer_owner_ai_message(message, context, question, *, status=None):
+async def answer_owner_ai_message(message, context, question, *, status=None, equipment_context=None):
     config = get_owner_ai_client_config()
     if config is None:
         await message.reply_text(
@@ -11517,6 +11519,8 @@ async def answer_owner_ai_message(message, context, question, *, status=None):
             "maintenance_context": maintenance_context,
             "audience": audience,
         }
+        if equipment_context is not None:
+            owner_ai_query_context["equipment_context"] = equipment_context
         if reply_context:
             owner_ai_query_context["reply_context"] = reply_context
         result = await run_blocking(
@@ -21773,6 +21777,7 @@ def main():
     revision_bot.register(app, sys.modules[__name__])
     stock_movement_bot.register(app, sys.modules[__name__])
     app.add_handler(conv)
+    group_equipment.register(app, sys.modules[__name__])
     register_private_owner_ai_idle_handler(app)
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("ids", cmd_ids))

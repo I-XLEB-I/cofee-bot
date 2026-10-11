@@ -56,6 +56,7 @@ def query_owner_ai(
     reply_context: str | None = None,
     audience: str | None = None,
     revision_context: Mapping[str, Any] | None = None,
+    equipment_context: Mapping[str, Any] | None = None,
     urlopen: UrlOpen = urllib.request.urlopen,
 ) -> dict[str, Any]:
     """Call the versioned internal API and return its validated response."""
@@ -98,6 +99,10 @@ def query_owner_ai(
         payload["conversation_id"] = normalized_conversation_id
     if audience is not None:
         payload["audience"] = audience
+    if equipment_context is not None:
+        if revision_context is not None or not normalized_conversation_id:
+            raise OwnerAiInputError("Контекст диагностики должен быть отдельным.")
+        payload["equipment_context"] = dict(equipment_context)
     if revision_context is not None:
         if audience != "private" or normalized_conversation_id != f"telegram:{user_id}:{user_id}":
             raise OwnerAiAccessError("Ревизия через ИИ доступна в личном чате.")
@@ -107,7 +112,7 @@ def query_owner_ai(
             maintenance_context
         )
     if reply_context is not None:
-        normalized_reply_context = " ".join(str(reply_context).split())[:800].strip()
+        normalized_reply_context = " ".join(str(reply_context).split())[:1600 if equipment_context is not None else 800].strip()
         if normalized_reply_context:
             payload["reply_context"] = normalized_reply_context
     request_body = json.dumps(
@@ -115,13 +120,13 @@ def query_owner_ai(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    if len(request_body) > config.max_request_bytes:
+    if len(request_body) > (370_000 if equipment_context is not None else config.max_request_bytes):
         raise OwnerAiInputError(
             "Вопрос вместе с контекстом слишком длинный. "
             "Сократите вопрос или отправьте его без цитирования предыдущего сообщения."
         )
     request = urllib.request.Request(
-        config.url,
+        config.url.rstrip("/") + ("/equipment" if equipment_context is not None else ""),
         data=request_body,
         method="POST",
         headers={
@@ -132,7 +137,7 @@ def query_owner_ai(
         },
     )
     try:
-        with urlopen(request, timeout=config.timeout_seconds) as response:
+        with urlopen(request, timeout=max(config.timeout_seconds, 100) if equipment_context is not None else config.timeout_seconds) as response:
             if response.status != 200:
                 raise OwnerAiClientError(
                     f"Owner AI returned HTTP {response.status}."
