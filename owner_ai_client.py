@@ -193,7 +193,14 @@ def query_owner_ai(
     answer = answer.strip()
     if len(answer) > config.max_answer_chars:
         raise OwnerAiClientError("Owner AI answer is too long.")
-    return {"scope": scope, "answer": answer}
+    result = {"scope": scope, "answer": answer}
+    if equipment_context is not None and payload.get("equipment_memory") is not None:
+        from equipment_memory import normalize_memory
+        try:
+            result["equipment_memory"] = normalize_memory(payload["equipment_memory"])
+        except ValueError as exc:
+            raise OwnerAiClientError("Сервис вернул некорректную память обращения.") from exc
+    return result
 
 
 def _normalize_maintenance_context(
