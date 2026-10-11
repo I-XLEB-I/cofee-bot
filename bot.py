@@ -11470,6 +11470,11 @@ async def enqueue_owner_ai_message(message, context, question):
         )
 
 
+def get_equipment_memory_store():
+    from equipment_memory import EquipmentMemoryStore
+    return EquipmentMemoryStore(Path(resolve_runtime_path(PERSISTENCE_FILE)).with_name("equipment_cases.sqlite3"))
+
+
 async def answer_owner_ai_message(message, context, question, *, status=None, equipment_context=None):
     config = get_owner_ai_client_config()
     if config is None:
@@ -11493,6 +11498,16 @@ async def answer_owner_ai_message(message, context, question, *, status=None, eq
             getattr(replied_message, "text", None)
             or getattr(replied_message, "caption", None)
         )
+    if equipment_context is not None:
+        equipment_context = dict(equipment_context)
+        reply_id = equipment_context.get("reply_message_id")
+        if reply_id:
+            try:
+                memory = await run_blocking(lambda: get_equipment_memory_store().load(user_id, chat_id, reply_id))
+                if memory:
+                    equipment_context["previous_case"] = memory
+            except Exception as exc:
+                logger.warning("equipment_memory_load_failed error_type=%s", type(exc).__name__)
     # Supply the small read-only service-history dataset on every turn.  The
     # model decides whether ``maintenance.history`` is relevant from the tool
     # description; keyword matching here would make natural follow-ups such as
@@ -11566,10 +11581,22 @@ async def answer_owner_ai_message(message, context, question, *, status=None, eq
         return
     scope_label = "владелец" if result["scope"] == "owner" else "сотрудник"
     plain_answer = str(result["answer"])
-    formatted_answer = format_owner_ai_answer_html(plain_answer)
+    if equipment_context is not None:
+        from equipment_format import format_equipment_answer_html
+        formatted_answer = format_equipment_answer_html(plain_answer)
+        heading = "🔧 Помощник по оборудованию"
+        memory = result.get("equipment_memory")
+        if memory:
+            try:
+                await run_blocking(lambda: get_equipment_memory_store().save(user_id, chat_id, status.message_id, memory))
+            except Exception as exc:
+                logger.warning("equipment_memory_save_failed error_type=%s", type(exc).__name__)
+    else:
+        formatted_answer = format_owner_ai_answer_html(plain_answer)
+        heading = f"🤖 ИИ-аналитик · {scope_label}"
     try:
         await status.edit_text(
-            f"<b>🤖 ИИ-аналитик · {escape_html(scope_label)}</b>"
+            f"<b>{escape_html(heading)}</b>"
             f"\n\n{formatted_answer}",
             parse_mode="HTML",
             link_preview_options=NO_LINK_PREVIEW,
@@ -11580,10 +11607,16 @@ async def answer_owner_ai_message(message, context, question, *, status=None, eq
             user_id,
             type(exc).__name__,
         )
-        await status.edit_text(
-            f"🤖 ИИ-аналитик · {scope_label}\n\n{plain_answer}",
-            link_preview_options=NO_LINK_PREVIEW,
-        )
+        if equipment_context is not None:
+            # Older clients/API endpoints may reject expandable quotations.
+            try:
+                await status.edit_text(f"<b>{escape_html(heading)}</b>\n\n" +
+                    format_equipment_answer_html(plain_answer, expandable=False),
+                    parse_mode="HTML", link_preview_options=NO_LINK_PREVIEW)
+                return
+            except BadRequest:
+                pass
+        await status.edit_text(f"{heading}\n\n{plain_answer}", link_preview_options=NO_LINK_PREVIEW)
 
 
 def build_owner_ai_maintenance_context():
