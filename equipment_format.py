@@ -45,15 +45,14 @@ def format_equipment_answer_html(answer, *, expandable=True):
     for i, block in enumerate(blocks):
         if block.startswith('Источники:\n'):
             links = '\n'.join(_source(line) for line in block.splitlines()[1:])
-            rendered.append('<b>📚 Источники</b>\n' + quote + links + '</blockquote>')
+            rendered.append('<b>Источники и данные</b>\n' + quote + links + '</blockquote>')
         elif block.startswith('Сообщение для сервиса — черновик, не отправлено:\n'):
             body = block.partition('\n')[2]
-            rendered.append('<b>🛠 Черновик для сервиса</b>\n' + quote + _draft(body) + '</blockquote>')
-        elif block.startswith(('Возможные причины:\n', 'Что проверить:\n')):
+            rendered.append('<b>Черновик для сервиса</b>\n' + quote + _draft(body) + '</blockquote>')
+        elif block.startswith(('Возможные причины:\n', 'Что проверить:\n', 'Что сделать сейчас:\n')):
             heading, _, body = block.partition('\n')
-            icon = '🔎' if heading.startswith('Возможные') else '✅'
-            rendered.append(f'<b>{icon} {html.escape(heading.rstrip(":"))}</b>\n' + html.escape(body))
-        elif block.startswith(('По сообщению/фото:', 'Как это связано:', 'Что это означает:')):
+            rendered.append(f'<b>{html.escape(heading.rstrip(":"))}</b>\n' + html.escape(body))
+        elif block.startswith(('По сообщению/фото:', 'Как это связано:', 'Что это означает:', 'Мастер:', 'Учёл результаты:')):
             heading, _, body = block.partition(':')
             rendered.append(f'<b>{html.escape(heading)}:</b>{html.escape(body)}')
         elif block.startswith('Проверено:'):
@@ -69,7 +68,6 @@ def format_equipment_answer_html(answer, *, expandable=True):
         else:
             rendered.append(html.escape(block))
     text = '\n\n'.join(rendered)
-    # The server reserves 3900 characters; compact links usually free more space.
-    if len(answer) <= 3800:
-        text += '\n\n<i>Ответь на это сообщение: «Подробнее» или напиши результат проверки.</i>'
+    # The backend asks the next relevant question. A generic "Подробнее"
+    # footer on every turn invited repeated reports instead of a dialogue.
     return text

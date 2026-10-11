@@ -59,6 +59,31 @@ def test_old_quote_fallback_and_injected_html_stay_safe():
     assert '<script>' not in result
 
 
+def test_practical_reply_keeps_actions_visible_and_telemetry_details_collapsed():
+    answer='''Гиппо · продолжение разбора
+
+Что сделать сейчас:
+1. Посмотри на экран. Если ошибка осталась, нужен мастер.
+
+Мастер: Датчик внутри узла нагрева.
+
+Текущее состояние по телеметрии не подтверждено.
+
+Источники:
+Jofemar: руководство G23: https://example.com/manual.pdf
+Данные на: 11.10.2026 15:42 МСК.
+Telemetron: последний отчёт неизвестен.
+Vendista: последняя связь неизвестна.'''
+    result=format_equipment_answer_html(answer)
+    p=Markup();p.feed(result)
+    assert not p.stack and len(p.quotes)==1 and 'expandable' in p.quotes[0]
+    main=result.partition('<blockquote')[0]
+    assert 'Что сделать сейчас' in main and 'Мастер:' in main
+    assert 'Текущее состояние по телеметрии не подтверждено.' in main
+    assert 'Telemetron:' not in main and 'Vendista:' not in main and '15:42' not in main
+    assert 'Ответь на это сообщение' not in result
+
+
 def test_group_memory_survives_reopening_and_is_shared_only_within_reply_chain(tmp_path):
     path=tmp_path/'cases.sqlite3'
     memory={'location':'Гиппо','model':'Jofemar Bluetec G23','problem':'датчик','checks':'вода есть'}
