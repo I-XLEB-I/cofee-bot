@@ -11583,12 +11583,16 @@ async def answer_owner_ai_message(message, context, question, *, status=None, eq
     plain_answer = str(result["answer"])
     if equipment_context is not None:
         from equipment_format import format_equipment_answer_html
+        from equipment_memory import starts_new_case
         formatted_answer = format_equipment_answer_html(plain_answer)
         heading = "🔧 Помощник по оборудованию"
         memory = result.get("equipment_memory")
         if memory:
             try:
-                await run_blocking(lambda: get_equipment_memory_store().save(user_id, chat_id, status.message_id, memory))
+                await run_blocking(lambda: get_equipment_memory_store().save(
+                    user_id, chat_id, status.message_id, memory,
+                    reply_message_id=equipment_context.get("reply_message_id"),
+                    start_new=starts_new_case(question)))
             except Exception as exc:
                 logger.warning("equipment_memory_save_failed error_type=%s", type(exc).__name__)
     else:
