@@ -201,16 +201,15 @@ def test_http_owner_auth_and_save_readback(tmp_path):
     import time
     import urllib.error
     import urllib.request
-    from payroll_api import PayrollApiServer, PayrollApiConfig
-    from procurement.app import Workspace
+    from procurement.app import ProcurementHttpServer, Workspace
     class Sources:
         cached_at=time.monotonic()
     token='t'*40
     w=Workspace(Sources(),Store(tmp_path/'state.sqlite3'),token,lambda:{123})
     w.raw=raw()
-    server=PayrollApiServer(PayrollApiConfig(token='p'*40,port=0,host='127.0.0.1'),payload_builder=lambda x:{},extra_routes=w)
+    server=ProcurementHttpServer(w, port=0, host='127.0.0.1')
     server.start()
-    url=f'http://127.0.0.1:{server._server.server_port}/api/procurement'
+    url=f'http://127.0.0.1:{server.port}/api/procurement'
     def request(data,auth=''):
         return urllib.request.urlopen(urllib.request.Request(url,data=json.dumps(data).encode(),headers={'Content-Type':'application/json','X-Telegram-Init-Data':auth}),timeout=3)
     try:
@@ -224,6 +223,10 @@ def test_http_owner_auth_and_save_readback(tmp_path):
         w.preview=True
         with pytest.raises(urllib.error.HTTPError) as err:request({'action':'notifications','enabled':True})
         assert err.value.code==403
+        payroll_url=f'http://127.0.0.1:{server.port}/internal/owner-ai/payroll'
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(urllib.request.Request(payroll_url, data=b'{}'), timeout=3)
+        assert err.value.code==404
     finally:
         server.close()
 

@@ -44,7 +44,7 @@ import bdr_revision
 import owner_monitoring
 import revision_bot
 import stock_movement_bot
-from procurement.app import create_workspace
+from procurement.app import ProcurementHttpServer, create_workspace
 from procurement.notifications import loop as procurement_notification_loop
 from revision_sheet_journal import SerializedSheetsClient
 from owner_ai_client import (
@@ -136,6 +136,7 @@ OWNER_PAYROLL_API_PORT = int(
 PROCUREMENT_ENABLED = os.getenv('PROCUREMENT_ENABLED', 'false').strip().lower() == 'true'
 PROCUREMENT_URL = os.getenv('PROCUREMENT_URL', '').strip()
 PROCUREMENT_OWNER_IDS = os.getenv('PROCUREMENT_OWNER_IDS', '').strip()
+PROCUREMENT_PORT = int(os.getenv('PROCUREMENT_PORT', '8081'))
 TELEMETRON_TODAY_REPORT_URL = (
     "https://my.telemetron.net/reports/sales-by-machines"
 )
@@ -21526,14 +21527,18 @@ async def on_app_startup(application):
         )
         workspace.refresh()
         APPLICATION_RUNTIME['procurement_workspace'] = workspace
+        if OWNER_PAYROLL_API_TOKEN and PROCUREMENT_PORT == OWNER_PAYROLL_API_PORT:
+            raise RuntimeError('PROCUREMENT_PORT must differ from OWNER_PAYROLL_API_PORT')
+        procurement_server = ProcurementHttpServer(workspace, PROCUREMENT_PORT)
+        procurement_server.start()
+        APPLICATION_RUNTIME['procurement_http_server'] = procurement_server
         if PROCUREMENT_URL.startswith('https://'):
             APPLICATION_RUNTIME['procurement_notifications'] = asyncio.create_task(
                 procurement_notification_loop(application, workspace, PROCUREMENT_URL))
-    if OWNER_PAYROLL_API_TOKEN or workspace is not None:
-        import secrets
+    if OWNER_PAYROLL_API_TOKEN:
         payroll_server = PayrollApiServer(
             PayrollApiConfig(
-                token=OWNER_PAYROLL_API_TOKEN or secrets.token_urlsafe(32),
+                token=OWNER_PAYROLL_API_TOKEN,
                 port=OWNER_PAYROLL_API_PORT,
             ),
             payload_builder=lambda request: build_payroll_payload(
@@ -21542,7 +21547,6 @@ async def on_app_startup(application):
                 sources_factory=build_payout_sources,
                 settlement_factory=compute_payout_settlement,
             ),
-            extra_routes=workspace,
         )
         payroll_server.start()
         APPLICATION_RUNTIME["owner_payroll_api_server"] = payroll_server
@@ -21561,6 +21565,9 @@ async def on_app_shutdown(application):
         procurement_task.cancel()
         await asyncio.gather(procurement_task, return_exceptions=True)
     APPLICATION_RUNTIME.pop('procurement_workspace', None)
+    procurement_server = APPLICATION_RUNTIME.pop('procurement_http_server', None)
+    if procurement_server is not None:
+        await run_blocking(procurement_server.close)
     monitor_task = APPLICATION_RUNTIME.pop("owner_monitoring_task", None)
     if monitor_task:
         monitor_task.cancel()

@@ -218,6 +218,42 @@ class Workspace:
         handler.wfile.write(body)
 
 
+class ProcurementHttpServer:
+    """Serve only the owner Mini App on its public-facing port."""
+
+    def __init__(self, workspace, port, host='0.0.0.0'):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if not workspace.handle(self):
+                    self.send_error(404)
+
+            do_POST = do_GET
+
+            def log_message(self, *_args):
+                pass
+
+        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._server.daemon_threads = True
+        self._thread = None
+
+    @property
+    def port(self):
+        return self._server.server_port
+
+    def start(self):
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._server.serve_forever,
+                                            daemon=True, name='procurement-http')
+            self._thread.start()
+
+    def close(self):
+        self._server.shutdown()
+        self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+
 def create_workspace(client_factory, primary_book, token, owners, path, preview=False):
     return Workspace(SheetsSources(client_factory, primary_book), Store(path), token, owners, preview)
 
