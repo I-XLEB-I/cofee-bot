@@ -10,6 +10,21 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 logger = logging.getLogger(__name__)
 
 
+def alert_text(items):
+    due = [item for item in items if item['status'] in ('urgent', 'soon')]
+    check = [item for item in items if item['status'] == 'check']
+    lines = ['🛒 Пора проверить закупки' if due else '🛒 Для плана закупок нужны данные', '']
+    for item in due:
+        quantity = f" · к покупке ≈ {item['buy']:g} {item['unit']}" if item['buy'] is not None else ''
+        lines.append(f"{item['name']}: заказать до {item['order_by']}{quantity}")
+    if check:
+        if due:
+            lines.append('')
+        lines.append(f'Для {len(check)} позиций пока нельзя рассчитать срок заказа — проверьте остатки и параметры в закупщике.')
+    lines += ['', 'Расчёт ориентировочный. Откройте основания и проверьте неизвестные движения.']
+    return '\n'.join(lines)
+
+
 async def loop(application, workspace, url):
     while True:
         try:
@@ -28,16 +43,8 @@ async def loop(application, workspace, url):
                             signature = [(i['name'], i['status'], i['order_by']) for i in items]
                             event = hashlib.sha256(json.dumps([uid, signature], ensure_ascii=False).encode()).hexdigest()
                             if await asyncio.to_thread(workspace.store.reserve_alert, event):
-                                lines = ['🛒 Пора проверить закупки', '']
-                                for item in items:
-                                    if item['status'] == 'check':
-                                        lines.append(f"{item['name']}: уточнить остаток или параметры поставки")
-                                        continue
-                                    quantity = f" · к покупке ≈ {item['buy']:g} {item['unit']}" if item['buy'] is not None else ''
-                                    lines.append(f"{item['name']}: заказать до {item['order_by']}{quantity}")
-                                lines += ['', 'Расчёт ориентировочный. Откройте основания и проверьте неизвестные движения.']
                                 try:
-                                    await application.bot.send_message(uid, '\n'.join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Открыть закупщик', web_app=WebAppInfo(url=url))]]))
+                                    await application.bot.send_message(uid, alert_text(items), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Открыть закупщик', web_app=WebAppInfo(url=url))]]))
                                 except Exception:
                                     # Delivery may have succeeded; no blind resend after a timeout.
                                     await asyncio.to_thread(workspace.store.alert_result, event, 'uncertain')

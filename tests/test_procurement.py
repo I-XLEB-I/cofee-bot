@@ -164,6 +164,17 @@ def test_procurement_access_does_not_inherit_payout_editor_role(monkeypatch):
         bot.get_procurement_owner_ids()
 
 
+def test_reminder_names_due_orders_without_listing_every_unknown_item():
+    from procurement.notifications import alert_text
+    due = {'name': 'Кофе', 'status': 'urgent', 'order_by': '2026-11-02',
+           'buy': 5, 'unit': 'кг'}
+    checks = [{'name': f'Товар {i}', 'status': 'check'} for i in range(17)]
+    message = alert_text([due, *checks])
+    assert 'Кофе: заказать до 2026-11-02 · к покупке ≈ 5 кг' in message
+    assert 'Для 17 позиций пока нельзя рассчитать срок заказа' in message
+    assert 'Товар 0' not in message
+
+
 def test_operational_order_retries_cannot_duplicate_or_change_existing(tmp_path):
     s=Store(tmp_path/'state.sqlite3');o={'id':'b2be6a9c-0482-4573-b0c1-733cfd60763d','item':'Кофе','quantity':5,'expected_on':'2026-11-05','supplier':'Поставщик'}
     s.order(o,123);s.order(o,123)
