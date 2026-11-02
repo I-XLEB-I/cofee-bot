@@ -303,19 +303,29 @@ def build_dashboard(raw, policies, orders, *, today=None, month=None):
         if estimated is not None and daily is not None and daily > 0:
             days_left = max(0, estimated / daily)
             covered = max(0, estimated)
+            usable_orders = []
             for order in sorted(item_orders, key=lambda o: o['expected_on']):
                 arrival = day(order.get('expected_on'))
                 if arrival and today <= arrival <= today + timedelta(days=math.floor(covered / daily + 1e-9)):
                     covered += order['quantity']
+                    usable_orders.append(order)
                 elif arrival and arrival < today:
                     issues.append('Ожидаемый срок поставки прошёл: уточните получение')
+                elif arrival:
+                    issues.append('Заказ придёт после возможного исчерпания запаса')
             if lead is not None and safety is not None:
                 due_on = (today + timedelta(days=math.floor(covered / daily - lead - safety + 1e-9))).isoformat()
             if pack and safety is not None:
-                # Orders count only if delivery is confirmed before the planning window begins.
-                eligible = sum(o['quantity'] for o in item_orders if day(o.get('expected_on')) and today <= day(o['expected_on']) <= max(today, target))
-                stock_at_start = estimated - daily * max(0, (target - today).days)
-                buy = math.ceil(max(0, monthly + daily * safety - stock_at_start - eligible) / pack) * pack
+                # For the current month buy only for remaining days. An order in transit
+                # counts only if it arrives before a projected stockout and month end.
+                start = max(today, target)
+                end = target + timedelta(days=month_days)
+                demand_days = max(0, (end - start).days)
+                stock_at_start = estimated - daily * max(0, (start - today).days)
+                usable_by_end = sum(o['quantity'] for o in usable_orders
+                                    if day(o.get('expected_on')) < end)
+                shortage = max(0, daily * (demand_days + safety) - stock_at_start - usable_by_end)
+                buy = math.ceil((shortage - 1e-9) / pack) * pack if shortage else 0
         status = 'check'
         if due_on:
             status = 'urgent' if due_on <= today.isoformat() else ('soon' if due_on <= (today + timedelta(days=7)).isoformat() else 'ok')

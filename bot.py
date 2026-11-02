@@ -135,6 +135,7 @@ OWNER_PAYROLL_API_PORT = int(
 )
 PROCUREMENT_ENABLED = os.getenv('PROCUREMENT_ENABLED', 'false').strip().lower() == 'true'
 PROCUREMENT_URL = os.getenv('PROCUREMENT_URL', '').strip()
+PROCUREMENT_OWNER_IDS = os.getenv('PROCUREMENT_OWNER_IDS', '').strip()
 TELEMETRON_TODAY_REPORT_URL = (
     "https://my.telemetron.net/reports/sales-by-machines"
 )
@@ -743,6 +744,17 @@ def get_payout_editor_ids():
         for payload in get_user_directory_entries().values()
         if USER_ROLE_PAYOUT_EDITOR in payload.get("roles", [])
     }
+
+
+def get_procurement_owner_ids():
+    """Explicit Mini App access, independent of employee and payout roles."""
+    try:
+        result = {int(part.strip()) for part in PROCUREMENT_OWNER_IDS.split(',') if part.strip()}
+    except ValueError as exc:
+        raise RuntimeError('PROCUREMENT_OWNER_IDS must contain Telegram user IDs') from exc
+    if not result or any(value <= 0 for value in result):
+        raise RuntimeError('PROCUREMENT_OWNER_IDS must contain at least one Telegram user ID')
+    return result
 
 
 def get_allowed_user_ids():
@@ -11759,7 +11771,7 @@ async def start(update: Update, context):
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
     ]
-    if PROCUREMENT_ENABLED and PROCUREMENT_URL.startswith('https://') and update.effective_user.id in get_payout_editor_ids():
+    if PROCUREMENT_ENABLED and PROCUREMENT_URL.startswith('https://') and update.effective_user.id in get_procurement_owner_ids():
         keyboard.insert(0, [InlineKeyboardButton('🛒 Закупщик', web_app=WebAppInfo(url=PROCUREMENT_URL))])
     if owner_ai_api_configured():
         keyboard.append(
@@ -21509,7 +21521,7 @@ async def on_app_startup(application):
             return read_client
         workspace = create_workspace(
             procurement_client,
-            SPREADSHEET_ID, BOT_TOKEN, get_payout_editor_ids,
+            SPREADSHEET_ID, BOT_TOKEN, get_procurement_owner_ids,
             Path(resolve_runtime_path(PERSISTENCE_FILE)).with_name('procurement.sqlite3'),
         )
         workspace.refresh()

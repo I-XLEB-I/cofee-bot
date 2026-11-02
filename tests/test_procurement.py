@@ -122,6 +122,26 @@ def test_late_supply_cannot_prevent_prior_stockout():
     assert coffee['order_by']=='2026-11-15' and coffee['buy']==2
 
 
+def test_current_month_purchase_uses_remaining_days():
+    r = raw()
+    r['manual_counts'] = [{'item': 'Кофе', 'location': 'Южный',
+                           'quantity': 0.5, 'counted_on': '2026-11-20', 'note': 'Проверено'}]
+    coffee = build_dashboard(r, {'Кофе': {'lead_days': 3, 'safety_days': 2, 'pack_size': 1}},
+                             [], today=date(2026, 11, 20))['items'][0]
+    assert coffee['monthly'] == 3  # Full month still shown for planning.
+    assert coffee['buy'] == 1  # 11 remaining days, not all 30 again.
+
+
+def test_only_deliveries_before_stockout_reduce_monthly_purchase():
+    p = {'Кофе': {'lead_days': 3, 'safety_days': 2, 'pack_size': 1}}
+    on_time = [{'item': 'Кофе', 'status': 'ordered', 'quantity': 1, 'expected_on': '2026-11-10'}]
+    late = [{'item': 'Кофе', 'status': 'ordered', 'quantity': 1, 'expected_on': '2026-12-01'}]
+    early = build_dashboard(raw(), p, on_time, today=date(2026, 11, 1))['items'][0]
+    delayed = build_dashboard(raw(), p, late, today=date(2026, 11, 1))['items'][0]
+    assert early['buy'] == 1
+    assert delayed['buy'] == 2
+
+
 def signed(token,uid=123,stamp=1000):
     d={'auth_date':str(stamp),'user':json.dumps({'id':uid})}
     secret=hmac.new(b'WebAppData',token.encode(),hashlib.sha256).digest()
@@ -133,6 +153,15 @@ def test_telegram_identity_allowlist_expiry_and_tampering():
     assert validate_init_data(signed('token'),'token',{123},now=1100)==123
     for value,owners,now in [(signed('wrong'),{123},1100),(signed('token'),{999},1100),(signed('token'),{123},5000)]:
         with pytest.raises(PermissionError):validate_init_data(value,'token',owners,now=now)
+
+
+def test_procurement_access_does_not_inherit_payout_editor_role(monkeypatch):
+    import bot
+    monkeypatch.setattr(bot, 'PROCUREMENT_OWNER_IDS', '123')
+    assert bot.get_procurement_owner_ids() == {123}
+    monkeypatch.setattr(bot, 'PROCUREMENT_OWNER_IDS', '')
+    with pytest.raises(RuntimeError, match='PROCUREMENT_OWNER_IDS'):
+        bot.get_procurement_owner_ids()
 
 
 def test_operational_order_retries_cannot_duplicate_or_change_existing(tmp_path):
