@@ -24,6 +24,7 @@ from telegram import (
     LinkPreviewOptions,
     ReplyKeyboardRemove,
     Update,
+    WebAppInfo,
 )
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.request import HTTPXRequest
@@ -43,6 +44,8 @@ import bdr_revision
 import owner_monitoring
 import revision_bot
 import stock_movement_bot
+from procurement.app import create_workspace
+from procurement.notifications import loop as procurement_notification_loop
 from revision_sheet_journal import SerializedSheetsClient
 from owner_ai_client import (
     OwnerAiAccessError,
@@ -130,6 +133,8 @@ OWNER_PAYROLL_API_TOKEN = os.getenv("OWNER_PAYROLL_API_TOKEN", "").strip()
 OWNER_PAYROLL_API_PORT = int(
     os.getenv("OWNER_PAYROLL_API_PORT", os.getenv("PORT", "8080"))
 )
+PROCUREMENT_ENABLED = os.getenv('PROCUREMENT_ENABLED', 'false').strip().lower() == 'true'
+PROCUREMENT_URL = os.getenv('PROCUREMENT_URL', '').strip()
 TELEMETRON_TODAY_REPORT_URL = (
     "https://my.telemetron.net/reports/sales-by-machines"
 )
@@ -11754,6 +11759,8 @@ async def start(update: Update, context):
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
     ]
+    if PROCUREMENT_ENABLED and PROCUREMENT_URL.startswith('https://') and update.effective_user.id in get_payout_editor_ids():
+        keyboard.insert(0, [InlineKeyboardButton('🛒 Закупщик', web_app=WebAppInfo(url=PROCUREMENT_URL))])
     if owner_ai_api_configured():
         keyboard.append(
             [InlineKeyboardButton("🤖 ИИ-аналитик", callback_data="owner_ai")]
@@ -21492,10 +21499,29 @@ async def on_app_startup(application):
             APPLICATION_RUNTIME["owner_monitoring_task"] = asyncio.create_task(
                 owner_monitoring.monitoring_loop(application, config, monitoring_store),
             )
-    if OWNER_PAYROLL_API_TOKEN:
+    workspace = None
+    if PROCUREMENT_ENABLED:
+        def procurement_client():
+            scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+            credentials = get_google_credentials(scopes)
+            read_client = gspread.authorize(credentials)
+            read_client.set_timeout((5, 20))
+            return read_client
+        workspace = create_workspace(
+            procurement_client,
+            SPREADSHEET_ID, BOT_TOKEN, get_payout_editor_ids,
+            Path(resolve_runtime_path(PERSISTENCE_FILE)).with_name('procurement.sqlite3'),
+        )
+        workspace.refresh()
+        APPLICATION_RUNTIME['procurement_workspace'] = workspace
+        if PROCUREMENT_URL.startswith('https://'):
+            APPLICATION_RUNTIME['procurement_notifications'] = asyncio.create_task(
+                procurement_notification_loop(application, workspace, PROCUREMENT_URL))
+    if OWNER_PAYROLL_API_TOKEN or workspace is not None:
+        import secrets
         payroll_server = PayrollApiServer(
             PayrollApiConfig(
-                token=OWNER_PAYROLL_API_TOKEN,
+                token=OWNER_PAYROLL_API_TOKEN or secrets.token_urlsafe(32),
                 port=OWNER_PAYROLL_API_PORT,
             ),
             payload_builder=lambda request: build_payroll_payload(
@@ -21504,6 +21530,7 @@ async def on_app_startup(application):
                 sources_factory=build_payout_sources,
                 settlement_factory=compute_payout_settlement,
             ),
+            extra_routes=workspace,
         )
         payroll_server.start()
         APPLICATION_RUNTIME["owner_payroll_api_server"] = payroll_server
@@ -21517,6 +21544,11 @@ async def on_app_startup(application):
 
 
 async def on_app_shutdown(application):
+    procurement_task = APPLICATION_RUNTIME.pop('procurement_notifications', None)
+    if procurement_task:
+        procurement_task.cancel()
+        await asyncio.gather(procurement_task, return_exceptions=True)
+    APPLICATION_RUNTIME.pop('procurement_workspace', None)
     monitor_task = APPLICATION_RUNTIME.pop("owner_monitoring_task", None)
     if monitor_task:
         monitor_task.cancel()

@@ -152,9 +152,11 @@ class PayrollApiServer:
         config: PayrollApiConfig,
         *,
         payload_builder: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+        extra_routes: Any = None,
     ) -> None:
         self.config = config
         self.payload_builder = payload_builder
+        self.extra_routes = extra_routes
         self._lock = threading.Lock()
         handler = self._handler_type()
         self._server = ThreadingHTTPServer((config.host, config.port), handler)
@@ -186,12 +188,16 @@ class PayrollApiServer:
             server_version = "CoffeePayroll/1"
 
             def do_GET(self) -> None:  # noqa: N802
+                if owner.extra_routes is not None and owner.extra_routes.handle(self):
+                    return
                 if self.path == "/health":
                     self._json(200, {"status": "ok"})
                 else:
                     self._json(404, {"error": "not_found"})
 
             def do_POST(self) -> None:  # noqa: N802
+                if owner.extra_routes is not None and owner.extra_routes.handle(self):
+                    return
                 if self.path != "/internal/owner-ai/payroll":
                     self._json(404, {"error": "not_found"})
                     return

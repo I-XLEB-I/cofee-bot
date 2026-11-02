@@ -22,3 +22,6 @@ coffee-bot.bundle
 .claude/
 *.sqlite3
 *.sqlite3-journal
+
+# Purchasing local read-only preview and cached source material
+.procurement/
