@@ -104,6 +104,13 @@ class BdrRevisionTests(unittest.TestCase):
         with self.assertRaisesRegex(BdrRevisionError, "нет блока за 09.2026"):
             self.layout.for_revision("13.09.2026")
 
+    def test_invalid_later_bdr_date_does_not_block_valid_period(self):
+        self.client.rows[93]["values"][1] = value_cell("31.11.2026")
+        layout = read_layout(self.client, "bdr")
+        self.assertEqual(layout.for_revision("01.09.2026").date, date(2026, 8, 31))
+        with self.assertRaisesRegex(BdrRevisionError, "нет блока за 11.2026"):
+            layout.for_revision("13.11.2026")
+
     def test_closer_other_month_does_not_override_accounting_month(self):
         self.layout.blocks.append(copy.copy(self.block))
         self.layout.blocks[-1].date = date(2026, 9, 10)
@@ -157,6 +164,27 @@ class BdrRevisionTests(unittest.TestCase):
         text = bot.build_revision_message_saved_text(draft, result)
         self.assertIn("ожидает подходящего блока", text)
         self.assertNotIn("записано в блок", text)
+
+    def test_invalid_bdr_header_still_saves_bot_revision_as_pending(self):
+        self.client.rows[93]["values"][1] = value_cell("31.09.2026")
+        draft = {
+            "sync_bdr": True, "date": "01.11.2026", "period": "10.2026",
+            "point": "Гиппо", "who": "Кирилл", "values": {"Кофе": "2"},
+            "chat_id": -100, "source_key": "msg:14", "source_message_id": 14,
+        }
+        with (
+            patch("bot.BDR_SPREADSHEET_ID", "bdr"),
+            patch("bot.get_sheet", return_value=SimpleNamespace(client=self.client)),
+            patch("bot.find_revision_record", return_value=None),
+            patch("bot.add_revision_row", return_value=45) as add,
+            patch("bot.append_group_report_log", return_value=401) as log,
+        ):
+            result = bot.save_revision_message_entry(draft)
+        self.assertEqual(add.call_args.args[0]["period"], "10.2026")
+        self.assertEqual(add.call_args.args[0]["filled_at"], "01.11.2026")
+        self.assertEqual(json.loads(log.call_args.args[0]["revision_backup"])["pending_bdr"]["period"], "10.2026")
+        self.assertIsNone(result["revision"]["bdr"])
+        self.assertEqual(self.client.writes, [])
 
     def test_missing_target_block_cannot_leave_previous_bdr_contribution_behind(self):
         draft = {"sync_bdr": True, "date": "13.09.2026"}
