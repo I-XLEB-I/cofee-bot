@@ -255,6 +255,7 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch("bot.GROUP_REPORT_SAVE_MIN_INTERVAL_SECONDS", 0))
         self.enterContext(patch("bot.run_blocking", side_effect=run_locally))
         self.enterContext(patch("bot.find_group_report_duplicate", side_effect=find_duplicate))
+        self.enterContext(patch("bot.get_group_report_logs_with_rows", return_value=[]))
         self.semantic_duplicates = self.enterContext(
             patch(
                 "bot.find_service_semantic_duplicates",
@@ -497,6 +498,69 @@ class RevisionChatRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.logs[0]["source_key"], "msg:101")
         self.assertEqual(self.logs[0]["revision_mode"], "created")
         self.assertEqual(update_service.call_args.args[1]["service_sum"], 250)
+
+    async def test_forwarded_pending_revision_fills_existing_service_without_new_pay(self):
+        text = "04.09 Сити\nКофе - 6\nМолоко - 4\nВоды - 2.5"
+        with patch("bot.save_group_report_revision", side_effect=ValueError("broken BDR")):
+            await bot.process_group_report_message(self.make_message(text), self.application)
+        self.assertEqual(self.logs[0]["revision_mode"], "pending_bdr")
+        service_entry = {
+            "__row": 2, "Дата": "04.09.2026", "Кто": "Александр",
+            "Точка": "Сити", "Вода(бут)": "2,5", "Нехватка": "",
+            "Остатки": "", "Закупки": "", "Сумма закупок": "0",
+            "В ЗП": "Александр",
+        }
+        original = {
+            "__row": 2, "Chat_ID": -1001, "Source_Key": "msg:101",
+            "Source_Message_ID": 101, "Service_Row": 2,
+            "Revision_Row": "", "Revision_Mode": "pending_bdr",
+            "Revision_Period": "", "Revision_Location": "",
+            "Revision_Backup": "", "Photo_Rows": "", "Статус": "saved",
+        }
+        resent = self.make_message(text, 202)
+        resent.chat_id = 7
+        resent.chat.type = "private"
+        with (
+            patch("bot.find_group_report_duplicate", return_value=(None, original)),
+            patch("bot.get_all_services_with_rows", return_value=[service_entry]),
+            patch("bot.update_group_report_log") as update_log,
+        ):
+            await bot.process_group_report_message(resent, self.application)
+        self.assertEqual(len(self.services), 1)
+        self.assertEqual(len(self.revisions), 1)
+        self.assertEqual(self.revisions[0]["period"], "08.2026")
+        update_log.assert_called_once()
+        self.assertEqual(update_log.call_args.args[0], 2)
+        self.assertEqual(update_log.call_args.args[1]["service_row"], 2)
+        self.assertIn("повторного начисления нет", self.send_feedback.await_args.args[3])
+
+    async def test_changed_resend_uses_unique_service_and_pending_log(self):
+        text = "04.09 Сити\nКофе - 6\nМолоко - 4\nВоды - 2.5"
+        with patch("bot.save_group_report_revision", side_effect=ValueError("broken BDR")):
+            await bot.process_group_report_message(self.make_message(text), self.application)
+        service_entry = {
+            "__row": 2, "Дата": "04.09.2026", "Кто": "Александр",
+            "Точка": "Сити", "Вода(бут)": "2,5", "Нехватка": "",
+            "Остатки": "", "Закупки": "", "Сумма закупок": "0",
+            "В ЗП": "Александр",
+        }
+        pending_log = {
+            "__row": 2, "Chat_ID": -1001, "Source_Key": "msg:101",
+            "Source_Message_ID": 101, "Service_Row": 2,
+            "Revision_Row": "", "Revision_Mode": "pending_bdr",
+            "Revision_Period": "", "Revision_Location": "",
+            "Revision_Backup": "", "Photo_Rows": "", "Статус": "saved",
+        }
+        self.semantic_duplicates.return_value = [service_entry]
+        resent = self.make_message(text.replace("Кофе - 6", "Кофе - 6,0"), 202)
+        with (
+            patch("bot.get_group_report_logs_with_rows", return_value=[pending_log]),
+            patch("bot.update_group_report_log") as update_log,
+        ):
+            await bot.process_group_report_message(resent, self.application)
+        self.assertEqual(len(self.services), 1)
+        self.assertEqual(len(self.revisions), 1)
+        update_log.assert_called_once()
 
     async def test_intentionally_removed_revision_is_not_treated_as_pending(self):
         message = self.make_message("04.09 Сити\nКофе - 6\nМолоко - 4\nВоды - 2.5")
