@@ -126,7 +126,13 @@ class BdrLayout:
         for row in sorted({r for r, _ in self.cells}):
             label = self.cells.get((row, 1), {}).get("formattedValue", "")
             if re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{4}", label):
-                block_date = datetime.strptime(label, "%d.%m.%Y").date()
+                try:
+                    block_date = datetime.strptime(label, "%d.%m.%Y").date()
+                except ValueError:
+                    # A malformed later header must not prevent reading valid
+                    # periods. Do not attach its item rows to the prior block.
+                    active = None
+                    continue
                 columns = {}
                 for (r, column), cell in self.cells.items():
                     location = POINT_ALIASES.get(key(cell.get("formattedValue")))
