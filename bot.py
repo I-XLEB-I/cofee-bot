@@ -2603,6 +2603,51 @@ def find_group_report_duplicate(chat_id, source_key, fingerprint):
     return matched_source, matched_fingerprint
 
 
+def find_pending_revision_log_for_service(service_row):
+    matches = [
+        record for record in get_group_report_logs_with_rows()
+        if str(record.get("Service_Row", "")).strip() == str(service_row)
+        and record.get("Статус") == "saved"
+        and record.get("Revision_Mode") == "pending_bdr"
+        and not str(record.get("Revision_Row", "")).strip()
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def save_missing_revision_for_existing_service(draft, record, service_entry):
+    revision_meta = save_edited_revision_entry(draft, record, draft["revision"])
+    run_group_sheet_write_blocking_with_retry(
+        lambda: update_group_report_log(record["__row"], {
+            "chat_id": record.get("Chat_ID", ""),
+            "source_key": record.get("Source_Key", ""),
+            "source_message_id": record.get("Source_Message_ID", ""),
+            "media_group_id": record.get("Media_Group_ID", ""),
+            "who": draft["who"],
+            "point": draft["point"],
+            "date": draft["date"],
+            "fingerprint": draft["fingerprint"],
+            "service_row": service_entry["__row"],
+            "photo_rows": record.get("Photo_Rows", ""),
+            "revision_row": revision_meta["row"],
+            "revision_period": revision_meta["period"],
+            "revision_location": revision_meta["location"],
+            "revision_mode": revision_meta["mode"],
+            "revision_backup": revision_meta["backup"],
+            "status": "saved",
+            "created_at": record.get("Создано", "") or format_group_report_created_at(),
+        }),
+        "existing service revision recovery log update",
+        draft=draft,
+    )
+    return {
+        "log_row": record["__row"],
+        "service_row": service_entry["__row"],
+        "revision": revision_meta,
+        "existing_service": True,
+        "warnings": [],
+    }
+
+
 def serialize_row_numbers(row_numbers):
     return ",".join(str(row_num) for row_num in row_numbers if row_num)
 
@@ -18519,9 +18564,12 @@ def build_revision_snapshot_batch_result_text(outcomes):
         draft = outcome.get("draft", {})
         label = status_labels.get(outcome.get("status"), outcome.get("status", "неизвестно"))
         if outcome.get("status") == "saved" and outcome.get("save_result", {}).get("service_row"):
-            label = "обслуживание и ревизия сохранены"
-            if not outcome["save_result"].get("revision"):
+            if outcome["save_result"].get("existing_service"):
+                label = "ревизия сохранена к существующему обслуживанию; повторной оплаты нет"
+            elif not outcome["save_result"].get("revision"):
                 label = "обслуживание сохранено, ревизия не сохранена"
+            else:
+                label = "обслуживание и ревизия сохранены"
         bdr_meta = (outcome.get("save_result", {}).get("revision") or {}).get("bdr")
         if bdr_meta:
             label += f"; БДР {bdr_meta['date']}"
@@ -18973,6 +19021,26 @@ async def process_group_service_report_draft(message, application, draft, send_s
                     )
                     return {**outcome, "status": "already" if status == "saved" else status}
 
+            if (
+                save_result is None and duplicate and draft.get("revision")
+                and duplicate.get("Revision_Mode") == "pending_bdr"
+                and not str(duplicate.get("Revision_Row", "")).strip()
+            ):
+                service_entry = await run_blocking(find_group_report_service_entry, duplicate)
+                if (
+                    service_entry
+                    and build_service_duplicate_signature_from_entry(service_entry)
+                    == build_service_duplicate_signature(build_group_report_payload(draft))
+                ):
+                    save_result = await run_group_sheet_write_with_retry(
+                        lambda current_draft: save_missing_revision_for_existing_service(
+                            current_draft, duplicate, service_entry,
+                        ),
+                        draft,
+                        "resent pending revision recovery",
+                        application=application,
+                    )
+
             if save_result is None and duplicate:
                 await send_group_report_feedback_message(
                     application,
@@ -18989,20 +19057,36 @@ async def process_group_service_report_draft(message, application, draft, send_s
                     None,
                 )
                 if semantic_duplicates:
-                    cleanup_expired_group_report_drafts(application.bot_data)
-                    draft_id = next_group_report_draft_id(application.bot_data)
-                    draft_copy = dict(draft)
-                    draft_copy["created_at_ts"] = datetime.now().timestamp()
-                    draft_copy["draft_mode"] = "service_duplicate_warning"
-                    get_group_report_drafts(application.bot_data)[draft_id] = draft_copy
-                    await send_group_report_feedback_message(
-                        application,
-                        draft["chat_id"],
-                        draft["source_message_id"],
-                        build_group_report_duplicate_warning_text(draft, semantic_duplicates),
-                        reply_markup=build_group_report_duplicate_draft_markup(draft_id),
-                    )
-                    return {**outcome, "status": "pending"}
+                    if draft.get("revision") and len(semantic_duplicates) == 1:
+                        service_entry = semantic_duplicates[0]
+                        pending_log = await run_blocking(
+                            find_pending_revision_log_for_service,
+                            service_entry["__row"],
+                        )
+                        if pending_log:
+                            save_result = await run_group_sheet_write_with_retry(
+                                lambda current_draft: save_missing_revision_for_existing_service(
+                                    current_draft, pending_log, service_entry,
+                                ),
+                                draft,
+                                "existing service revision recovery",
+                                application=application,
+                            )
+                    if save_result is None:
+                        cleanup_expired_group_report_drafts(application.bot_data)
+                        draft_id = next_group_report_draft_id(application.bot_data)
+                        draft_copy = dict(draft)
+                        draft_copy["created_at_ts"] = datetime.now().timestamp()
+                        draft_copy["draft_mode"] = "service_duplicate_warning"
+                        get_group_report_drafts(application.bot_data)[draft_id] = draft_copy
+                        await send_group_report_feedback_message(
+                            application,
+                            draft["chat_id"],
+                            draft["source_message_id"],
+                            build_group_report_duplicate_warning_text(draft, semantic_duplicates),
+                            reply_markup=build_group_report_duplicate_draft_markup(draft_id),
+                        )
+                        return {**outcome, "status": "pending"}
 
             if save_result is None:
                 save_result = await run_group_sheet_write_with_retry(
@@ -19054,6 +19138,20 @@ async def process_group_service_report_draft(message, application, draft, send_s
     await request_group_service_today_refresh(application)
     outcome.update(status="saved", save_result=save_result)
     if not send_saved_feedback:
+        return outcome
+
+    if save_result.get("existing_service"):
+        revision_meta = save_result["revision"]
+        bdr_status = (
+            " Перенос в БДР ожидает подходящего блока."
+            if revision_meta.get("pending_bdr") else ""
+        )
+        await send_group_report_feedback_message(
+            application, draft["chat_id"], draft["source_message_id"],
+            f"✅ Ревизия сохранена: {draft['point']}, {format_period_label(revision_meta['period'])}. "
+            f"Обслуживание #{save_result['service_row']} уже было записано; повторного начисления нет."
+            + bdr_status,
+        )
         return outcome
 
     last_error = None
