@@ -24,6 +24,7 @@ from telegram import (
     LinkPreviewOptions,
     ReplyKeyboardRemove,
     Update,
+    WebAppInfo,
 )
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.request import HTTPXRequest
@@ -43,6 +44,8 @@ import bdr_revision
 import owner_monitoring
 import revision_bot
 import stock_movement_bot
+from procurement.app import ProcurementHttpServer, create_workspace
+from procurement.notifications import loop as procurement_notification_loop
 from revision_sheet_journal import SerializedSheetsClient
 from owner_ai_client import (
     OwnerAiAccessError,
@@ -130,6 +133,10 @@ OWNER_PAYROLL_API_TOKEN = os.getenv("OWNER_PAYROLL_API_TOKEN", "").strip()
 OWNER_PAYROLL_API_PORT = int(
     os.getenv("OWNER_PAYROLL_API_PORT", os.getenv("PORT", "8080"))
 )
+PROCUREMENT_ENABLED = os.getenv('PROCUREMENT_ENABLED', 'false').strip().lower() == 'true'
+PROCUREMENT_URL = os.getenv('PROCUREMENT_URL', '').strip()
+PROCUREMENT_OWNER_IDS = os.getenv('PROCUREMENT_OWNER_IDS', '').strip()
+PROCUREMENT_PORT = int(os.getenv('PROCUREMENT_PORT', '8081'))
 TELEMETRON_TODAY_REPORT_URL = (
     "https://my.telemetron.net/reports/sales-by-machines"
 )
@@ -738,6 +745,17 @@ def get_payout_editor_ids():
         for payload in get_user_directory_entries().values()
         if USER_ROLE_PAYOUT_EDITOR in payload.get("roles", [])
     }
+
+
+def get_procurement_owner_ids():
+    """Explicit Mini App access, independent of employee and payout roles."""
+    try:
+        result = {int(part.strip()) for part in PROCUREMENT_OWNER_IDS.split(',') if part.strip()}
+    except ValueError as exc:
+        raise RuntimeError('PROCUREMENT_OWNER_IDS must contain Telegram user IDs') from exc
+    if not result or any(value <= 0 for value in result):
+        raise RuntimeError('PROCUREMENT_OWNER_IDS must contain at least one Telegram user ID')
+    return result
 
 
 def get_allowed_user_ids():
@@ -11754,6 +11772,8 @@ async def start(update: Update, context):
         [InlineKeyboardButton("📦 Ревизия", callback_data="revision")],
         [InlineKeyboardButton("📊 Отчёты", callback_data="reports")],
     ]
+    if PROCUREMENT_ENABLED and PROCUREMENT_URL.startswith('https://') and update.effective_user.id in get_procurement_owner_ids():
+        keyboard.insert(0, [InlineKeyboardButton('🛒 Закупщик', web_app=WebAppInfo(url=PROCUREMENT_URL))])
     if owner_ai_api_configured():
         keyboard.append(
             [InlineKeyboardButton("🤖 ИИ-аналитик", callback_data="owner_ai")]
@@ -21492,6 +21512,29 @@ async def on_app_startup(application):
             APPLICATION_RUNTIME["owner_monitoring_task"] = asyncio.create_task(
                 owner_monitoring.monitoring_loop(application, config, monitoring_store),
             )
+    workspace = None
+    if PROCUREMENT_ENABLED:
+        def procurement_client():
+            scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+            credentials = get_google_credentials(scopes)
+            read_client = gspread.authorize(credentials)
+            read_client.set_timeout((5, 20))
+            return read_client
+        workspace = create_workspace(
+            procurement_client,
+            SPREADSHEET_ID, BOT_TOKEN, get_procurement_owner_ids,
+            Path(resolve_runtime_path(PERSISTENCE_FILE)).with_name('procurement.sqlite3'),
+        )
+        workspace.refresh()
+        APPLICATION_RUNTIME['procurement_workspace'] = workspace
+        if OWNER_PAYROLL_API_TOKEN and PROCUREMENT_PORT == OWNER_PAYROLL_API_PORT:
+            raise RuntimeError('PROCUREMENT_PORT must differ from OWNER_PAYROLL_API_PORT')
+        procurement_server = ProcurementHttpServer(workspace, PROCUREMENT_PORT)
+        procurement_server.start()
+        APPLICATION_RUNTIME['procurement_http_server'] = procurement_server
+        if PROCUREMENT_URL.startswith('https://'):
+            APPLICATION_RUNTIME['procurement_notifications'] = asyncio.create_task(
+                procurement_notification_loop(application, workspace, PROCUREMENT_URL))
     if OWNER_PAYROLL_API_TOKEN:
         payroll_server = PayrollApiServer(
             PayrollApiConfig(
@@ -21517,6 +21560,14 @@ async def on_app_startup(application):
 
 
 async def on_app_shutdown(application):
+    procurement_task = APPLICATION_RUNTIME.pop('procurement_notifications', None)
+    if procurement_task:
+        procurement_task.cancel()
+        await asyncio.gather(procurement_task, return_exceptions=True)
+    APPLICATION_RUNTIME.pop('procurement_workspace', None)
+    procurement_server = APPLICATION_RUNTIME.pop('procurement_http_server', None)
+    if procurement_server is not None:
+        await run_blocking(procurement_server.close)
     monitor_task = APPLICATION_RUNTIME.pop("owner_monitoring_task", None)
     if monitor_task:
         monitor_task.cancel()
