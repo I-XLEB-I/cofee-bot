@@ -395,6 +395,33 @@ class TelegramDialogueTests(unittest.IsolatedAsyncioTestCase):
         model.assert_not_called()
         self.assertEqual(self.store.get(12, 12)["records"][0]["values"]["Кофе"], "4.5")
 
+    async def test_warehouse_list_with_blank_water_keeps_all_counts_without_ai(self):
+        text = (
+            "Дома\n\nКофе - 33\n\nМолоко - 22\n\nШоколад - 10\n\n"
+            "Мока - 59\n\nСироп - 37\n\nСтакан - 4030\n\n"
+            "Крышка Б - 4350\n\nКрышка Ч - 11\n\nПалоч - 1750\n\n"
+            "Трубочки - 2250\n\nСахар - 6380\n\nМанжеты - 100\n\n"
+            "Салфетки влажные - 12\n\nСалфетки сухие - 0\n\n"
+            "Мусорные пакеты - 5\n\nВоды -"
+        )
+        self.store.accept(12, 12, 1, text, "2026-11-06")
+        with (
+            patch.object(revision_bot, "get_store", return_value=self.store),
+            patch.object(bot, "get_allowed_user_ids", return_value={12}),
+            patch.object(bot, "query_owner_ai") as model,
+            patch.object(revision_bot, "prepare_save", new=AsyncMock()) as prepare,
+        ):
+            await revision_bot.drain(bot, self.application, 12, 12)
+        model.assert_not_called()
+        prepare.assert_not_awaited()
+        draft = self.store.get(12, 12)
+        self.assertEqual(len(draft["records"][0]["values"]), 15)
+        self.assertEqual(draft["records"][0]["values"]["Салфетки сухие"], "0")
+        self.assertNotIn("Вода", draft["records"][0]["values"])
+        self.assertEqual(draft["records"][0]["location"], "Дома")
+        self.assertEqual(draft["records"][0]["date"], "2026-11-06")
+        self.assertIn("Вода", self.application.bot.send_message.call_args.args[1])
+
     async def test_complete_report_starts_reconciliation_without_save_command(self):
         self.store.accept(12, 12, 1, "Ревизия Дома: все остатки", "2026-09-13")
         self.store.mark_message(12, 12, 1, "parsed", proposal("Дома", {n: "1" for n in bot.REVISION_ITEMS}))
