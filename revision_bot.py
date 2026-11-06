@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -216,21 +217,23 @@ async def drain(host, application, chat_id, user_id):
                 proposal = json.loads(event["proposal"])
             else:
                 store.mark_message(chat_id, user_id, event["message_id"], "processing")
-                result = await host.run_blocking(
-                    host.query_owner_ai,
-                    host.get_owner_ai_client_config(),
-                    user_id=user_id,
-                    question=event["text"],
-                    conversation_id=f"telegram:{chat_id}:{user_id}",
-                    audience="private",
-                    revision_context={
-                        "message_date": event["message_date"],
-                        "records": draft["records"],
-                    },
-                )
-                proposal = validate_proposal(
-                    result["revision"], host.REVISION_LOCATIONS, host.REVISION_ITEMS
-                )
+                proposal = parse_structured_revision(host, event["text"], draft)
+                if proposal is None:
+                    result = await host.run_blocking(
+                        host.query_owner_ai,
+                        host.get_owner_ai_client_config(),
+                        user_id=user_id,
+                        question=event["text"],
+                        conversation_id=f"telegram:{chat_id}:{user_id}",
+                        audience="private",
+                        revision_context={
+                            "message_date": event["message_date"],
+                            "records": draft["records"],
+                        },
+                    )
+                    proposal = validate_proposal(
+                        result["revision"], host.REVISION_LOCATIONS, host.REVISION_ITEMS
+                    )
                 store.mark_message(chat_id, user_id, event["message_id"], "parsed", proposal)
             current = store.apply_message(
                 chat_id, user_id, event["message_id"], proposal, expected_version=draft["version"]
@@ -267,6 +270,58 @@ def start_worker(host, application, chat_id, user_id):
     key = chat_id, user_id
     if key not in _tasks or _tasks[key].done():
         _tasks[key] = application.create_task(drain(host, application, chat_id, user_id))
+
+
+def parse_structured_revision(host, text, draft):
+    """Parse an unambiguous item list without depending on the AI service."""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    location = host.normalize_revision_location_name(lines[0])
+    if location:
+        lines = lines[1:]
+    elif len(draft.get("records", [])) == 1:
+        location = draft["records"][0]["location"]
+    else:
+        return None
+    if not lines:
+        return None
+
+    values = {}
+    missing = []
+    for line in lines:
+        match = re.fullmatch(r"(.+?)\s*[-–—:=]\s*(\d+(?:[.,]\d{1,4})?)?\s*", line)
+        if not match:
+            return None
+        item_spec = host.get_revision_import_item_spec(match.group(1))
+        if not item_spec:
+            return None
+        item = item_spec[0]
+        raw_value = match.group(2)
+        if item in values or item in missing:
+            return None
+        if raw_value is None:
+            missing.append(item)
+        else:
+            values[item] = raw_value
+    if not values:
+        return None
+
+    clarification = (
+        "Не указано количество: " + ", ".join(missing) + ". "
+        "Можно прислать его позже или сохранить частичную ревизию."
+        if missing else ""
+    )
+    return validate_proposal({
+        "action": "update",
+        "clarification": clarification,
+        "records": [{
+            "location": location,
+            "previous_location": "",
+            "date": "",
+            "values": values,
+        }],
+    }, host.REVISION_LOCATIONS, host.REVISION_ITEMS)
 
 
 async def handle_message(host, message, context, question):
